@@ -91,8 +91,9 @@ endpoint=http://192.168.1.50:8080/scan
 Beim nächsten Start liest er die Datei und **spiegelt die Zugangsdaten in seinen
 Flash-Speicher**. Danach kommen WLAN und Weboberfläche auch dann hoch, wenn die Karte
 fehlt oder unlesbar ist — sonst hätte man genau dann keine Diagnose, wenn man sie
-braucht. Die Datei bleibt liegen und hat weiterhin Vorrang; zum Ändern des Netzes
-genügt es, sie zu überschreiben.
+braucht. Die Datei bleibt liegen. Übernommen wird sie nur, wenn sich ihr Inhalt seit dem
+letzten Mal **geändert** hat; sonst gelten die Werte aus dem Flash, also auch alles, was in
+der Weboberfläche eingestellt wurde. Zum Ändern des Netzes genügt es, sie zu überschreiben.
 
 > Einen Einrichtungsassistenten über ein eigenes WLAN des Sticks gibt es noch nicht,
 > siehe [Offene Punkte](#offene-punkte).
@@ -161,6 +162,15 @@ der Stick die Endmarke `%%EOF`.
 parallel zu einem Lesezugriff des Druckers, greift der USB-Teil auf einen abgeräumten
 Kartentreiber zu und das Gerät startet neu. Ein Blick auf die Weboberfläche darf den
 Betrieb nie gefährden — deshalb liest der Stick das Verzeichnis roh mit.
+
+**„Medium abmelden" stoppt keinen laufenden Zugriff.** `mediaPresent(false)` weist nur
+*neue* Kommandos ab. Ein Lesevorgang, der gerade läuft, läuft weiter — ein Linux-Host
+liest beim Aushängen die FAT in 120-kB-Blöcken, das dauert länger als jede feste
+Wartezeit. Wird der Kartentreiber in dieser Zeit abgebaut, hängt der USB-Teil, und nach
+fünf Sekunden startet der Task-Watchdog das Gerät neu (im Kernel-Log des Hosts steht dann
+`cmd_age=5s`). Der Stick zählt deshalb laufende Zugriffe mit und fasst die Karte erst an,
+wenn keiner mehr offen ist. Aus demselben Grund gilt als „Ruhe" erst, wenn der Host weder
+schreibt **noch liest**.
 
 **Bei mehreren Zugangspunkten mit derselben Kennung** nimmt `WiFi.begin(ssid, pass)`
 den erstbesten, nicht den stärksten. Der Stick sucht deshalb vorher und verbindet sich

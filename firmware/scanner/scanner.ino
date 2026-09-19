@@ -335,7 +335,7 @@ static volatile uint32_t g_bytesGeschrieben = 0;   // seit dem letzten Verarbeit
 static uint32_t g_naechsterVersuch = 0;   // 0 = sofort faellig
 static int      g_versuche         = 0;
 
-#define FW_VERSION "v19"
+#define FW_VERSION "v20"
 
 String cfgSsid, cfgPass, cfgEndpoint;
 String cfgWebPass;   // Schutz der Weboberflaeche; leer = offen
@@ -350,31 +350,79 @@ static bool       g_webAn = false;
 static bool       g_updateBegonnen = false;   // Update.begin() ist tatsaechlich gelaufen
 
 // ---- MSC: der Host greift auf die SD zu, jeder Sektor laeuft durch uns ----
+// Uebergabe der Karte zwischen USB-Task und Hauptschleife. mediaPresent(false)
+// haelt nur NEUE Kommandos ab - ein Lesevorgang, der gerade laeuft, laeuft weiter.
+// Ein Linux-Host liest beim Aushaengen die FAT in 120-kB-Bloecken, das dauert
+// laenger als die 200 ms, die wir vor SD_MMC.end() gewartet haben. Der USB-Task
+// hing dann auf dem abgebauten Treiber, nach 5 s schlug der Task-Watchdog zu
+// (im Pruefstand zweimal hintereinander, im Kernel-Log "cmd_age=5s").
+// Deshalb: Sperre setzen, warten bis kein Zugriff mehr laeuft, erst dann anfassen.
+static volatile int  g_usbZugriffe = 0;      // gerade laufende onRead/onWrite
+static volatile bool g_sdGesperrt  = false;  // Hauptschleife hat die Karte
+
 static int32_t onWrite(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize)
 {
     // Rueckgabe 0 heisst fuer TinyUSB "beschaeftigt, gleich nochmal" - bei einem
     // echten Kartenfehler haengt der Host damit endlos. Negativ = sauberer Fehler.
+    if (g_sdGesperrt) return -1;
+    g_usbZugriffe++;
+    int32_t ergebnis = -1;
     uint32_t sec = SD_MMC.sectorSize();
-    if (!sec) return -1;
-    for (uint32_t x = 0; x < bufsize / sec; x++) {
-        if (!SD_MMC.writeRAW(buffer + sec * x, lba + x)) return -1;
+    if (sec) {
+        ergebnis = bufsize;
+        for (uint32_t x = 0; x < bufsize / sec; x++) {
+            if (g_sdGesperrt || !SD_MMC.writeRAW(buffer + sec * x, lba + x)) { ergebnis = -1; break; }
+        }
     }
-    g_lastWrite = millis();
+    if (ergebnis > 0) {
+        g_lastWrite = millis();
+        g_dirty = true;
+        g_bytesGeschrieben += bufsize;   // Messung: kommen ueberhaupt Scandaten an?
+    }
     g_lastHost = millis();
-    g_dirty = true;
-    g_bytesGeschrieben += bufsize;   // Messung: kommen ueberhaupt Scandaten an?
-    return bufsize;
+    g_usbZugriffe--;
+    return ergebnis;
 }
 
 static int32_t onRead(uint32_t lba, uint32_t offset, void *buffer, uint32_t bufsize)
 {
+    if (g_sdGesperrt) return -1;
+    g_usbZugriffe++;
+    int32_t ergebnis = -1;
     uint32_t sec = SD_MMC.sectorSize();
-    if (!sec) return -1;
-    for (uint32_t x = 0; x < bufsize / sec; x++) {
-        if (!SD_MMC.readRAW((uint8_t *)buffer + x * sec, lba + x)) return -1;
+    if (sec) {
+        ergebnis = bufsize;
+        for (uint32_t x = 0; x < bufsize / sec; x++) {
+            if (g_sdGesperrt || !SD_MMC.readRAW((uint8_t *)buffer + x * sec, lba + x)) { ergebnis = -1; break; }
+        }
     }
     g_lastHost = millis();
-    return bufsize;
+    g_usbZugriffe--;
+    return ergebnis;
+}
+
+// Karte dem Host entziehen und warten, bis wirklich niemand mehr darauf zugreift.
+// Liefert false, wenn ein Zugriff nach 5 s immer noch laeuft - dann lieber
+// nicht anfassen und den Host behalten lassen.
+static bool karteUebernehmen()
+{
+    MSC.mediaPresent(false);
+    g_sdGesperrt = true;
+    uint32_t t0 = millis();
+    while (millis() - t0 < 5000) {
+        if (g_usbZugriffe == 0 && millis() - g_lastHost > 300) return true;
+        delay(10);
+    }
+    logZeile(String("[usb] Host laesst nicht los (") + (int)g_usbZugriffe + " Zugriffe offen)");
+    g_sdGesperrt = false;
+    MSC.mediaPresent(true);
+    return false;
+}
+
+static void karteZurueckgeben()
+{
+    g_sdGesperrt = false;
+    MSC.mediaPresent(true);
 }
 
 // SCSI START STOP UNIT. Geraete senden das oft am Jobende ("auswerfen",
@@ -404,29 +452,36 @@ static bool onStartStop(uint8_t pc, bool start, bool eject)
 // Vorgang, den wir beobachten wollen. Der USB-CDC reisst beim WLAN-Start ab,
 // deshalb ist das Netz der einzige verlaessliche Kanal.
 static String g_logPuffer;
+static size_t g_logGesendet = 0;   // bis hierhin ist der Puffer schon beim Empfaenger
 
 static void logZeile(const String &msg)
 {
     Serial.println(msg);
     g_logPuffer += String(millis()) + " " + msg + "\n";
-    if (g_logPuffer.length() > 8000) g_logPuffer.remove(0, 4000);   // Deckel, RAM ist knapp
+    if (g_logPuffer.length() > 8000) {                             // Deckel, RAM ist knapp
+        g_logPuffer.remove(0, 4000);
+        g_logGesendet = g_logGesendet > 4000 ? g_logGesendet - 4000 : 0;
+    }
 }
 
-// Puffer wegschicken. Beruehrt die SD-Karte nicht.
+// Nur das Neue seit dem letzten Mal wegschicken. Beruehrt die SD-Karte nicht.
+// Vorher ging jedes Mal der ganze Puffer raus - pro Scan eine Protokolldatei
+// mit der gesamten Vorgeschichte. Der Puffer selbst bleibt stehen, die
+// Weboberflaeche soll den ganzen Verlauf zeigen.
 static void logFlushNetz()
 {
-    if (g_logPuffer.isEmpty() || cfgEndpoint.isEmpty()) return;
+    if (g_logGesendet >= g_logPuffer.length() || cfgEndpoint.isEmpty()) return;
     if (WiFi.status() != WL_CONNECTED) return;
+    String teil = g_logPuffer.substring(g_logGesendet);
     HTTPClient http;
     String url = cfgEndpoint;
     url += (url.indexOf('?') < 0) ? "?name=" : "&name=";
     url += "scanlog-" + String(millis()) + ".txt";
     if (!http.begin(url)) return;
     http.addHeader("Content-Type", "text/plain");
-    int code = http.POST(g_logPuffer);
+    int code = http.POST(teil);
     http.end();
-    // Puffer bleibt stehen: die Weboberflaeche soll den ganzen Verlauf zeigen
-    (void)code;
+    if (code >= 200 && code < 300) g_logGesendet = g_logPuffer.length();
 }
 
 // ---- MBR-Partitionstyp auf FAT32-LBA (0x0C) setzen ----
@@ -572,12 +627,34 @@ static bool rohVerzeichnis(int &anzahl, uint32_t &summe)
 }
 
 // ---- Konfiguration von der SD lesen ----
-static void ladeConfig()
+// Die Datei gilt nur, wenn sie sich seit dem letzten Uebernehmen GEAENDERT hat.
+// Vorher gewann sie bei jedem Start - wer das Upload-Ziel in der Weboberflaeche
+// umstellte, bekam beim naechsten Neustart still den alten Wert aus der Datei
+// zurueck. Der Pruefstand ist genau daran gescheitert. Liefert true, wenn die
+// Werte uebernommen wurden.
+static bool ladeConfig()
 {
     File f = SD_MMC.open("/wifi.cfg");
-    if (!f) { Serial.println("[cfg] /wifi.cfg fehlt"); return; }
-    while (f.available()) {
-        String line = f.readStringUntil('\n');
+    if (!f) { logZeile("[cfg] /wifi.cfg fehlt"); return false; }
+    String inhalt = f.readString();
+    f.close();
+
+    uint32_t stand = 2166136261u;                    // FNV-1a ueber den Dateiinhalt
+    for (unsigned i = 0; i < inhalt.length(); i++) { stand ^= (uint8_t)inhalt[i]; stand *= 16777619u; }
+    g_nvs.begin("scanstick", true);
+    uint32_t bekannt = g_nvs.getUInt("cfgstand", 0);
+    g_nvs.end();
+    if (stand == bekannt) {
+        logZeile("[cfg] /wifi.cfg unveraendert - Einstellungen aus dem Flash gelten");
+        return false;
+    }
+
+    int von = 0;
+    while (von < (int)inhalt.length()) {
+        int bis = inhalt.indexOf('\n', von);
+        if (bis < 0) bis = inhalt.length();
+        String line = inhalt.substring(von, bis);
+        von = bis + 1;
         line.trim();
         int eq = line.indexOf('=');
         if (eq < 1) continue;
@@ -587,8 +664,32 @@ static void ladeConfig()
         else if (k == "pass") cfgPass = v;
         else if (k == "endpoint") cfgEndpoint = v;
     }
-    f.close();
-    logZeile(String("[cfg] ssid=") + cfgSsid + " endpoint=" + cfgEndpoint);
+    g_nvs.begin("scanstick", false);
+    g_nvs.putUInt("cfgstand", stand);
+    g_nvs.end();
+    logZeile(String("[cfg] /wifi.cfg neu uebernommen: ssid=") + cfgSsid + " endpoint=" + cfgEndpoint);
+    return true;
+}
+
+// Warum sind wir gestartet? Ohne diese Zeile ist ein Neustart im Betrieb nicht
+// von einem Stromausfall zu unterscheiden - und Brownout, Absturz und Watchdog
+// verlangen voellig verschiedene Gegenmassnahmen.
+static const char *g_startGrund = "unbekannt";
+static const char *resetGrund()
+{
+    switch (esp_reset_reason()) {
+        case ESP_RST_POWERON:  return "Strom eingeschaltet";
+        case ESP_RST_SW:       return "Software-Neustart";
+        case ESP_RST_PANIC:    return "Absturz (Panic)";
+        case ESP_RST_INT_WDT:  return "Interrupt-Watchdog";
+        case ESP_RST_TASK_WDT: return "Task-Watchdog";
+        case ESP_RST_WDT:      return "Watchdog";
+        case ESP_RST_BROWNOUT: return "Brownout (Spannungseinbruch)";
+        case ESP_RST_DEEPSLEEP: return "Tiefschlaf";
+        case ESP_RST_EXT:      return "externer Reset";
+        case ESP_RST_USB:      return "USB-Reset";
+        default:               return "unbekannt";
+    }
 }
 
 // ---- Zugangsdaten zusaetzlich im NVS-Flash ----
@@ -1006,6 +1107,7 @@ static void webStatus()
     if (g_rssiLetztLast)
         h += zl("Empfang am Ende des letzten Uploads", String(g_rssiLetztLast) + " dBm");
     h += zl("Laufzeit", dauer(millis()));
+    h += zl("Letzter Startgrund", g_startGrund);
     h += zl("Freier Speicher", menschlich(ESP.getFreeHeap()));
     h += "</table><p>"
          "<form method=\"post\" action=\"/jetzt-schauen\" style=\"display:inline\">"
@@ -1461,15 +1563,18 @@ static void verarbeiteScans(bool manuell)
         // gerade abgeraeumten Kartentreiber zu und der Stick startete neu -
         // derselbe Fehler, der frueher in der Dateien-Seite steckte. Gefahrlos
         // ist der Entzug hier, weil roh bereits eine fertige Datei zu sehen war.
-        MSC.mediaPresent(false);
-        delay(200);
+        if (!karteUebernehmen()) {
+            logZeile("[scan] Karte nicht bekommen, naechster Anlauf spaeter");
+            g_naechsterVersuch = millis() + 5000;
+            return;                          // g_dirty bleibt stehen
+        }
 
         SD_MMC.end();
         delay(100);
         SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0, SD_D1, SD_D2, SD_D3);
         if (!SD_MMC.begin()) {
             logZeile("[scan] remount fehlgeschlagen");
-            MSC.mediaPresent(true);          // Medium auf keinen Fall verlieren
+            karteZurueckgeben();             // Medium auf keinen Fall verlieren
             return;
         }
 
@@ -1477,6 +1582,7 @@ static void verarbeiteScans(bool manuell)
         g_fundAnzahl = 0;
         sammleDateien("/", 0);
         bool wifi = wifiVerbinden();
+        logFlushNetz();                      // Stand VOR dem Senden sichern - stuerzt es ab, wissen wir wo
         sendeGefundene(wifi, hoch, fehler);
 
         // SCHRITT 4: Cache schreiben, dem Drucker eine frische Sicht geben
@@ -1484,7 +1590,7 @@ static void verarbeiteScans(bool manuell)
         delay(80);
         SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0, SD_D1, SD_D2, SD_D3);
         SD_MMC.begin();
-        MSC.mediaPresent(true);
+        karteZurueckgeben();
         logZeile("[usb] Stick neu angemeldet");
     } else {
         logZeile("[scan] roh nachgesehen: nichts zu holen");
@@ -1540,6 +1646,8 @@ void setup()
     Serial.begin(115200);
     delay(300);
     Serial.println("\n=== Scan-Stick " FW_VERSION " ===");
+    g_startGrund = resetGrund();
+    logZeile(String("[boot] " FW_VERSION ", Grund: ") + g_startGrund);
 
     ledInit();
     ledColor(60, 60, 60);   // WEISS = Strom da, bootet
@@ -1557,14 +1665,10 @@ void setup()
     if (!sdOk) { logZeile("[sd] Mount fehlgeschlagen"); zeigeScreen(Z_SDFEHL); }
     else fixMbrTyp();   // MBR nur bei gemounteter Karte anfassen
 
-    if (sdOk) {
-        String altS = cfgSsid, altP = cfgPass, altE = cfgEndpoint;
-        ladeConfig();                     // /wifi.cfg hat Vorrang
-        if (cfgSsid != altS || cfgPass != altP || cfgEndpoint != altE) {
-            cfgNachNvs();
-            logZeile("[nvs] aus /wifi.cfg aktualisiert");
-            if (WiFi.status() != WL_CONNECTED) wlanStarten();
-        }
+    if (sdOk && ladeConfig()) {          // nur eine GEAENDERTE /wifi.cfg gewinnt
+        cfgNachNvs();
+        logZeile("[nvs] aus /wifi.cfg uebernommen");
+        if (WiFi.status() != WL_CONNECTED) wlanStarten();
     }
 
     MSC.vendorID("DIY");
@@ -1630,7 +1734,10 @@ void loop()
     // Groesse schon vor dem Schreiben ein. Wuerden wir darauf vertrauen, benennen
     // wir mitten im laufenden Scan um - der Drucker schreibt dann seine alte
     // Verzeichnissicht zurueck und die Umbenennung ist weg. Also zusaetzlich Ruhe abwarten.
-    if (g_dirty && !g_warteAnzeige && nun - g_lastWrite > ROH_RUHE &&
+    // Ruhe heisst: weder Schreiben NOCH Lesen. Ein Host, der nach dem Schreiben
+    // noch liest (Linux beim Aushaengen, ein Drucker beim Nachpruefen), ist nicht
+    // fertig - ihm jetzt das Medium zu entziehen bringt nur Fehler auf seiner Seite.
+    if (g_dirty && !g_warteAnzeige && nun - g_lastHost > ROH_RUHE &&
         nun - g_rohLetzt > ROH_INTERVALL) {
         g_rohLetzt = nun;
         int anz = 0;
