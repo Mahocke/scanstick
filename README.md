@@ -202,6 +202,63 @@ Für den Produktivbetrieb tritt hier etwas anderes an die Stelle — Ablage in e
 Cloud, einem Dokumentensystem oder einem Ordner. Die Firmware kennt bewusst nur eine
 URL, damit das Ziel austauschbar bleibt.
 
+### Wo der Empfänger laufen sollte
+
+Das Skript läuft ohne Zusatzpakete auf Linux, macOS und Windows. Entscheidend ist aber
+nicht das Betriebssystem, sondern die **Verfügbarkeit**: Der Empfänger muss laufen,
+wenn jemand scannt. Schläft der Rechner, bleibt die Datei auf der Karte liegen und wird
+beim nächsten Anlauf erneut versucht — angekommen ist sie aber nicht.
+
+| Gastgeber | Eignung |
+|---|---|
+| Raspberry Pi | ideal: läuft durch, wenig Strom, als Dienst einrichtbar |
+| NAS | sehr gut, Ablage direkt am Ziel |
+| Server / VM | gut, sofern vom Stick erreichbar |
+| Arbeitsplatzrechner | nur solange er wach ist |
+
+### Firewall und Autostart
+
+**macOS** — beim ersten Start erscheint „Eingehende Netzwerkverbindungen zulassen?",
+das muss erlaubt werden (nachträglich unter *Systemeinstellungen → Netzwerk → Firewall
+→ Optionen*). Port 8080 braucht keine Administratorrechte. Dauerhaft über einen
+LaunchAgent in `~/Library/LaunchAgents/`; der Rechner darf dann nicht in den
+Ruhezustand gehen.
+
+**Windows** — die Defender-Firewall fragt beim ersten Start nach; Haken bei *Privates
+Netzwerk*, öffentliche Netzwerke nicht. Nachträglich: *Eingehende Regel → Port → TCP
+8080 → zulassen*, Profil „Privat". Dauerhaft über die Aufgabenplanung („Beim Start des
+Computers") oder als Dienst.
+
+**Linux** — falls eine Firewall aktiv ist: `sudo ufw allow 8080/tcp` beziehungsweise
+`firewall-cmd --add-port=8080/tcp --permanent`. Dauerhaft als systemd-Unit:
+
+```ini
+# /etc/systemd/system/scan-receiver.service
+[Unit]
+Description=Scan-Stick Empfaenger
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/scanstick/scan-receiver.py
+Restart=always
+User=pi
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl enable --now scan-receiver
+```
+
+**Zwei Dinge, die man leicht vergisst:**
+
+1. Der Empfänger braucht eine **feste Adresse** — im Router reserviert oder statisch
+   vergeben. Bekommt er per DHCP eine neue, zeigt `endpoint=` ins Leere, und zwar
+   irgendwann mitten im Betrieb.
+2. Er nimmt **alles** entgegen, was an ihn geschickt wird. Im Heimnetz ist das
+   vertretbar, aus dem Internet erreichbar sollte er nicht sein.
+
 ## Anzeige
 
 | Anzeige | Bedeutung |
