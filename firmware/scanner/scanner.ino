@@ -331,14 +331,11 @@ static volatile uint32_t g_lastWrite = 0;
 static volatile uint32_t g_lastHost  = 0;   // wann hat der Host zuletzt gelesen/geschrieben
 static volatile bool     g_dirty     = false;
 static volatile uint32_t g_bytesGeschrieben = 0;   // seit dem letzten Verarbeiten
-// Merkmale der zuletzt gesendeten Datei - gegen doppelte Uploads
-static uint32_t g_letzteGroesse = 0;
-static uint32_t g_letztePruef   = 0;
 
 static uint32_t g_naechsterVersuch = 0;   // 0 = sofort faellig
 static int      g_versuche         = 0;
 
-#define FW_VERSION "v18"
+#define FW_VERSION "v19"
 
 String cfgSsid, cfgPass, cfgEndpoint;
 String cfgWebPass;   // Schutz der Weboberflaeche; leer = offen
@@ -350,14 +347,17 @@ static bool g_startGeprueft = false;   // nach dem Hochlaufen einmal nachsehen
 static WebServer  g_web(80);
 static Preferences g_nvs;
 static bool       g_webAn = false;
+static bool       g_updateBegonnen = false;   // Update.begin() ist tatsaechlich gelaufen
 
 // ---- MSC: der Host greift auf die SD zu, jeder Sektor laeuft durch uns ----
 static int32_t onWrite(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize)
 {
+    // Rueckgabe 0 heisst fuer TinyUSB "beschaeftigt, gleich nochmal" - bei einem
+    // echten Kartenfehler haengt der Host damit endlos. Negativ = sauberer Fehler.
     uint32_t sec = SD_MMC.sectorSize();
-    if (!sec) return 0;
+    if (!sec) return -1;
     for (uint32_t x = 0; x < bufsize / sec; x++) {
-        if (!SD_MMC.writeRAW(buffer + sec * x, lba + x)) return 0;
+        if (!SD_MMC.writeRAW(buffer + sec * x, lba + x)) return -1;
     }
     g_lastWrite = millis();
     g_lastHost = millis();
@@ -369,9 +369,9 @@ static int32_t onWrite(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t 
 static int32_t onRead(uint32_t lba, uint32_t offset, void *buffer, uint32_t bufsize)
 {
     uint32_t sec = SD_MMC.sectorSize();
-    if (!sec) return 0;
+    if (!sec) return -1;
     for (uint32_t x = 0; x < bufsize / sec; x++) {
-        if (!SD_MMC.readRAW((uint8_t *)buffer + x * sec, lba + x)) return 0;
+        if (!SD_MMC.readRAW((uint8_t *)buffer + x * sec, lba + x)) return -1;
     }
     g_lastHost = millis();
     return bufsize;
@@ -458,6 +458,27 @@ static void fixMbrTyp()
 
 #define ROH_MIN_GROESSE 2048   // darunter: Hilfsdateien wie wifi.cfg, kein Scan
 
+// Was gilt als Scan? EIN Massstab fuer den Rohleser (sieht nur den 8.3-Kurznamen)
+// und den Sammler (sieht den langen Namen). Vorher zaehlte der Rohleser jede
+// Datei ab 2 kB, der Sammler uebersprang aber alles mit fuehrendem Punkt. Eine
+// "._wifi.cfg" vom Mac (4 kB, Kurzname "_WIFI~1.CFG") war roh sichtbar, im
+// Sammellauf aber nicht - der Stick meldete das Medium daraufhin fuenfmal in
+// Folge ab und wieder an, nach jedem Start und nach jedem Schreibzugriff.
+static bool istScanEndung(const uint8_t *e)   // 3 Zeichen aus dem Kurznamen, gross
+{
+    return !memcmp(e, "PDF", 3) || !memcmp(e, "JPG", 3) || !memcmp(e, "JPE", 3) ||
+           !memcmp(e, "TIF", 3);
+}
+
+static bool istScanName(const String &basis)
+{
+    int p = basis.lastIndexOf('.');
+    if (p < 0) return false;
+    String e = basis.substring(p + 1);
+    e.toUpperCase();
+    return e == "PDF" || e == "JPG" || e == "JPEG" || e == "TIF" || e == "TIFF";
+}
+
 struct FatLage {
     bool     gueltig;
     uint8_t  sektorenProCluster;
@@ -536,6 +557,7 @@ static bool rohVerzeichnis(int &anzahl, uint32_t &summe)
                 uint8_t attr = d[11];
                 if (attr == 0x0F) continue;                   // Teil eines langen Namens
                 if (attr & 0x18) continue;                    // Ordner oder Datentraegername
+                if (!istScanEndung(d + 8)) continue;          // Endung im Kurznamen: Byte 8-10
                 uint32_t gr = le32(d + 28);
                 if (gr < ROH_MIN_GROESSE) continue;           // Hilfsdatei, kein Scan
                 anzahl++;
@@ -585,8 +607,6 @@ static void cfgAusNvs()
     g_loeschen  = g_nvs.getBool("loeschen", true);
     g_invertiert = g_nvs.getBool("invers", true);
     g_ledHell   = (uint8_t)g_nvs.getUChar("ledhell", 5);
-    g_letzteGroesse = g_nvs.getUInt("dubgr", 0);
-    g_letztePruef   = g_nvs.getUInt("dubpr", 0);
     for (int i = 0; i < Z_ANZAHL; i++) {
         char k[10];
         snprintf(k, sizeof k, "farbe%d", i);
@@ -764,13 +784,14 @@ static bool dateiVollstaendig(const String &pfad, uint32_t groesse)
     return false;
 }
 
-// Merkmale der zuletzt gesendeten Datei. Der Drucker stellt nach dem
+// Kennung der Datei fuer den Empfaenger. Der Drucker stellt nach dem
 // Verschieben gern seine alte Verzeichnissicht wieder her - dann zeigt
-// "[Untitled].pdf" erneut auf dieselben Daten und wir wuerden sie ein zweites
-// Mal hochladen. Genau das ist heute zweimal passiert.
-
-// Kurze Kennzahl aus Groesse plus erstem und letztem Block - reicht voellig,
-// um dieselbe Datei wiederzuerkennen, und kostet kaum Lesezeit.
+// "[Untitled].pdf" erneut auf dieselben Daten und wir laden sie ein zweites
+// Mal hoch. Der Empfaenger erkennt die Wiederholung an dieser Kennung.
+//
+// Kurze Kennzahl aus Groesse plus erstem und letztem Block - reicht, um
+// dieselbe Datei wiederzuerkennen, und kostet kaum Lesezeit. Zum LOESCHEN ohne
+// Upload taugt sie bewusst nicht (siehe sendeGefundene).
 static uint32_t dateiKennzahl(const String &pfad, uint32_t groesse)
 {
     File f = SD_MMC.open(pfad);
@@ -986,8 +1007,11 @@ static void webStatus()
         h += zl("Empfang am Ende des letzten Uploads", String(g_rssiLetztLast) + " dBm");
     h += zl("Laufzeit", dauer(millis()));
     h += zl("Freier Speicher", menschlich(ESP.getFreeHeap()));
-    h += "</table><p><a class=\"btn\" href=\"/jetzt-schauen\">Jetzt nach Scans schauen</a>"
-         "<a class=\"btn\" href=\"/neustart\">Neu starten</a></p>";
+    h += "</table><p>"
+         "<form method=\"post\" action=\"/jetzt-schauen\" style=\"display:inline\">"
+         "<button class=\"btn\" type=\"submit\">Jetzt nach Scans schauen</button></form>"
+         "<form method=\"post\" action=\"/neustart\" style=\"display:inline\">"
+         "<button class=\"btn\" type=\"submit\">Neu starten</button></form></p>";
     g_web.send(200, "text/html; charset=utf-8", h + htmlFuss());
 }
 
@@ -1071,9 +1095,33 @@ static void webHolen()
     f.close();
 }
 
+// Formulare nur von der eigenen Seite annehmen. Ein Browser schickt bei einer
+// Absendung von einer fremden Seite immer die Kopfzeile Origin mit - stimmt sie
+// nicht mit unserem Host ueberein, war es nicht unsere Seite. So konnte eine
+// beliebige Webseite im selben Browser das Upload-Ziel umbiegen oder den Stick
+// mitten im Upload neu starten; ein gespeichertes Passwort schickt der Browser
+// automatisch mit. Werkzeuge wie curl schicken kein Origin und duerfen weiter,
+// sie haben ohnehin kein im Browser gespeichertes Passwort.
+static bool herkunftOk()
+{
+    String eigen = "http://" + g_web.hostHeader();
+    String origin = g_web.header("Origin");
+    if (origin.length()) return origin == eigen;
+    String referer = g_web.header("Referer");
+    if (referer.length()) return referer.startsWith(eigen + "/");
+    return true;
+}
+
+static bool herkunftPruefen()
+{
+    if (herkunftOk()) return true;
+    g_web.send(403, "text/plain; charset=utf-8", "Anfrage kam nicht von dieser Seite\n");
+    return false;
+}
+
 static void webJetztSchauen()
 {
-    if (!webAuth()) return;
+    if (!webAuth() || !herkunftPruefen()) return;
     // Einmal nachschauen. Frueher wurde hier g_dirty gesetzt - das loeste den
     // Wiederhol-Mechanismus fuer den Drucker-Commit aus, der hier nicht gemeint ist.
     g_einmalSchauen = true;
@@ -1128,7 +1176,7 @@ static void webRoh()
 
 static void webNeustart()
 {
-    if (!webAuth()) return;
+    if (!webAuth() || !herkunftPruefen()) return;
     g_web.send(200, "text/html; charset=utf-8",
                htmlKopf("Neustart") + "<p>Der Stick startet neu. Diese Seite ist in etwa "
                "10 Sekunden wieder da.</p>" + htmlFuss());
@@ -1141,6 +1189,7 @@ static void webEinstellungen()
     if (!webAuth()) return;
 
     if (g_web.method() == HTTP_POST) {
+        if (!herkunftPruefen()) return;
         if (g_web.hasArg("endpoint")) cfgEndpoint = g_web.arg("endpoint");
         if (g_web.hasArg("idle")) {
             uint32_t sek = g_web.arg("idle").toInt();
@@ -1231,27 +1280,39 @@ static void webStarten()
     g_web.on("/einstellungen", HTTP_GET, webEinstellungen);
     g_web.on("/einstellungen", HTTP_POST, webEinstellungen);
     g_web.on("/holen", webHolen);
-    g_web.on("/jetzt-schauen", webJetztSchauen);
-    g_web.on("/neustart", webNeustart);
+    // Nebenwirkungen nur per POST: ein GET laesst sich von jeder fremden Seite
+    // als Bild-Adresse unterschieben, ein POST nicht ohne Origin-Kopfzeile.
+    g_web.on("/jetzt-schauen", HTTP_POST, webJetztSchauen);
+    g_web.on("/neustart", HTTP_POST, webNeustart);
     g_web.on("/update", HTTP_GET, webUpdateSeite);
     g_web.on("/update", HTTP_POST,
         []() {
-            bool fehler = Update.hasError();
-            g_web.send(200, "text/html; charset=utf-8",
-                       htmlKopf(fehler ? "Update fehlgeschlagen" : "Update eingespielt") +
-                       (fehler ? "<p class=\"bad\">Das Abbild wurde verworfen, die bisherige "
-                                 "Firmware laeuft weiter.</p>"
-                               : "<p class=\"ok\">Der Stick startet jetzt neu. Diese Seite ist in "
-                                 "etwa 10 Sekunden wieder da.</p>") + htmlFuss());
+            // Der Abschluss lief frueher ohne Passwortpruefung und startete den
+            // Stick auch dann neu, wenn gar kein Abbild geschrieben worden war.
+            // Ein "curl -X POST /update" von irgendwem im WLAN genuegte damit,
+            // einen laufenden Upload abzuschiessen.
+            if (!webAuth() || !herkunftPruefen()) return;
+            bool ok = g_updateBegonnen && Update.isFinished() && !Update.hasError();
+            g_updateBegonnen = false;
+            g_web.send(ok ? 200 : 400, "text/html; charset=utf-8",
+                       htmlKopf(ok ? "Update eingespielt" : "Update fehlgeschlagen") +
+                       (ok ? "<p class=\"ok\">Der Stick startet jetzt neu. Diese Seite ist in "
+                             "etwa 10 Sekunden wieder da.</p>"
+                           : "<p class=\"bad\">Es wurde kein vollstaendiges Abbild geschrieben, "
+                             "die bisherige Firmware laeuft weiter.</p>") + htmlFuss());
             delay(600);
-            if (!fehler) ESP.restart();
+            if (ok) ESP.restart();
         },
         []() {
-            if (!webAuth()) return;
+            // Hier nur pruefen, nicht antworten - die Antwort gibt der Abschluss.
+            // Ein Passwort ist gesetzt und fehlt: Abbild gar nicht erst annehmen.
+            if (cfgWebPass.length() && !g_web.authenticate("scan", cfgWebPass.c_str())) return;
+            if (!herkunftOk()) return;
             HTTPUpload &up = g_web.upload();
             if (up.status == UPLOAD_FILE_START) {
                 logZeile("[update] Start: " + up.filename);
-                if (!Update.begin(UPDATE_SIZE_UNKNOWN)) logZeile("[update] begin fehlgeschlagen");
+                g_updateBegonnen = Update.begin(UPDATE_SIZE_UNKNOWN);
+                if (!g_updateBegonnen) logZeile("[update] begin fehlgeschlagen");
             } else if (up.status == UPLOAD_FILE_WRITE) {
                 if (Update.write(up.buf, up.currentSize) != up.currentSize)
                     logZeile("[update] Schreibfehler");
@@ -1261,6 +1322,9 @@ static void webStarten()
             }
         });
     g_web.onNotFound([]() { g_web.sendHeader("Location", "/"); g_web.send(303, "text/plain", ""); });
+    // Der WebServer behaelt nur angeforderte Kopfzeilen; Host merkt er sich immer.
+    const char *kopf[] = { "Origin", "Referer" };
+    g_web.collectHeaders(kopf, 2);
     g_web.begin();
     if (MDNS.begin("scanstick")) MDNS.addService("http", "tcp", 80);
     g_webAn = true;
@@ -1293,7 +1357,7 @@ static void sammleDateien(const String &pfad, int tiefe)
                 sammleDateien(voll, tiefe + 1);
             continue;
         }
-        if (basis.equalsIgnoreCase("wifi.cfg") || basis.startsWith(".")) continue;
+        if (!istScanName(basis)) continue;   // derselbe Massstab wie im Rohleser
         if (!sz) continue;
         if (g_fundAnzahl < MAX_FUND) g_fund[g_fundAnzahl++] = voll;
     }
@@ -1322,12 +1386,12 @@ static void sendeGefundene(bool wifi, int &hoch, int &fehler)
             fehler++;
             continue;
         }
+        // Die Kennzahl geht als Kennung mit; ob es eine Wiederholung ist,
+        // entscheidet der Empfaenger. Frueher verglich der Stick hier selbst
+        // mit der zuletzt gesendeten Datei und LOESCHTE bei Gleichstand ohne
+        // Upload - die Kennzahl deckt aber nur Anfang und Ende ab, zwei echte
+        // Scans desselben Formulars haetten so still verschwinden koennen.
         uint32_t kennzahl = dateiKennzahl(voll, groesse);
-        if (groesse && groesse == g_letzteGroesse && kennzahl == g_letztePruef) {
-            logZeile("[dub] " + basis + " ist die zuletzt gesendete Datei - nur wegraeumen");
-            SD_MMC.remove(voll);
-            continue;
-        }
 
         // Umbenennen, bevor gesendet wird: der Drucker nennt jeden Scan gleich
         // ("[Untitled].pdf"), der Name muss sofort wieder frei sein.
@@ -1367,12 +1431,6 @@ static void sendeGefundene(bool wifi, int &hoch, int &fehler)
                 if (SD_MMC.rename(sendePfad, ziel)) logZeile("[up] aufgehoben als " + ziel);
                 else { logZeile("[up] Verschieben fehlgeschlagen, loesche"); SD_MMC.remove(sendePfad); }
             }
-            g_letzteGroesse = groesse;
-            g_letztePruef   = kennzahl;
-            g_nvs.begin("scanstick", false);          // Neustart soll das nicht vergessen
-            g_nvs.putUInt("dubgr", g_letzteGroesse);
-            g_nvs.putUInt("dubpr", g_letztePruef);
-            g_nvs.end();
             hoch++;
         } else {
             fehler++;
@@ -1515,7 +1573,10 @@ void setup()
     MSC.onStartStop(onStartStop);
     MSC.onRead(onRead);
     MSC.onWrite(onWrite);
-    MSC.mediaPresent(true);
+    // Ohne Karte "kein Medium" melden statt eines Laufwerks mit 0 Sektoren. So
+    // sieht der Host einen leeren Kartenleser, und von aussen ist der Zustand
+    // vom frueheren Boot-Haenger zu unterscheiden.
+    MSC.mediaPresent(sdOk);
     MSC.isWritable(true);
     uint32_t sec = SD_MMC.sectorSize();
     uint32_t rawSectors = sec ? (uint32_t)(SD_MMC.cardSize() / sec) : 0;

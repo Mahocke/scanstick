@@ -182,6 +182,18 @@ Erreichbar über `http://scanstick.local/` oder die angezeigte Adresse.
 Ein **Passwort** lässt sich setzen (Benutzername `scan`). Ohne kann jedes Gerät im
 selben Netz die Scans herunterladen.
 
+Alles, was etwas verändert (Einstellungen, „Jetzt schauen", Neustart, Firmware), geht
+nur per `POST` und nur von der eigenen Seite: Schickt ein Browser eine `Origin`- oder
+`Referer`-Kopfzeile mit, muss sie zum Stick passen. Sonst könnte eine beliebige fremde
+Webseite im selben Browser das Upload-Ziel umbiegen oder den Stick mitten im Upload neu
+starten, denn ein gespeichertes Passwort schickt der Browser automatisch mit. Werkzeuge
+wie `curl` schicken keine `Origin`-Kopfzeile und funktionieren weiter:
+
+```bash
+curl -u scan:PASSWORT --data-urlencode 'endpoint=http://192.168.1.50:8080/scan' http://scanstick.local/einstellungen
+curl -u scan:PASSWORT -X POST http://scanstick.local/neustart
+```
+
 ## Einstellungen
 
 Upload-Ziel · Namensanfang der Dateien (z. B. Standortkennung) · Ruhefrist ·
@@ -196,11 +208,41 @@ nimmt `POST /scan?name=…` entgegen und legt die Datei ab.
 
 ```bash
 python3 empfaenger/scan-receiver.py    # lauscht auf Port 8080, legt in ~/scan-inbox ab
+SCAN_PORT=9000 SCAN_INBOX=/srv/scans python3 empfaenger/scan-receiver.py
 ```
+
+Der Empfänger nimmt eine Datei nur an, wenn sie **vollständig** ist: Die Länge muss der
+Ankündigung entsprechen, eine PDF muss auf `%%EOF` enden. Sonst antwortet er mit 400
+und merkt sich nichts, der Stick versucht es später erneut. Das ist wichtig, weil der
+Stick Wiederholungen über eine Kennung meldet und der Empfänger sie verwirft: Würde
+er einen abgerissenen Upload verkürzt ablegen und die Kennung merken, gälte die
+Wiederholung als Duplikat, und der Stick löschte daraufhin das einzige vollständige
+Exemplar. Das Protokoll des Sticks (`scanlog-*.txt`) landet im Unterordner `protokoll/`.
 
 Für den Produktivbetrieb tritt hier etwas anderes an die Stelle — Ablage in einer
 Cloud, einem Dokumentensystem oder einem Ordner. Die Firmware kennt bewusst nur eine
-URL, damit das Ziel austauschbar bleibt.
+URL, damit das Ziel austauschbar bleibt. Wer einen eigenen Empfänger schreibt, sollte
+die drei Regeln übernehmen: Länge prüfen, bei PDF `%%EOF` prüfen, Kennung erst nach
+erfolgreicher Ablage merken.
+
+## Prüfstand ohne Drucker
+
+`test/stresstest.sh` läuft auf einem Linux-Rechner, an dem der Stick steckt (ein
+Raspberry Pi eignet sich). Der Rechner spielt den Drucker: mounten, Test-PDFs
+schreiben, auswerfen. Ein Empfänger auf demselben Rechner prüft, ob jede Datei
+vollständig und genau einmal ankommt. Drei Szenarien: eine Datei, zwei in einem Zug,
+und eine zweite Datei im engsten Moment, sobald das Medium nach dem ersten Upload
+wieder da ist.
+
+```bash
+sudo SCAN_WEBPASS=PASSWORT test/stresstest.sh http://scanstick.local /dev/sda1
+```
+
+Das Upload-Ziel des Sticks wird für die Dauer des Tests umgestellt und danach
+zurückgesetzt. Die Partition wird nur angefasst, wenn sie zu einem Espressif-USB-Gerät
+gehört und `SCANS` heißt. Der Linux-Treiber schreibt Verzeichniseinträge früher und
+anders als ein Drucker; der Prüfstand ersetzt den Drucktest nicht, macht aber
+Regressionen wiederholbar sichtbar.
 
 ### Wo der Empfänger laufen sollte
 

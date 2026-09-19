@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+# Pruefstand fuer den Scan-Stick - ohne Drucker.
+#
+# Laeuft auf einem Linux-Rechner (etwa einem Raspberry Pi), an dem der Stick als
+# USB-Laufwerk haengt. Der Rechner spielt den Drucker: er mountet den Stick,
+# schreibt Test-PDFs, wirft aus. Ein Empfaenger auf demselben Rechner prueft,
+# ob jede Datei vollstaendig und genau einmal ankommt.
+#
+#   sudo test/stresstest.sh [Stick-Adresse] [Partition]
+#     Stick-Adresse  http://scanstick.local  (Vorgabe)
+#     Partition      /dev/sda1               (Vorgabe)
+#
+#   Umgebung: SCAN_WEBPASS=...  Passwort der Weboberflaeche (Benutzer scan)
+#             SCAN_PORT=8090    Port des Test-Empfaengers
+#
+# Das Upload-Ziel des Sticks wird fuer die Dauer des Tests auf diesen Rechner
+# umgestellt und am Ende zurueckgesetzt. Die Partition wird nur angefasst, wenn
+# sie zu einem Espressif-USB-Geraet gehoert und SCANS heisst.
+#
+# Drei Szenarien:
+#   A  eine Datei
+#   B  zwei Dateien in einem Zug (der Drucker legt sie nacheinander ab)
+#   C  zweite Datei, sobald das Medium nach dem ersten Upload wieder da ist -
+#      der engste Zeitpunkt, den ein Drucker real treffen kann
+#
+# Der Linux-Treiber schreibt Verzeichniseintraege frueher und anders als ein
+# Drucker. Der Pruefstand ersetzt den Drucktest nicht, macht aber Regressionen
+# wiederholbar sichtbar.
+set -u
+export PATH="/sbin:/usr/sbin:$PATH"
+
+STICK="${1:-http://scanstick.local}"
+DEV="${2:-/dev/sda1}"
+PORT="${SCAN_PORT:-8090}"
+PASS="${SCAN_WEBPASS:-}"
+HIER="$(cd "$(dirname "$0")/.." && pwd)"
+ARBEIT="$(mktemp -d /tmp/stresstest.XXXX)"
+INBOX="$ARBEIT/inbox"
+MNT="$ARBEIT/mnt"
+mkdir -p "$INBOX" "$MNT"
+BLOCK="/dev/$(basename "$DEV" | sed 's/[0-9]*$//')"
+FEHLER=0
+GESCHRIEBEN=0
+ALTES_ZIEL=""
+EMPFAENGER_PID=""
+
+CURL=(curl -s -m 15)
+[ -n "$PASS" ] && CURL+=(-u "scan:$PASS")
+
+log()  { printf '%s  %s\n' "$(date +%H:%M:%S)" "$*"; }
+fail() { log "FEHLER: $*"; FEHLER=$((FEHLER + 1)); }
+
+aufraeumen() {
+    mountpoint -q "$MNT" && umount "$MNT"
+    if [ -n "$ALTES_ZIEL" ]; then
+        "${CURL[@]}" --data-urlencode "endpoint=$ALTES_ZIEL" "$STICK/einstellungen" >/dev/null \
+            && log "Upload-Ziel zurueckgesetzt auf $ALTES_ZIEL" \
+            || log "WARNUNG: Upload-Ziel konnte nicht zurueckgesetzt werden (war $ALTES_ZIEL)"
+    fi
+    [ -n "$EMPFAENGER_PID" ] && kill "$EMPFAENGER_PID" 2>/dev/null
+    log "Arbeitsordner: $ARBEIT (Empfaenger-Log, Inbox)"
+}
+trap aufraeumen EXIT
+
+[ "$(id -u)" = 0 ] || { echo "bitte mit sudo starten (mount/umount)"; exit 2; }
+
+# ---- Sicherheitsnetz: nur den Stick anfassen ----
+VID=$(udevadm info -q property -n "$BLOCK" 2>/dev/null | sed -n 's/^ID_VENDOR_ID=//p')
+LABEL=$(lsblk -no LABEL "$DEV" 2>/dev/null)
+if [ "$VID" != "303a" ] || [ "$LABEL" != "SCANS" ]; then
+    echo "$DEV ist kein Scan-Stick (USB-Hersteller '$VID', Name '$LABEL') - Abbruch"
+    exit 2
+fi
+
+# ---- Stick erreichbar? ----
+STATUS=$("${CURL[@]}" "$STICK/") || { echo "Weboberflaeche $STICK nicht erreichbar"; exit 2; }
+VERSION=$(printf '%s' "$STATUS" | grep -o 'Scan-Stick v[0-9]*' | head -1)
+ALTES_ZIEL=$(printf '%s' "$STATUS" | grep -o 'Ziel fuer Uploads</td><td>[^<]*' | sed 's/.*<td>//')
+STICK_IP=$(getent hosts "${STICK#http://}" | awk '{print $1}')
+[ -z "$STICK_IP" ] && STICK_IP="${STICK#http://}"
+MEINE_IP=$(ip -o route get "$STICK_IP" | sed -n 's/.*src \([0-9.]*\).*/\1/p')
+log "Stick: $VERSION unter $STICK, bisheriges Ziel: $ALTES_ZIEL"
+log "Pruefstand: $(hostname) $MEINE_IP, Empfaenger auf Port $PORT"
+
+# ---- Empfaenger starten und Stick umstellen ----
+SCAN_PORT="$PORT" SCAN_INBOX="$INBOX" python3 "$HIER/empfaenger/scan-receiver.py" \
+    >"$ARBEIT/empfaenger.log" 2>&1 &
+EMPFAENGER_PID=$!
+sleep 1
+curl -s -m 3 "http://127.0.0.1:$PORT/" >/dev/null || { echo "Empfaenger startet nicht, siehe $ARBEIT/empfaenger.log"; exit 2; }
+
+NEUES_ZIEL="http://$MEINE_IP:$PORT/scan"
+"${CURL[@]}" --data-urlencode "endpoint=$NEUES_ZIEL" "$STICK/einstellungen" >/dev/null
+JETZT=$("${CURL[@]}" "$STICK/" | grep -o 'Ziel fuer Uploads</td><td>[^<]*' | sed 's/.*<td>//')
+[ "$JETZT" = "$NEUES_ZIEL" ] || { echo "Upload-Ziel liess sich nicht setzen (steht auf '$JETZT')"; exit 2; }
+log "Upload-Ziel fuer den Test: $NEUES_ZIEL"
+
+# ---- Hilfsfunktionen ----
+medium_da() { dd if="$BLOCK" of=/dev/null bs=512 count=1 2>/dev/null; }
+
+warte_medium() {   # warte_medium da|weg Sekunden
+    local ziel=$1 frist=$2 t=0
+    while [ $t -lt "$frist" ]; do
+        if [ "$ziel" = da ]; then
+            if medium_da; then partprobe "$BLOCK" 2>/dev/null; sleep 1; [ -b "$DEV" ] && return 0; fi
+        else
+            medium_da || return 0
+        fi
+        sleep 1; t=$((t + 1))
+    done
+    return 1
+}
+
+# erzeugt eine PDF mit gueltigem Kopf, Zufallsinhalt und %%EOF am Ende
+mach_pdf() {   # mach_pdf Datei Bytes
+    python3 - "$1" "$2" <<'PY'
+import os, sys
+pfad, groesse = sys.argv[1], int(sys.argv[2])
+kopf = (b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"
+        b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n"
+        b"2 0 obj << /Type /Pages /Kids [] /Count 0 >> endobj\n"
+        b"3 0 obj << /Length 0 >> stream\n")
+fuss = b"\nendstream endobj\ntrailer << /Root 1 0 R >>\n%%EOF\n"
+with open(pfad, "wb") as f:
+    f.write(kopf)
+    f.write(os.urandom(max(0, groesse - len(kopf) - len(fuss))))
+    f.write(fuss)
+PY
+}
+
+# schreibt Dateien wie ein Drucker: mounten, ablegen, sync, auswerfen
+schreibe() {   # schreibe Datei...
+    warte_medium da 120 || { fail "Medium kam nicht zurueck"; return 1; }
+    mount -t vfat "$DEV" "$MNT" || { fail "mount $DEV"; return 1; }
+    for f in "$@"; do
+        cp "$f" "$MNT/[Untitled].pdf" 2>/dev/null && mv "$MNT/[Untitled].pdf" "$MNT/$(basename "$f")"
+        log "  geschrieben: $(basename "$f") ($(stat -c %s "$f") Bytes)"
+        GESCHRIEBEN=$((GESCHRIEBEN + 1))
+    done
+    sync
+    umount "$MNT" || fail "umount"
+}
+
+# wartet, bis eine Datei mit dieser Pruefsumme im Posteingang liegt
+warte_ankunft() {   # warte_ankunft Datei Sekunden
+    local soll t=0
+    soll=$(sha256sum "$1" | cut -d' ' -f1)
+    while [ $t -lt "$2" ]; do
+        if ls "$INBOX"/*.pdf >/dev/null 2>&1 && sha256sum "$INBOX"/*.pdf | grep -q "^$soll "; then
+            log "  angekommen: $(basename "$1") nach ${t}s"
+            return 0
+        fi
+        sleep 2; t=$((t + 2))
+    done
+    fail "$(basename "$1") kam innerhalb von $2 s nicht vollstaendig an"
+    return 1
+}
+
+# ---- Szenario A: eine Datei ----
+log "Szenario A: eine Datei (300 kB)"
+mach_pdf "$ARBEIT/a1.pdf" 300000
+schreibe "$ARBEIT/a1.pdf"
+warte_ankunft "$ARBEIT/a1.pdf" 180
+
+# ---- Szenario B: zwei Dateien in einem Zug ----
+log "Szenario B: zwei Dateien nacheinander im selben Mount (800 kB + 150 kB)"
+mach_pdf "$ARBEIT/b1.pdf" 800000
+mach_pdf "$ARBEIT/b2.pdf" 150000
+schreibe "$ARBEIT/b1.pdf" "$ARBEIT/b2.pdf"
+warte_ankunft "$ARBEIT/b1.pdf" 240
+warte_ankunft "$ARBEIT/b2.pdf" 120
+
+# ---- Szenario C: zweite Datei, sobald das Medium zurueck ist ----
+log "Szenario C: grosse Datei (2 MB), zweite sofort nach Rueckkehr des Mediums"
+mach_pdf "$ARBEIT/c1.pdf" 2000000
+mach_pdf "$ARBEIT/c2.pdf" 250000
+schreibe "$ARBEIT/c1.pdf"
+if warte_medium weg 90; then
+    log "  Stick hat das Medium genommen"
+    schreibe "$ARBEIT/c2.pdf"     # wartet selbst, bis das Medium wieder da ist
+else
+    fail "Stick hat das Medium nach c1 nicht genommen"
+fi
+warte_ankunft "$ARBEIT/c1.pdf" 300
+warte_ankunft "$ARBEIT/c2.pdf" 300
+
+# ---- Bilanz ----
+ANGEKOMMEN=$(ls "$INBOX"/*.pdf 2>/dev/null | wc -l)
+ABGELEHNT=$(grep -c ABGELEHNT "$ARBEIT/empfaenger.log" || true)
+DUPLIKATE=$(grep -c "schon empfangen" "$ARBEIT/empfaenger.log" || true)
+log "Bilanz: $GESCHRIEBEN geschrieben, $ANGEKOMMEN angekommen, $DUPLIKATE Duplikate verworfen, $ABGELEHNT abgelehnt"
+[ "$ANGEKOMMEN" -eq "$GESCHRIEBEN" ] || fail "Anzahl stimmt nicht"
+[ "$ABGELEHNT" -eq 0 ] || fail "Empfaenger hat unvollstaendige Uploads abgelehnt"
+
+warte_medium da 120 || fail "Medium am Ende nicht zurueck"
+
+if [ "$FEHLER" -eq 0 ]; then log "ERGEBNIS: alles bestanden"; exit 0; fi
+log "ERGEBNIS: $FEHLER Fehler"
+exit 1
