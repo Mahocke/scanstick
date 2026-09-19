@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Winziger Scan-Empfaenger: nimmt POST /scan?name=... entgegen und legt die
 Datei in ~/scan-inbox/ ab. Nur zum Testen der Scan-Stick-Kette gedacht;
-spaeter uebernimmt homegate diese Rolle."""
+im Betrieb tritt hier die eigentliche Ablage an diese Stelle."""
 import os, time, http.server, socketserver, urllib.parse
 
 PORT = 8080

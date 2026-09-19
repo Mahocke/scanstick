@@ -1489,7 +1489,7 @@ void setup()
         }
     }
 
-    MSC.vendorID("GladHome");
+    MSC.vendorID("DIY");
     MSC.productID("ScanStick");
     MSC.productRevision("1.0");
     MSC.onStartStop(onStartStop);
