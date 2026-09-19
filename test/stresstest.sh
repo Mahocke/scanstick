@@ -83,7 +83,7 @@ log "Stick: $VERSION unter $STICK, bisheriges Ziel: $ALTES_ZIEL"
 log "Pruefstand: $(hostname) $MEINE_IP, Empfaenger auf Port $PORT"
 
 # ---- Empfaenger starten und Stick umstellen ----
-SCAN_PORT="$PORT" SCAN_INBOX="$INBOX" python3 "$HIER/empfaenger/scan-receiver.py" \
+SCAN_PORT="$PORT" SCAN_INBOX="$INBOX" python3 -u "$HIER/empfaenger/scan-receiver.py" \
     >"$ARBEIT/empfaenger.log" 2>&1 &
 EMPFAENGER_PID=$!
 sleep 1
