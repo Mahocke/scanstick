@@ -1,0 +1,6 @@
+build/
+*.bin
+*.elf
+*.map
+wifi.cfg
+.DS_Store
