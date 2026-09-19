@@ -359,6 +359,7 @@ static bool       g_updateBegonnen = false;   // Update.begin() ist tatsaechlich
 // Deshalb: Sperre setzen, warten bis kein Zugriff mehr laeuft, erst dann anfassen.
 static volatile int  g_usbZugriffe = 0;      // gerade laufende onRead/onWrite
 static volatile bool g_sdGesperrt  = false;  // Hauptschleife hat die Karte
+static void logZeile(const String &msg);     // steht weiter unten
 
 static int32_t onWrite(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize)
 {
