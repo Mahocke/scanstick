@@ -338,13 +338,14 @@ static uint32_t g_letztePruef   = 0;
 static uint32_t g_naechsterVersuch = 0;   // 0 = sofort faellig
 static int      g_versuche         = 0;
 
-#define FW_VERSION "v17"
+#define FW_VERSION "v18"
 
 String cfgSsid, cfgPass, cfgEndpoint;
 String cfgWebPass;   // Schutz der Weboberflaeche; leer = offen
 String cfgPraefix = "scan";   // Namensanfang der Dateien, z.B. "buero-774"
 static bool g_zeitOk        = false;   // NTP-Zeit vorhanden?
 static bool g_einmalSchauen = false;   // Knopf "Jetzt schauen": einmal, ohne Wartezyklus
+static bool g_startGeprueft = false;   // nach dem Hochlaufen einmal nachsehen
 
 static WebServer  g_web(80);
 static Preferences g_nvs;
@@ -787,7 +788,7 @@ static uint32_t dateiKennzahl(const String &pfad, uint32_t groesse)
     return summe;
 }
 
-static bool ladeHoch(fs::FS &fs, const String &pfad, const String &name)
+static bool ladeHoch(fs::FS &fs, const String &pfad, const String &name, const String &id)
 {
     File f = fs.open(pfad);
     if (!f) { logZeile("[up] " + pfad + " nicht oeffenbar"); return false; }
@@ -803,6 +804,11 @@ static bool ladeHoch(fs::FS &fs, const String &pfad, const String &name)
     }
     ziel += (ziel.indexOf('?') < 0) ? "?name=" : "&name=";
     ziel += name;
+    // Eindeutige Kennung derselben Datei. Damit kann der Empfaenger doppelte
+    // Uebertragungen erkennen und verwerfen - etwa wenn ein Upload abbricht und
+    // spaeter wiederholt wird, oder wenn der Drucker seine alte Verzeichnissicht
+    // zurueckschreibt und die Datei dadurch erneut auftaucht.
+    if (id.length()) { ziel += "&id="; ziel += id; }
 
     // Bei schwachem Funk scheitert der erste Verbindungsaufbau gern mal.
     // Einmal aufgeben hiess bisher: Datei bleibt liegen, naechster Anlauf erst
@@ -1343,7 +1349,9 @@ static void sendeGefundene(bool wifi, int &hoch, int &fehler)
             }
         }
 
-        if (wifi && ladeHoch(SD_MMC, sendePfad, sendeName)) {
+        char idText[32];
+        snprintf(idText, sizeof idText, "%08x-%08x", (unsigned)groesse, (unsigned)kennzahl);
+        if (wifi && ladeHoch(SD_MMC, sendePfad, sendeName, String(idText))) {
             if (g_loeschen) {
                 SD_MMC.remove(sendePfad);
             } else {
@@ -1378,38 +1386,50 @@ static void verarbeiteScans(bool manuell)
     g_warteAnzeige = false;
     logZeile(manuell ? "[scan] manuelle Suche" : "[scan] Scan fertig, verarbeite");
     zeigeScreen(Z_SUCHT);
-    // WICHTIG: Das Medium wird dem Host NICHT mehr entzogen. Ein mediaPresent(false)
-    // mitten im Job laesst den Drucker seinen Scan nie committen -> Datei fuer immer weg
-    // (Cluster allokiert, kein Verzeichniseintrag). Wir lesen nur noch mit.
-    // FS frisch mounten, damit wir die vom Host geschriebene FAT sehen
-    SD_MMC.end();
-    delay(100);
-    SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0, SD_D1, SD_D2, SD_D3);
-    if (!SD_MMC.begin()) { logZeile("[scan] remount fehlgeschlagen"); return; }
 
-    g_fundAnzahl = 0;
-    sammleDateien("/", 0);
+    // SCHRITT 1: roh nachsehen. Reines Lesen von Sektoren - das stoert den
+    // Drucker nicht und fasst den Kartentreiber nicht an. Ist nichts da, sparen
+    // wir uns alles Weitere und damit jedes Risiko. (Der Rohleser sieht nur das
+    // Wurzelverzeichnis; genau dort legt der Drucker seine Scans ab.)
+    int rohAnz = 0;
+    uint32_t rohGroesse = 0;
+    rohVerzeichnis(rohAnz, rohGroesse);
 
     int hoch = 0, fehler = 0;
-    if (g_fundAnzahl > 0) {
-        // Ab hier veraendern wir die Karte. Der Drucker darf sie dabei nicht
-        // sehen: er haelt eine eigene, gepufferte Sicht auf das Dateisystem und
-        // wuerde sie beim naechsten Schreiben zurueckschreiben - unsere
-        // Umbenennungen waeren weg und die Cluster verwaist. Jetzt ist der
-        // Entzug gefahrlos, denn die Datei ist gefunden = der Job ist fertig.
+    if (rohAnz > 0) {
+        // SCHRITT 2: ERST den Host abmelden, DANN die Karte neu anhaengen.
+        // Vorher lief das Ab- und Anhaengen bei angemeldetem Medium. Traf in
+        // dieses Fenster ein Zugriff des Druckers, griff der USB-Teil auf einen
+        // gerade abgeraeumten Kartentreiber zu und der Stick startete neu -
+        // derselbe Fehler, der frueher in der Dateien-Seite steckte. Gefahrlos
+        // ist der Entzug hier, weil roh bereits eine fertige Datei zu sehen war.
         MSC.mediaPresent(false);
-        delay(300);
+        delay(200);
 
+        SD_MMC.end();
+        delay(100);
+        SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0, SD_D1, SD_D2, SD_D3);
+        if (!SD_MMC.begin()) {
+            logZeile("[scan] remount fehlgeschlagen");
+            MSC.mediaPresent(true);          // Medium auf keinen Fall verlieren
+            return;
+        }
+
+        // SCHRITT 3: jetzt sind wir allein auf der Karte
+        g_fundAnzahl = 0;
+        sammleDateien("/", 0);
         bool wifi = wifiVerbinden();
         sendeGefundene(wifi, hoch, fehler);
 
-        // Cache auf die Karte schreiben, dann dem Drucker eine frische Sicht geben
+        // SCHRITT 4: Cache schreiben, dem Drucker eine frische Sicht geben
         SD_MMC.end();
         delay(80);
         SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0, SD_D1, SD_D2, SD_D3);
         SD_MMC.begin();
         MSC.mediaPresent(true);
         logZeile("[usb] Stick neu angemeldet");
+    } else {
+        logZeile("[scan] roh nachgesehen: nichts zu holen");
     }
     logZeile(String("[scan] fertig: ") + hoch + " hochgeladen, " + fehler + " Fehler, " +
              "vom Host geschrieben: " + (g_bytesGeschrieben / 1024) + " kB");
@@ -1513,6 +1533,23 @@ void loop()
     if (!g_zeitOk && WiFi.status() == WL_CONNECTED && !g_dirty &&
         millis() - g_zeitVersuch > ZEIT_WIEDERHOLUNG) {
         zeitHolen();
+    }
+
+    // Ein Stromausfall oder Neustart mitten im Ablauf darf keine Datei
+    // liegenlassen: Schreibzugriffe merkt sich der Stick nur im Arbeitsspeicher,
+    // nach dem Start weiss er also nichts von dem, was schon da ist.
+    if (!g_startGeprueft && WiFi.status() == WL_CONNECTED && millis() > 8000) {
+        g_startGeprueft = true;
+        int a = 0;
+        uint32_t gr = 0;
+        if (rohVerzeichnis(a, gr) && a > 0) {
+            logZeile(String("[start] ") + a + " Datei(en) mit " + (gr / 1024) +
+                     " kB lagen noch da - nehme sie mit");
+            g_dirty = true;
+            g_lastWrite = millis() - IDLE_MS - 1;   // sofort faellig
+            g_versuche = 0;
+            g_naechsterVersuch = 0;
+        }
     }
 
     if (g_stopNeu) {
