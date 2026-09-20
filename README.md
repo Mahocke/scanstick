@@ -1,414 +1,410 @@
 # Scan-Stick
 
-Ein USB-Stick, der Scans selbst ins Netz weiterreicht.
+A USB stick that passes scans on to the network by itself.
 
-Ein LILYGO **T-Dongle-S3** steckt im USB-Anschluss eines Druckers und gibt sich als
-gewöhnlicher USB-Speicher aus. Der Drucker scannt wie immer „an USB". Der Stick merkt,
-wann eine Datei fertig geschrieben ist, gibt ihr einen Namen mit Zeitstempel, lädt sie
-per HTTP an einen beliebigen Empfänger und räumt sie weg. Ein kleines Display zeigt,
-was gerade passiert; eine Weboberfläche zeigt Zustand, Protokoll und die Dateien auf
-der Karte.
+A LILYGO **T-Dongle-S3** sits in the USB port of a printer and presents itself as an
+ordinary USB storage device. The printer scans "to USB" as always. The stick notices
+when a file has finished writing, gives it a name with a timestamp, uploads it over
+HTTP to an arbitrary receiver and clears it away. A small display shows what is
+happening right now; a web interface shows state, log and the files on the card.
 
-Entstanden an einem **HP PageWide Color MFP 780**, im Prinzip aber an jedem Gerät
-brauchbar, das „Scan an USB-Laufwerk" beherrscht.
+Developed on an **HP PageWide Color MFP 780**, but in principle usable on any device
+that can do "scan to USB drive".
 
-## Warum nicht einfach „Scan in Netzwerkordner"?
+## Why not just "scan to network folder"?
 
-Weil der Drucker dabei bei **jedem** Scan erst prüft, ob er sein Ablageziel erreicht —
-das kostet spürbar Zeit, bevor überhaupt Papier eingezogen wird. Gegenüber dem Stick
-ist das Laufwerk sofort da; der Netzwerkteil passiert erst danach und stört den
-Bedienablauf nicht mehr. Außerdem bleibt das Ziel austauschbar: Der Stick kennt nur
-eine URL, alles Weitere macht der Empfänger.
+Because the printer then checks on **every** scan whether it can reach its destination -
+that costs noticeable time before any paper is even pulled in. Compared to the stick,
+the drive is there immediately; the network part only happens afterwards and no longer
+disturbs the workflow. The destination also stays interchangeable: the stick only knows
+a URL, the receiver does everything else.
 
-## Ablauf
+## Flow
 
 ```
-Drucker schreibt Sektoren   →   Stick erkennt Schreibzugriffe
+Printer writes sectors      →   Stick detects write accesses
                                  ↓
-                            liest das Dateiverzeichnis roh mit (stört den Drucker nicht)
+                            reads the directory raw alongside (does not disturb the printer)
                                  ↓
-                            Datei vollständig?  (%%EOF vorhanden, 3 s Ruhe)
+                            file complete?  (%%EOF present, 3 s of quiet)
                                  ↓
-                            liest die Datei roh entlang der Belegungskette und lädt sie hoch
-                            — der Drucker hat das Medium die ganze Zeit
+                            reads the file raw along the allocation chain and uploads it
+                            - the printer has the medium the whole time
                                  ↓
-                            merkt sich im Flash: gesendet (Startcluster, Größe, Kennzahl)
+                            records in flash: sent (start cluster, size, checksum)
                                  ↓
-                            später, wenn der Drucker n Minuten nichts angefasst hat:
-                            Medium für unter eine Sekunde weg, Gesendetes löschen,
-                            Geister austragen, Karte prüfen und heilen
+                            later, once the printer has not touched anything for n minutes:
+                            medium gone for less than a second, delete what was sent,
+                            remove ghosts, check and heal the card
 ```
 
-**Im Betrieb wird das Medium nie abgemeldet.** Der Stick fasst weder den Dateisystem-Treiber
-noch die Karte an, solange gescannt wird: Er liest Verzeichnis, Belegungstabelle und
-Datenblöcke direkt aus den Sektoren. Umbenennen ist unnötig. Was gesendet ist, steht in einer
-Merkliste im Flash (Startblock, Größe, Kennzahl) und wird nicht erneut gesendet. Liegt die
-gesendete Datei noch da, fragt der 780 beim nächsten Scan „Datei bereits vorhanden" —
-„Ersetzen" ist richtig, die neue Fassung gilt als neu.
+**During operation the medium is never unmounted.** The stick touches neither the file system
+driver nor the card while scanning is going on: it reads directory, allocation table and
+data blocks directly from the sectors. Renaming is unnecessary. What has been sent is kept in a
+list in flash (start block, size, checksum) and is not sent again. If the sent file is still
+there, the 780 asks "file already exists" on the next scan - "replace" is the right answer, the
+new version counts as new.
 
-Aufgeräumt wird nur in einer Ruhephase: nach einer einstellbaren Zeit ohne jeden Zugriff des
-Druckers (Vorgabe 3 Minuten — der 780 fasst den Stick zwischen Jobs nicht an), wenn die Merkliste voll wird, oder auf Knopfdruck in der
-Weboberfläche. Das ist der einzige Moment, in dem das Medium kurz weg ist, und dann steht
-niemand am Gerät. Frühere Fassungen nahmen dem Drucker das Medium bei jedem Scan weg, zuerst
-für die Dauer des Uploads, zuletzt für eine halbe Sekunde; jeder Job, der genau dann startete
-oder während der Drucker den Stick neu einhängte, scheiterte.
+Cleanup only happens in a quiet phase: after a configurable time without any access by the
+printer (default 3 minutes - the 780 does not touch the stick between jobs), when the sent list
+fills up, or at the push of a button in the web interface. That is the only moment in which the
+medium is briefly gone, and then nobody is standing at the device. Earlier versions took the
+medium away from the printer on every scan, at first for the duration of the upload, later for
+half a second; every job that started exactly then, or while the printer was remounting the
+stick, failed.
 
-Die Karte sollte **klein partitioniert** sein, etwa 4 GB mit 32-kB-Clustern: Nach jedem
-Aufräumen hängt der Drucker den Stick neu ein und liest dabei die Belegungstabelle. Bei
-64 GB sind das 60 MB über USB, bei 4 GB mit großen Clustern 512 kB.
+The card should be **partitioned small**, about 4 GB with 32 kB clusters: after every
+cleanup the printer remounts the stick and reads the allocation table while doing so. With
+64 GB that is 60 MB over USB, with 4 GB and large clusters 512 kB.
 
 ## Hardware
 
-**LILYGO T-Dongle-S3** (ESP32-S3, 16 MB Flash, microSD im USB-A-Stecker, ST7735-Display,
-APA102-LED). Eine microSD mit **FAT32** gehört hinein — 64 GB funktionieren, entgegen
-mancher Behauptung; sie müssen nur FAT32 statt exFAT sein.
+**LILYGO T-Dongle-S3** (ESP32-S3, 16 MB flash, microSD in the USB-A plug, ST7735 display,
+APA102 LED). A microSD with **FAT32** belongs in it - 64 GB does work, contrary to some
+claims; it only has to be FAT32 instead of exFAT.
 
-| Funktion | Pins |
+| Function | Pins |
 |---|---|
-| SD (SD_MMC, 4 Bit) | CLK 12, CMD 16, D0 14, D1 17, D2 21, D3 18 |
-| Display ST7735 | CS 4, SDA 3, SCL 5, DC 2, RST 1, Licht 38 (aktiv low) |
-| Status-LED APA102 | Daten 40, Takt 39, BGR |
+| SD (SD_MMC, 4 bit) | CLK 12, CMD 16, D0 14, D1 17, D2 21, D3 18 |
+| Display ST7735 | CS 4, SDA 3, SCL 5, DC 2, RST 1, backlight 38 (active low) |
+| Status LED APA102 | data 40, clock 39, BGR |
 
 ## Installation
 
-### 1. Karte vorbereiten
+### 1. Prepare the card
 
-Eine microSD mit **FAT32**. Karten bis 32 GB sind ab Werk meist schon so formatiert und
-können direkt hinein. Größere kommen als exFAT, das der Stick nicht lesen kann — sie
-müssen einmalig auf FAT32 umformatiert werden, **in einem richtigen Kartenleser**:
+A microSD with **FAT32**. Cards up to 32 GB usually come formatted that way from the factory
+and can go straight in. Larger ones arrive as exFAT, which the stick cannot read - they have
+to be reformatted to FAT32 once, **in a real card reader**:
 
 ```bash
-# Linux/macOS, /dev/sdX durch das tatsächliche Gerät ersetzen – Vorsicht, löscht alles
+# Linux/macOS, replace /dev/sdX with the actual device - careful, erases everything
 sudo parted -s /dev/sdX mklabel msdos
-sudo parted -s /dev/sdX mkpart primary fat32 1MiB 4097MiB   # 4 GB reichen, siehe Ablauf
+sudo parted -s /dev/sdX mkpart primary fat32 1MiB 4097MiB   # 4 GB is enough, see Flow
 sudo parted -s /dev/sdX set 1 lba on
-sudo mkfs.vfat -F 32 -s 64 -n SCANS /dev/sdX1                 # 32-kB-Cluster: kleine Belegungstabelle
+sudo mkfs.vfat -F 32 -s 64 -n SCANS /dev/sdX1                 # 32 kB clusters: small allocation table
 ```
 
-Unter Windows tut es ein Werkzeug wie „FAT32 Format", die Bordmittel bieten FAT32
-oberhalb von 32 GB nicht an. Eine kleine Partition lässt sich auch über den eingesteckten
-Stick anlegen (4 GB mit großen Clustern in vier Sekunden); eine 64-GB-Partition dagegen
-nicht, das Formatieren schreibt dann minutenlang und der Stick bricht ab.
+On Windows a tool such as "FAT32 Format" does the job, the built-in tools do not offer FAT32
+above 32 GB. A small partition can also be created through the plugged-in stick (4 GB with
+large clusters in four seconds); a 64 GB partition cannot, formatting then writes for minutes
+and the stick aborts.
 
-### 2. Firmware aufspielen
+### 2. Flash the firmware
 
-Einmalig über Kabel, siehe [Bauen und Flashen](#bauen-und-flashen). Fertige Abbilder
-liegen unter [Releases](../../releases).
+Once over cable, see [Building and flashing](#building-and-flashing). Ready-made images
+are available under [Releases](../../releases).
 
-### 3. WLAN-Zugangsdaten eintragen
+### 3. Enter the WiFi credentials
 
-**Der einfache Weg: über das eigene WLAN des Sticks.** Kennt der Stick kein Netz oder
-erreicht er keins, spannt er ein eigenes WLAN namens `scanstick-XXXX` auf (offen; XXXX steht
-auch im Display). Handy oder Rechner damit verbinden — die Einrichtungsseite öffnet sich von
-selbst, wie bei einem Hotel-WLAN, sonst `http://192.168.4.1/` aufrufen. Dort Netz aus der
-Liste wählen, Passwort, Empfängeradresse, optional Geräteschlüssel und Web-Passwort eintragen,
-speichern. Der Stick startet neu und ist danach im Heimnetz unter `http://scanstick-XXXX.local/`
-erreichbar. Weitere Netze lassen sich später in den Einstellungen hinzufügen oder entfernen.
+**The easy way: through the stick's own WiFi.** If the stick knows no network, or cannot
+reach one, it opens its own WiFi named `scanstick-XXXX` (open; XXXX is also shown on the
+display). Connect a phone or computer to it - the setup page opens by itself, as with a hotel
+WiFi, otherwise open `http://192.168.4.1/`. There, pick a network from the list, enter
+password, receiver address, optionally device key and web password, and save. The stick
+restarts and is then reachable on the home network at `http://scanstick-XXXX.local/`.
+Further networks can be added or removed later in the Settings.
 
-**Der zweite Weg: eine Datei auf der Karte.** Auch dafür ist **kein Kartenleser nötig** — der
-Stick ist ja selbst ein USB-Laufwerk:
+**The second way: a file on the card.** For this too **no card reader is needed** - the
+stick is itself a USB drive:
 
-1. Stick in den Computer stecken, es erscheint ein Laufwerk namens **SCANS**
-2. darauf eine Textdatei **`wifi.cfg`** anlegen (Vorlage: `wifi.cfg.beispiel`):
+1. plug the stick into the computer, a drive named **SCANS** appears
+2. create a text file **`wifi.cfg`** on it (template: `wifi.cfg.example`):
 
 ```
-ssid=MeinWLAN
-pass=MeinPasswort
+ssid=MyWiFi
+pass=MyPassword
 endpoint=http://192.168.1.50:8080/scan
 ```
 
-Mehrere Netze sind erlaubt, bis zu vier: Jede `ssid=`-Zeile beginnt ein neues Netz, das
-folgende `pass=` gehört dazu. Beim Suchlauf gewinnt über alle bekannten Netze hinweg der
-stärkste Zugangspunkt, so läuft derselbe Stick an mehreren Standorten oder am Hotspot.
+(The keys are German by design: they are the file-format contract and stay as they are.)
 
-**Nur 2,4 GHz.** Der ESP32 sieht keine 5-GHz-Netze. Ein iPhone-Hotspot sendet standardmäßig
-auf 5 GHz und bleibt für den Stick unsichtbar, ohne jede Fehlermeldung; erst mit
-*Kompatibilität maximieren* in den Hotspot-Einstellungen wechselt er auf 2,4 GHz. Bei
-Dual-Band-Routern muss das Netz ebenfalls auf 2,4 GHz sichtbar sein.
+Several networks are allowed, up to four: every `ssid=` line starts a new network, the
+`pass=` that follows belongs to it. During the scan the strongest access point across all
+known networks wins, so the same stick works at several locations or on a hotspot.
+
+**2.4 GHz only.** The ESP32 does not see 5 GHz networks. An iPhone hotspot transmits on
+5 GHz by default and stays invisible to the stick, without any error message; only with
+*Maximize Compatibility* in the hotspot settings does it switch to 2.4 GHz. With dual-band
+routers the network must likewise be visible on 2.4 GHz.
 
 ```
-ssid=Buero
-pass=geheim1
-ssid=Zuhause
-pass=geheim2
+ssid=Office
+pass=secret1
+ssid=Home
+pass=secret2
 endpoint=http://192.168.1.50:8080/scan
 ```
 
-3. Laufwerk auswerfen, Stick abziehen
+3. eject the drive, unplug the stick
 
-Beim nächsten Start liest er die Datei und **spiegelt die Zugangsdaten in seinen
-Flash-Speicher**. Danach kommen WLAN und Weboberfläche auch dann hoch, wenn die Karte
-fehlt oder unlesbar ist — sonst hätte man genau dann keine Diagnose, wenn man sie
-braucht. Die Datei bleibt liegen. Übernommen wird sie nur, wenn sich ihr Inhalt seit dem
-letzten Mal **geändert** hat; sonst gelten die Werte aus dem Flash, also auch alles, was in
-der Weboberfläche eingestellt wurde. Zum Ändern des Netzes genügt es, sie zu überschreiben.
+On the next start it reads the file and **mirrors the credentials into its flash
+memory**. After that WiFi and web interface come up even when the card is missing or
+unreadable - otherwise there would be no diagnostics exactly when they are needed. The
+file stays where it is. It is only adopted if its content has **changed** since last
+time; otherwise the values from flash apply, including everything that was set in the
+web interface. To change the network it is enough to overwrite it.
 
-### 4. In den Drucker
+### 4. Into the printer
 
-Stick in den USB-Anschluss, etwa zehn Sekunden warten, bis das Display **BEREIT** zeigt,
-dann am Gerät „Scan an USB-Laufwerk" wählen. Die Adresse der Weboberfläche steht im
-Protokoll und wird beim Start angezeigt.
+Plug the stick into the USB port, wait about ten seconds until the display shows **READY**,
+then choose "scan to USB drive" at the device. The address of the web interface is in the
+log and is shown at startup.
 
-## Bauen und Flashen
+## Building and flashing
 
 ```bash
 arduino-cli compile -b "esp32:esp32:esp32s3:USBMode=default,CDCOnBoot=cdc,FlashSize=16M,PartitionScheme=default_8MB,PSRAM=disabled,FlashMode=qio,CPUFreq=240" --export-binaries firmware/scanner
 ```
 
-`default_8MB` ist wichtig: zwei Programmbereiche, damit Aktualisierungen über WLAN
-möglich sind. Mit `app3M_fat9M_16MB` gäbe es nur einen und jede abgebrochene
-Übertragung wäre fatal.
+`default_8MB` matters: two program areas, so that updates over WiFi are possible. With
+`app3M_fat9M_16MB` there would be only one and every aborted transfer would be fatal.
 
-Flashen über Kabel:
+Flashing over cable:
 
 ```bash
-# 1. Die laufende Firmware in den Flash-Modus holen (Port kurz mit 1200 Baud öffnen)
+# 1. Put the running firmware into flash mode (briefly open the port at 1200 baud)
 python3 -c 'import serial,time; s=serial.Serial("/dev/ttyACM0",1200); s.dtr=False; time.sleep(0.3); s.close()'
 sleep 4
-# 2. Vollständig schreiben
+# 2. Write completely
 esptool --chip esp32s3 --port /dev/ttyACM0 --no-stub --before default_reset --after no_reset \
   write_flash --flash_mode dio --flash_freq 80m --flash_size 16MB \
   0x0     firmware/scanner/build/*/scanner.ino.bootloader.bin \
   0x8000  firmware/scanner/build/*/scanner.ino.partitions.bin \
   0xe000  firmware/scanner/build/*/boot_app0.bin \
   0x10000 firmware/scanner/build/*/scanner.ino.bin
-# 3. Stick abziehen, 5 s warten, wieder einstecken
+# 3. Unplug the stick, wait 5 s, plug it in again
 ```
 
-Danach geht es bequemer: Weboberfläche → **Firmware** → `scanner.ino.bin` hochladen.
+After that it is more convenient: web interface -> **Firmware** -> upload `scanner.ino.bin`.
 
-## Fallen, die uns Stunden gekostet haben
+## Pitfalls that cost us hours
 
-**Nach dem Flashen hilft nur echtes Abziehen.** Der ESP32-S3 bleibt sonst im Flash-Modus
-stecken: kein Laufwerk, keine serielle Ausgabe, keine Firmware. Weder ein Software-Reset
-noch das Abschalten der Anschlussspannung per `uhubctl` holen ihn heraus — auch nicht
-nach zwanzig Sekunden. Nur physisch ausstecken und wieder einstecken.
-Test auf diesen Zustand: `esptool --before no_reset read_mac` — **verbindet** er sich,
-läuft **keine** Firmware.
+**After flashing, only a real unplug helps.** Otherwise the ESP32-S3 stays stuck in flash
+mode: no drive, no serial output, no firmware. Neither a software reset nor switching off
+the port power with `uhubctl` gets it out - not even after twenty seconds. Only physically
+unplugging and plugging it in again.
+Test for this state: `esptool --before no_reset read_mac` - if it **connects**, **no**
+firmware is running.
 
-**Serielle Ausgaben gibt es im Betrieb nicht.** Die Konsole gehört im
-Massenspeicher-Betrieb dem USB-Stack. Deshalb protokolliert der Stick in den
-Arbeitsspeicher und zeigt es über die Weboberfläche.
+**There is no serial output during operation.** In mass storage mode the console belongs
+to the USB stack. That is why the stick logs into memory and shows it through the web
+interface.
 
-**Dem Drucker das Medium zu entziehen, während er schreibt, zerstört den Scan.**
-Die Cluster sind dann belegt, der Verzeichniseintrag fehlt — die Datei existiert nie.
-Erst **nachdem** eine fertige Datei gefunden wurde, ist das Abmelden gefahrlos.
+**Taking the medium away from the printer while it is writing destroys the scan.**
+The clusters are then allocated, the directory entry is missing - the file never exists.
+Only **after** a complete file has been found is unmounting safe.
 
-**Umgekehrt darf man die Karte nicht ändern, während der Drucker sie sieht.**
-Er hält eine eigene, gepufferte Sicht auf das Verzeichnis und schreibt sie später
-zurück — Umbenennungen und ganze Ordner verschwinden dadurch wieder.
+**Conversely, the card must not be changed while the printer sees it.**
+It keeps its own buffered view of the directory and writes it back later - renames and
+whole folders disappear again as a result.
 
-**Der Drucker schreibt seine alte Sicht sogar nach dem Wiederanmelden zurück.** Beim
-nächsten Scan taucht der vorige Scan als „Geist" erneut in der Wurzel auf: ein
-Verzeichniseintrag, der auf die Blöcke der schon gesendeten Datei zeigt. Ihn per
-Dateisystem zu löschen gäbe diese Blöcke frei, also die Daten der anderen Datei; ihn zu
-verschieben hinterließe zwei Einträge auf denselben Blöcken (Kreuzverkettung). Der Stick
-lädt ihn deshalb hoch, der Empfänger erkennt ihn an der Kennung als Duplikat, und der
-Stick trägt daraufhin nur den Verzeichniseintrag roh aus, ohne die Blockzuordnung
-anzufassen. Ein eigener Empfänger muss das Wort `Duplikat` in seiner Antwort tragen.
+**The printer even writes its old view back after remounting.** On the next scan the
+previous scan shows up in the root again as a "ghost": a directory entry that points at
+the blocks of the file that was already sent. Deleting it through the file system would
+free those blocks, that is the data of the other file; moving it would leave two entries
+on the same blocks (cross-linking). The stick therefore uploads it, the receiver
+recognizes it as a duplicate by its identifier, and the stick then only removes the
+directory entry raw, without touching the block allocation. A custom receiver must carry
+the word `Duplikat` in its reply.
 
-**Die Dateigröße ist kein Zeichen für „fertig".** Der 780 trägt die endgültige Größe
-ein, *bevor* er schreibt, und reserviert den Platz. Wer darauf vertraut, lädt eine
-halb beschriebene Datei hoch, deren hinterer Teil aus Leerbytes besteht. Deshalb prüft
-der Stick die Endmarke `%%EOF`.
+**The file size is no sign of "finished".** The 780 writes the final size *before* it
+writes, and reserves the space. Whoever relies on it uploads a half-written file whose
+tail consists of empty bytes. That is why the stick checks for the end marker `%%EOF`.
 
-**Das Verzeichnis zum Nachsehen ab- und wieder anzuhängen ist gefährlich.** Läuft das
-parallel zu einem Lesezugriff des Druckers, greift der USB-Teil auf einen abgeräumten
-Kartentreiber zu und das Gerät startet neu. Ein Blick auf die Weboberfläche darf den
-Betrieb nie gefährden — deshalb liest der Stick das Verzeichnis roh mit.
+**Unmounting and remounting the directory just to look is dangerous.** If that runs
+in parallel with a read access of the printer, the USB part accesses a torn-down card
+driver and the device restarts. A look at the web interface must never endanger
+operation - that is why the stick reads the directory raw alongside.
 
-**„Medium abmelden" stoppt keinen laufenden Zugriff.** `mediaPresent(false)` weist nur
-*neue* Kommandos ab. Ein Lesevorgang, der gerade läuft, läuft weiter — ein Linux-Host
-liest beim Aushängen die FAT in 120-kB-Blöcken, das dauert länger als jede feste
-Wartezeit. Wird der Kartentreiber in dieser Zeit abgebaut, hängt der USB-Teil, und nach
-fünf Sekunden startet der Task-Watchdog das Gerät neu (im Kernel-Log des Hosts steht dann
-`cmd_age=5s`). Der Stick zählt deshalb laufende Zugriffe mit und fasst die Karte erst an,
-wenn keiner mehr offen ist. Aus demselben Grund gilt als „Ruhe" erst, wenn der Host weder
-schreibt **noch liest**.
+**"Unmount medium" does not stop an access in progress.** `mediaPresent(false)` only
+rejects *new* commands. A read that is currently running keeps running - a Linux host
+reads the FAT in 120 kB blocks when unmounting, which takes longer than any fixed wait
+time. If the card driver is torn down during that time, the USB part hangs, and after
+five seconds the task watchdog restarts the device (the host's kernel log then shows
+`cmd_age=5s`). The stick therefore counts accesses in progress and only touches the card
+once none is open any more. For the same reason "quiet" only applies once the host is
+neither writing **nor reading**.
 
-**Ein Neustart am Drucker ist ein Stromschnitt.** Meldet sich der Stick per USB ab, schaltet
-der 780 dem Port kurz die Versorgung weg. Nach einem Firmware-Update über die
-Weboberfläche kam die neue Firmware dadurch nie dazu, sich als gültig zu bestätigen — der
-Bootloader fiel zweimal auf die alte zurück. Der Stick meldet deshalb erst das Medium ab,
-trennt USB, wartet den Stromschnitt ab und startet erst dann neu (`sanftNeustarten`).
-Auf der Statusseite steht danach „Strom eingeschaltet" als Startgrund — das ist normal.
+**A restart at the printer is a power cut.** When the stick deregisters over USB, the 780
+briefly cuts the power to the port. After a firmware update through the web interface the
+new firmware therefore never got around to confirming itself as valid - the bootloader
+fell back to the old one twice. The stick therefore first unmounts the medium, disconnects
+USB, waits out the power cut and only then restarts (`sanftNeustarten`). The status page
+afterwards shows "Power on" as the reset reason - that is normal.
 
-**Den Dialog „Einstellungen für den nächsten Job beibehalten?" erst beantworten, wenn der
-Stick fertig ist.** Der 780 schreibt große Scans noch lange, nachdem das Papier durch ist,
-und zeigt dabei schon diesen Dialog. Wer ihn mit Löschen oder Abbrechen beantwortet, während
-der Drucker noch schreibt, bricht den eigenen Job ab: Ereignis 44.12.05 „Error writing
-multi-page image file". Danach nimmt der 780 dem USB-Port kurz den Strom, und sein USB-Host
-liest **gar nichts mehr** — auch keinen gewöhnlichen USB-Stick — bis der Drucker neu
-gestartet wird. Umstecken hilft nicht. Solange das Display des Sticks „SCAN ERKANNT" oder
-den Countdown zeigt, schreibt der Drucker noch; erst bei „SENDET" oder „BEREIT" ist er durch.
+**Only answer the dialog "Keep settings for the next job?" once the stick is done.**
+The 780 keeps writing large scans long after the paper has gone through, and already shows
+this dialog while doing so. Answering it with delete or cancel while the printer is still
+writing aborts your own job: event 44.12.05 "Error writing multi-page image file".
+After that the 780 briefly cuts the power to the USB port, and its USB host reads
+**nothing at all** any more - not even an ordinary USB stick - until the printer is
+restarted. Replugging does not help. As long as the stick's display shows "SCAN FOUND"
+or the countdown, the printer is still writing; only at "SENDING" or "READY" is it done.
 
-**Der 780 überschreibt eine gleichnamige Datei.** Bleibt `[Untitled].pdf` nach dem Senden
-auf der Karte liegen, hängt er beim nächsten Scan keinen Zeitstempel an, sondern schreibt
-dieselbe Datei neu. Der Stick erkennt eine Datei deshalb nicht am Namen, sondern an
-Startblock, Größe und Kennzahl — die neue Fassung gilt damit als neu und wird gesendet.
+**The 780 overwrites a file of the same name.** If `[Untitled].pdf` stays on the card
+after sending, the printer does not append a timestamp on the next scan but writes the
+same file anew. The stick therefore recognizes a file not by its name but by start block,
+size and checksum - so the new version counts as new and is sent.
 
-**Nicht jeder Schreibzugriff ist ein Scan.** Beim Öffnen des Scan-Dialogs schreibt der
-780 eine Testdatei von einem Block und löscht sie gleich wieder (rund 4 kB: FAT, Wurzel,
-ein Datenblock, wieder Wurzel und FAT). Die Anzeige zählt deshalb nur, was noch nicht
-gesendet ist; die Statusseite zeigt die letzten Schreibzugriffe des Hosts nach Bereich.
+**Not every write access is a scan.** When the scan dialog is opened, the 780 writes a
+test file of one block and deletes it again right away (about 4 kB: FAT, root, one data
+block, root and FAT again). The display therefore only counts what has not been sent yet;
+the status page shows the host's last write accesses by area.
 
-**Der Drucker lehnt eine beschädigte Karte ab.** Nach abgebrochenen Jobs und
-zurückgeschriebenen Verzeichnissen blieben Kreuzverkettungen, verwaiste Blöcke und die
-Schmutzmarke auf der Karte — und der 780 zeigte nur noch „USB-Stick anschließen". Der
-Stick prüft die Karte deshalb selbst, beim Start (bevor der Drucker sie sieht) und im
-Aufräumfenster: beide Zuordnungstabellen abgleichen, jede Kette ablaufen, doppelt belegte
-Blöcke dem zuerst gefundenen Eintrag lassen und den zweiten austragen, Waisen freigeben, zu
-kurze Ketten kürzen, Schmutzmarke setzen. Ist das Dateisystem zweimal in Folge unlesbar,
-legt er die Partition neu an (`POST /formatieren` tut das auch auf Knopfdruck, nur wenn
-nichts Ungesendetes liegt). Das Ergebnis steht auf der Statusseite unter „Kartenprüfung".
-Der Prüfstand hat dafür Szenario E.
+**The printer rejects a damaged card.** After aborted jobs and written-back directories,
+cross-links, orphaned blocks and the dirty flag remained on the card - and the 780 only
+showed "connect USB stick" any more. The stick therefore checks the card itself, at startup
+(before the printer sees it) and in the cleanup window: compare both allocation tables, walk
+every chain, leave doubly allocated blocks to the entry found first and remove the second,
+free orphans, shorten chains that are too short, clear the dirty flag. If the file system is
+unreadable twice in a row, it recreates the partition (`POST /formatieren` does that at the
+push of a button too, only when nothing unsent is present). The result is shown on the status
+page under "Card check". The test bench has scenario E for this.
 
-**Nach dem Senden wird gelöscht, nicht verschoben.** Ein nach `/gesendet` verschobener
-Eintrag behält seine Blöcke. Schreibt der Drucker danach seinen alten Wurzeleintrag zurück
-und ersetzt ihn, gibt er genau diese Blöcke frei — Kreuzverkettung. Gelöschte Blöcke sind
-frei, da kann ein Geist nichts mehr anrichten. Die Option „nach /gesendet verschieben"
-gibt es deshalb seit v37 nicht mehr; die Kopie liegt beim Empfänger.
+**After sending, files are deleted, not moved.** An entry moved to `/gesendet` keeps its
+blocks. If the printer then writes its old root entry back and replaces it, it frees exactly
+those blocks - cross-linking. Deleted blocks are free, a ghost can do no more harm there.
+That is why the option "move to /gesendet" no longer exists since v37; the copy is at the
+receiver.
 
-**Bei mehreren Zugangspunkten mit derselben Kennung** nimmt `WiFi.begin(ssid, pass)`
-den erstbesten, nicht den stärksten. Der Stick sucht deshalb vorher (`WiFiMulti`) und
-verbindet sich gezielt mit der besten Station. Die Kehrseite: Fällt genau diese Station
-aus, versucht der automatische Wiederverbinder nur sie. Nach zwei Minuten ohne Netz sucht
-der Stick deshalb von vorn, über alle bekannten Netze.
+**With several access points using the same SSID**, `WiFi.begin(ssid, pass)` takes the
+first one it finds, not the strongest. The stick therefore scans beforehand (`WiFiMulti`)
+and connects to the best station on purpose. The downside: if exactly that station fails,
+the automatic reconnector only tries that one. After two minutes without a network the
+stick therefore scans again from scratch, across all known networks.
 
-## Weboberfläche
+## Web interface
 
-Erreichbar über `http://scanstick-XXXX.local/` (XXXX = die letzten vier Stellen der
-Funkadresse, steht im Protokoll und auf der Statusseite) oder die angezeigte IP-Adresse.
-So kommen sich mehrere Sticks im selben Netz nicht in die Quere.
+Reachable at `http://scanstick-XXXX.local/` (XXXX = the last four digits of the MAC
+address, shown in the log and on the status page) or the displayed IP address. That way
+several sticks on the same network do not get in each other's way.
 
-| Seite | Inhalt |
+| Page | Content |
 |---|---|
-| Status | Karte, Empfang samt gewähltem Zugangspunkt, offene Schreibvorgänge, Uhrzeit, Laufzeit |
-| Protokoll | vollständiger Ablauf seit dem Start |
-| Dateien | Wurzel roh gelesen mit Stand (gesendet, offen, Geist), Ordner, einzeln herunterladbar |
-| Roh | was der Stick ohne Dateisystem-Treiber sieht (Diagnose) |
-| Einstellungen | siehe unten |
-| Firmware | Aktualisierung über WLAN |
+| Status | card, reception including the chosen access point, open writes, time, uptime |
+| Log | complete sequence since startup |
+| Files | root read raw with state (sent, open, ghost), folders, individually downloadable |
+| Raw | what the stick sees without a file system driver (diagnostics) |
+| Settings | see below |
+| Firmware | update over WiFi |
 
-Ein **Passwort** lässt sich setzen (Benutzername `scan`). Ohne kann jedes Gerät im
-selben Netz die Scans herunterladen.
+A **password** can be set (user name `scan`). Without one, every device on the same
+network can download the scans.
 
-Alles, was etwas verändert (Einstellungen, „Jetzt schauen", Neustart, Firmware), geht
-nur per `POST` und nur von der eigenen Seite: Schickt ein Browser eine `Origin`- oder
-`Referer`-Kopfzeile mit, muss sie zum Stick passen. Sonst könnte eine beliebige fremde
-Webseite im selben Browser das Upload-Ziel umbiegen oder den Stick mitten im Upload neu
-starten, denn ein gespeichertes Passwort schickt der Browser automatisch mit. Werkzeuge
-wie `curl` schicken keine `Origin`-Kopfzeile und funktionieren weiter:
-
-```bash
-curl -u scan:PASSWORT --data-urlencode 'endpoint=http://192.168.1.50:8080/scan' http://scanstick-1a2b.local/einstellungen
-curl -u scan:PASSWORT -X POST http://scanstick-1a2b.local/neustart
-```
-
-## Einstellungen
-
-Upload-Ziel · Namensanfang der Dateien (z. B. Standortkennung) · Ruhefrist · Aufräumen nach n Minuten Ruhe ·
-nach dem Senden löschen oder nach `/gesendet` verschieben · Passwort ·
-Geräteschlüssel für den Upload · Helligkeit der Status-LED (0 = aus) ·
-Farbumkehr des Displays · acht Zustandsfarben für Display und LED
-
-Der **Geräteschlüssel** signiert jeden Upload (HMAC-SHA256 über Name, Kennung und Länge,
-Kopfzeile `X-Scan-Auth`). Derselbe Schlüssel gehört in den Empfänger (`SCAN_KEY`), der dann
-alles ohne gültige Signatur abweist. Er lässt sich auch in `wifi.cfg` als `schluessel=`
-hinterlegen. Bewusst kein TLS: Im LAN reicht das, ein TLS-Kontext kostet auf dem Stick rund
-40 kB Arbeitsspeicher und jeden Upload spürbar Zeit. Wiederholungen brauchen keinen
-Zeitstempel, der Empfänger erkennt sie an der Kennung.
-
-Liegt eine Datei nach einem Fehlversuch noch auf der Karte (Empfänger nicht erreichbar,
-WLAN weg), sieht der Stick **alle zehn Minuten** roh nach und versucht es erneut.
-
-## Empfänger
-
-`empfaenger/scan-receiver.py` ist ein Beispiel in reinem Python ohne Abhängigkeiten:
-nimmt `POST /scan?name=…` entgegen und legt die Datei ab.
+Everything that changes something (settings, "Check now", restart, firmware) goes only
+by `POST` and only from the stick's own page: if a browser sends an `Origin` or
+`Referer` header, it has to match the stick. Otherwise any foreign web page in the same
+browser could redirect the upload target or restart the stick in the middle of an upload,
+because the browser sends a stored password automatically. Tools like `curl` send no
+`Origin` header and keep working:
 
 ```bash
-python3 empfaenger/scan-receiver.py    # lauscht auf Port 8080, legt in ~/scan-inbox ab
-SCAN_PORT=9000 SCAN_INBOX=/srv/scans SCAN_KEY=geheim python3 empfaenger/scan-receiver.py
+curl -u scan:PASSWORD --data-urlencode 'endpoint=http://192.168.1.50:8080/scan' http://scanstick-1a2b.local/einstellungen
+curl -u scan:PASSWORD -X POST http://scanstick-1a2b.local/neustart
 ```
 
-Mit `SCAN_KEY` verlangt er zu jedem Upload die Signatur des Sticks (siehe Einstellungen)
-und antwortet sonst mit 401.
+## Settings
 
-Der Empfänger nimmt eine Datei nur an, wenn sie **vollständig** ist: Die Länge muss der
-Ankündigung entsprechen, eine PDF muss auf `%%EOF` enden. Sonst antwortet er mit 400
-und merkt sich nichts, der Stick versucht es später erneut. Das ist wichtig, weil der
-Stick Wiederholungen über eine Kennung meldet und der Empfänger sie verwirft: Würde
-er einen abgerissenen Upload verkürzt ablegen und die Kennung merken, gälte die
-Wiederholung als Duplikat, und der Stick löschte daraufhin das einzige vollständige
-Exemplar. Das Protokoll des Sticks (`scanlog-*.txt`) landet im Unterordner `protokoll/`.
+Upload target - file name prefix (e.g. a site code) - quiet period - cleanup after n minutes of quiet -
+delete after sending or move to `/gesendet` - password -
+device key for the upload - brightness of the status LED (0 = off) -
+color inversion of the display - eight state colors for display and LED
 
-Für den Produktivbetrieb tritt hier etwas anderes an die Stelle — Ablage in einer
-Cloud, einem Dokumentensystem oder einem Ordner. Die Firmware kennt bewusst nur eine
-URL, damit das Ziel austauschbar bleibt. Wer einen eigenen Empfänger schreibt, sollte
-die drei Regeln übernehmen: Länge prüfen, bei PDF `%%EOF` prüfen, Kennung erst nach
-erfolgreicher Ablage merken.
+The **device key** signs every upload (HMAC-SHA256 over name, identifier and length,
+header `X-Scan-Auth`). The same key belongs in the receiver (`SCAN_KEY`), which then
+rejects everything without a valid signature. It can also be stored in `wifi.cfg` as
+`schluessel=`. Deliberately no TLS: on the LAN that is enough, a TLS context costs about
+40 kB of memory on the stick and noticeable time per upload. Repeats need no timestamp,
+the receiver recognizes them by the identifier.
 
-## Prüfstand ohne Drucker
+If a file is still on the card after a failed attempt (receiver unreachable, WiFi gone),
+the stick looks again raw **every ten minutes** and retries.
 
-`test/stresstest.sh` läuft auf einem Linux-Rechner, an dem der Stick steckt (ein
-Raspberry Pi eignet sich). Der Rechner spielt den Drucker: mounten, Test-PDFs
-schreiben, auswerfen. Ein Empfänger auf demselben Rechner prüft, ob jede Datei
-vollständig und genau einmal ankommt. Drei Szenarien: eine Datei, zwei in einem Zug,
-und eine zweite Datei im engsten Moment, sobald das Medium nach dem ersten Upload
-wieder da ist.
+## Receiver
+
+`empfaenger/scan-receiver.py` is an example in pure Python without dependencies:
+it accepts `POST /scan?name=...` and stores the file.
 
 ```bash
-sudo SCAN_WEBPASS=PASSWORT test/stresstest.sh http://scanstick-1a2b.local /dev/sda1
+python3 empfaenger/scan-receiver.py    # listens on port 8080, stores in ~/scan-inbox
+SCAN_PORT=9000 SCAN_INBOX=/srv/scans SCAN_KEY=secret python3 empfaenger/scan-receiver.py
 ```
 
-Das Upload-Ziel des Sticks wird für die Dauer des Tests umgestellt und danach
-zurückgesetzt. Die Partition wird nur angefasst, wenn sie zu einem Espressif-USB-Gerät
-gehört und `SCANS` heißt. Der Linux-Treiber schreibt Verzeichniseinträge früher und
-anders als ein Drucker; der Prüfstand ersetzt den Drucktest nicht, macht aber
-Regressionen wiederholbar sichtbar.
+With `SCAN_KEY` it requires the stick's signature for every upload (see Settings) and
+otherwise answers with 401.
 
-### Wo der Empfänger laufen sollte
+The receiver only accepts a file if it is **complete**: the length has to match the
+announcement, a PDF has to end with `%%EOF`. Otherwise it answers with 400 and
+remembers nothing, and the stick retries later. That matters because the stick reports
+repeats via an identifier and the receiver discards them: if it stored a broken-off
+upload truncated and remembered the identifier, the repeat would count as a duplicate,
+and the stick would then delete the only complete copy. The stick's log
+(`scanlog-*.txt`) ends up in the subfolder `protokoll/`.
 
-Das Skript läuft ohne Zusatzpakete auf Linux, macOS und Windows. Entscheidend ist aber
-nicht das Betriebssystem, sondern die **Verfügbarkeit**: Der Empfänger muss laufen,
-wenn jemand scannt. Schläft der Rechner, bleibt die Datei auf der Karte liegen und wird
-beim nächsten Anlauf erneut versucht — angekommen ist sie aber nicht.
+In production something else takes its place here - storage in a cloud, a document
+system or a folder. The firmware deliberately knows only a URL, so that the destination
+stays interchangeable. Anyone writing their own receiver should adopt the three rules:
+check the length, check `%%EOF` for PDFs, remember the identifier only after successful
+storage.
 
-| Gastgeber | Eignung |
+## Test bench without a printer
+
+`test/stresstest.sh` runs on a Linux machine with the stick plugged in (a Raspberry Pi
+works well). The machine plays the printer: mount, write test PDFs, eject. A receiver on
+the same machine checks whether every file arrives complete and exactly once. Three
+scenarios: one file, two in one go, and a second file at the tightest moment, as soon as
+the medium is back after the first upload.
+
+```bash
+sudo SCAN_WEBPASS=PASSWORD test/stresstest.sh http://scanstick-1a2b.local /dev/sda1
+```
+
+The stick's upload target is switched over for the duration of the test and reset
+afterwards. The partition is only touched if it belongs to an Espressif USB device and
+is named `SCANS`. The Linux driver writes directory entries earlier and differently than
+a printer; the test bench does not replace the print test, but it does make regressions
+repeatably visible.
+
+### Where the receiver should run
+
+The script runs without extra packages on Linux, macOS and Windows. What matters is not
+the operating system, however, but **availability**: the receiver has to be running when
+somebody scans. If the machine is asleep, the file stays on the card and is retried on
+the next attempt - but it has not arrived.
+
+| Host | Suitability |
 |---|---|
-| Raspberry Pi | ideal: läuft durch, wenig Strom, als Dienst einrichtbar |
-| NAS | sehr gut, Ablage direkt am Ziel |
-| Server / VM | gut, sofern vom Stick erreichbar |
-| Arbeitsplatzrechner | nur solange er wach ist |
+| Raspberry Pi | ideal: runs continuously, little power, can be set up as a service |
+| NAS | very good, storage right at the destination |
+| Server / VM | good, as long as it is reachable from the stick |
+| Workstation | only while it is awake |
 
-### Firewall und Autostart
+### Firewall and autostart
 
-**macOS** — beim ersten Start erscheint „Eingehende Netzwerkverbindungen zulassen?",
-das muss erlaubt werden (nachträglich unter *Systemeinstellungen → Netzwerk → Firewall
-→ Optionen*). Port 8080 braucht keine Administratorrechte. Dauerhaft über einen
-LaunchAgent in `~/Library/LaunchAgents/`; der Rechner darf dann nicht in den
-Ruhezustand gehen.
+**macOS** - on the first start "Allow incoming network connections?" appears, which has
+to be allowed (afterwards under *System Settings -> Network -> Firewall -> Options*).
+Port 8080 needs no administrator rights. Permanently via a LaunchAgent in
+`~/Library/LaunchAgents/`; the machine must then not go to sleep.
 
-**Windows** — die Defender-Firewall fragt beim ersten Start nach; Haken bei *Privates
-Netzwerk*, öffentliche Netzwerke nicht. Nachträglich: *Eingehende Regel → Port → TCP
-8080 → zulassen*, Profil „Privat". Dauerhaft über die Aufgabenplanung („Beim Start des
-Computers") oder als Dienst.
+**Windows** - the Defender firewall asks on the first start; tick *Private network*, not
+public networks. Afterwards: *inbound rule -> port -> TCP 8080 -> allow*, profile
+"Private". Permanently via Task Scheduler ("at computer startup") or as a service.
 
-**Linux** — falls eine Firewall aktiv ist: `sudo ufw allow 8080/tcp` beziehungsweise
-`firewall-cmd --add-port=8080/tcp --permanent`. Dauerhaft als systemd-Unit:
+**Linux** - if a firewall is active: `sudo ufw allow 8080/tcp` or
+`firewall-cmd --add-port=8080/tcp --permanent`. Permanently as a systemd unit:
 
 ```ini
 # /etc/systemd/system/scan-receiver.service
 [Unit]
-Description=Scan-Stick Empfaenger
+Description=Scan-Stick receiver
 After=network-online.target
 
 [Service]
 ExecStart=/usr/bin/python3 -u /opt/scanstick/empfaenger/scan-receiver.py
 Environment=SCAN_PORT=8080
 Environment=SCAN_INBOX=/srv/scans
-Environment=SCAN_KEY=geheim
+Environment=SCAN_KEY=secret
 Restart=always
 User=pi
 
@@ -420,34 +416,34 @@ WantedBy=multi-user.target
 sudo systemctl enable --now scan-receiver
 ```
 
-**Zwei Dinge, die man leicht vergisst:**
+**Two things that are easy to forget:**
 
-1. Der Empfänger braucht eine **feste Adresse** — im Router reserviert oder statisch
-   vergeben. Bekommt er per DHCP eine neue, zeigt `endpoint=` ins Leere, und zwar
-   irgendwann mitten im Betrieb.
-2. Er nimmt **alles** entgegen, was an ihn geschickt wird. Im Heimnetz ist das
-   vertretbar, aus dem Internet erreichbar sollte er nicht sein.
+1. The receiver needs a **fixed address** - reserved in the router or assigned
+   statically. If it gets a new one by DHCP, `endpoint=` points nowhere, and it happens
+   at some point in the middle of operation.
+2. It accepts **everything** that is sent to it. On a home network that is acceptable,
+   but it should not be reachable from the internet.
 
-## Anzeige
+## Display
 
-| Anzeige | Bedeutung |
+| Display | Meaning |
 |---|---|
-| STROM | fährt hoch |
-| BEREIT | wartet, mit Empfangsbalken |
-| OK | Drucker greift gerade zu |
-| SCAN ERKANNT | Schreibvorgang bemerkt, zeigt Countdown oder erkannte Größe |
-| SENDET | Fortschrittsbalken mit Prozent und Dateiname |
-| WARTE | Drucker noch nicht fertig, mit Versuchszähler |
-| SD?! | Karte nicht lesbar |
+| POWER | booting |
+| READY | waiting, with signal bar |
+| OK | printer is accessing right now |
+| SCAN FOUND | write noticed, shows countdown or detected size |
+| SENDING | progress bar with percentage and file name |
+| WAIT | printer not finished yet, with attempt counter |
+| SD?! | card not readable |
 
-## Offene Punkte
+## Open points
 
-- Selbsttätiger Wechsel des Zugangspunkts, wenn der Empfang längere Zeit schwach bleibt
-  (bei komplettem Ausfall sucht er nach zwei Minuten neu; bei nur schwachem Empfang noch nicht)
-- Auch andere Dateitypen als PDF auf Vollständigkeit prüfen
-- Weitere Boards, insbesondere solche ohne Kartensteckplatz (dort müsste der interne
-  Flash als Speicher dienen)
+- Automatic switching of the access point when reception stays weak for a longer time
+  (on a complete outage it scans again after two minutes; on merely weak reception not yet)
+- Check file types other than PDF for completeness as well
+- Further boards, in particular ones without a card slot (there the internal flash would
+  have to serve as storage)
 
-## Lizenz
+## License
 
-MIT, siehe `LICENSE`.
+MIT, see `LICENSE`.

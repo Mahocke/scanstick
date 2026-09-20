@@ -1,4 +1,4 @@
-name: Firmware bauen
+name: Build firmware
 
 on:
   push:
@@ -12,20 +12,20 @@ jobs:
 
       - uses: arduino/setup-arduino-cli@v2
 
-      - name: ESP32-Core und Bibliothek installieren
+      - name: Install ESP32 core and library
         run: |
           arduino-cli config init --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
           arduino-cli core update-index
           arduino-cli core install esp32:esp32@3.3.12
           arduino-cli lib install "GFX Library for Arduino@1.6.8"
 
-      - name: Firmware kompilieren
+      - name: Compile firmware
         run: >
           arduino-cli compile
           -b "esp32:esp32:esp32s3:USBMode=default,CDCOnBoot=cdc,FlashSize=16M,PartitionScheme=default_8MB,PSRAM=disabled,FlashMode=qio,CPUFreq=240"
           --export-binaries firmware/scanner
 
-      - name: Empfaenger und Pruefstand pruefen
+      - name: Check receiver and test bench
         run: |
           python3 -m py_compile empfaenger/scan-receiver.py
           bash -n test/stresstest.sh

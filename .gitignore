@@ -1,6 +1,2 @@
-build/
-*.bin
-*.elf
-*.map
-wifi.cfg
-.DS_Store
+__pycache__/
+firmware/scanner/build/

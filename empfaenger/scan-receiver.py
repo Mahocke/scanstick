@@ -1,30 +1,29 @@
 #!/usr/bin/env python3
-"""Winziger Scan-Empfaenger: nimmt POST /scan?name=... entgegen und legt die
-Datei in ~/scan-inbox/ ab. Nur zum Testen der Scan-Stick-Kette gedacht;
-im Betrieb tritt hier die eigentliche Ablage an diese Stelle.
+"""Tiny scan receiver: accepts POST /scan?name=... and stores the file in
+~/scan-inbox/. Meant for testing the Scan-Stick chain; in production the
+real archiving step takes its place here.
 
-Port und Ablageordner lassen sich ueber die Umgebung setzen:
+Port and inbox folder can be set through the environment:
     SCAN_PORT=8080 SCAN_INBOX=~/scan-inbox python3 scan-receiver.py
 """
 import os, time, hmac, hashlib, threading, http.server, socketserver, urllib.parse
 
 PORT = int(os.environ.get("SCAN_PORT", "8080"))
 INBOX = os.path.expanduser(os.environ.get("SCAN_INBOX", "~/scan-inbox"))
-# Geraeteschluessel: ist er gesetzt, muss jeder Upload eine gueltige Kopfzeile
-# X-Scan-Auth tragen (HMAC-SHA256 ueber "name\nid\nlaenge", derselbe Schluessel
-# wie in den Einstellungen des Sticks). Ohne Schluessel nimmt der Empfaenger
-# alles an - im Heimnetz vertretbar, fuer den Dauerbetrieb nicht.
+# Device key: if set, every upload must carry a valid X-Scan-Auth header
+# (HMAC-SHA256 over "name\nid\nlength", same key as in the stick's settings).
+# Without a key the receiver accepts everything - acceptable on a home
+# network, not for permanent use.
 SCHLUESSEL = os.environ.get("SCAN_KEY", "").encode()
-# Der Stick schickt sein Protokoll an denselben Endpunkt (scanlog-*.txt). Das
-# gehoert nicht zwischen die Scans, sondern in einen eigenen Ordner.
+# The stick sends its log to the same endpoint (scanlog-*.txt). That does
+# not belong between the scans but in a folder of its own.
 PROTOKOLL = os.path.join(INBOX, "protokoll")
 os.makedirs(PROTOKOLL, exist_ok=True)
 
-# Der Stick haengt an jeden Upload eine Kennung der Datei. Kommt dieselbe
-# Kennung ein zweites Mal, ist es eine Wiederholung - etwa nach einem
-# abgebrochenen Upload oder weil der Drucker seine alte Verzeichnissicht
-# zurueckgeschrieben hat und die Datei erneut auftauchte. Wir bestaetigen
-# solche Uploads, legen sie aber nicht noch einmal ab.
+# The stick attaches an id of the file to every upload. If the same id
+# arrives a second time it is a repeat - after an aborted upload, or because
+# the printer wrote back its stale directory view and the file reappeared.
+# We acknowledge such uploads but do not store them again.
 IDLISTE = os.path.join(INBOX, ".empfangene-ids")
 
 
@@ -48,7 +47,7 @@ def id_merken(scan_id):
 
 
 def ordner_sichern(pfad):
-    """Verzeichniseintrag auf die Platte zwingen (POSIX); anderswo egal."""
+    """Force the directory entry to disk (POSIX); harmless elsewhere."""
     try:
         fd = os.open(pfad, os.O_RDONLY)
         try:
@@ -60,13 +59,12 @@ def ordner_sichern(pfad):
 
 
 def ablegen(ordner, name, daten):
-    """Datei absturzsicher ablegen: erst in eine temporaere Datei schreiben,
-    auf die Platte zwingen, dann unter dem endgueltigen Namen einhaengen.
-    Stirbt der Rechner mittendrin, bleibt hoechstens eine .teil-Datei uebrig,
-    nie eine halbe PDF unter richtigem Namen. Erst danach wird die Kennung
-    gemerkt - eine gemerkte Kennung ohne sicher liegende Datei waere die
-    einzige Kombination, die einen Scan wirklich verlieren kann.
-    Liefert den endgueltigen Pfad."""
+    """Store a file crash-safely: write to a temporary file first, force it
+    to disk, then link it under its final name. If the machine dies halfway,
+    at most a .teil file is left behind, never a half PDF under the real
+    name. Only after that is the id remembered - a remembered id without a
+    safely stored file would be the one combination that really loses a scan.
+    Returns the final path."""
     tmp = os.path.join(ordner, "." + name + ".teil")
     with open(tmp, "wb") as f:
         f.write(daten)
@@ -76,12 +74,12 @@ def ablegen(ordner, name, daten):
     ziel, n = basis + ext, 1
     while True:
         try:
-            os.link(tmp, ziel)          # atomar und exklusiv: scheitert, wenn es den Namen gibt
+            os.link(tmp, ziel)          # atomic and exclusive: fails if the name exists
             break
         except FileExistsError:
             ziel = "%s_%d%s" % (basis, n, ext); n += 1
         except OSError:
-            os.replace(tmp, ziel)       # Dateisystem ohne harte Verweise
+            os.replace(tmp, ziel)       # file system without hard links
             ordner_sichern(ordner)
             return ziel
     os.unlink(tmp)
@@ -89,20 +87,20 @@ def ablegen(ordner, name, daten):
     return ziel
 
 
-# Zwei gleichzeitige Uploads derselben Kennung (Wiederholung des Sticks waehrend
-# der erste noch laeuft) duerfen nicht beide durchkommen.
+# Two simultaneous uploads with the same id (the stick retrying while the
+# first one is still running) must not both get through.
 SPERRE = threading.Lock()
 
 
 def vollstaendig(name, daten, angekuendigt):
-    """Nur eine vollstaendige Datei darf abgelegt und als empfangen gemerkt
-    werden. Vorher wurde ein abgerissener Upload verkuerzt gespeichert und
-    seine Kennung gemerkt - die Wiederholung des Sticks galt dann als Duplikat,
-    und der Stick loeschte daraufhin das einzige vollstaendige Exemplar."""
+    """Only a complete file may be stored and remembered as received. Earlier
+    a torn upload was stored truncated and its id remembered - the stick's
+    retry then counted as a duplicate, and the stick deleted the only
+    complete copy."""
     if len(daten) != angekuendigt:
-        return "nur %d von %d Bytes angekommen" % (len(daten), angekuendigt)
+        return "only %d of %d bytes arrived" % (len(daten), angekuendigt)
     if name.lower().endswith(".pdf") and b"%%EOF" not in daten[-1024:]:
-        return "PDF ohne Endmarke %%EOF"
+        return "PDF without %%EOF end marker"
     return None
 
 
@@ -116,9 +114,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "text/plain")
         if duplikat:
-            # Der Stick liest das Wort "Duplikat" aus der Antwort und traegt
-            # seinen Geist-Eintrag dann roh aus, statt ihn zu verschieben.
-            self.send_header("X-Scan-Duplikat", "ja")
+            # The stick looks for the word "duplicate" (or the older German
+            # "Duplikat") in the reply and then drops its ghost entry raw
+            # instead of moving it.
+            self.send_header("X-Scan-Duplicate", "yes")
         self.end_headers()
         self.wfile.write(text.encode() + b"\n")
 
@@ -128,7 +127,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         name_roh = params.get("name", [""])[0]
         id_roh = params.get("id", [""])[0]
         name = self._sicherer_name(name_roh)
-        scan_id = self._sicherer_name(id_roh) if id_roh else ""   # ohne Kennung nichts merken
+        scan_id = self._sicherer_name(id_roh) if id_roh else ""   # nothing to remember without an id
         laenge = int(self.headers.get("Content-Length", 0))
         daten = self.rfile.read(laenge) if laenge else b""
         stempel = time.strftime("%H:%M:%S")
@@ -138,36 +137,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
             soll = hmac.new(SCHLUESSEL, nachricht, hashlib.sha256).hexdigest()
             ist = self.headers.get("X-Scan-Auth", "")
             if not hmac.compare_digest(soll, ist):
-                print("[%s] ABGELEHNT %s von %s: Signatur %s" % (
-                    stempel, name, self.client_address[0], "fehlt" if not ist else "falsch"))
-                self._antwort(401, "abgelehnt: Signatur fehlt oder falsch")
+                print("[%s] REJECTED %s from %s: signature %s" % (
+                    stempel, name, self.client_address[0], "missing" if not ist else "wrong"))
+                self._antwort(401, "rejected: signature missing or wrong")
                 return
 
         fehler = vollstaendig(name, daten, laenge)
         if fehler:
-            print("[%s] ABGELEHNT %s: %s" % (stempel, name, fehler))
-            self._antwort(400, "abgelehnt: " + fehler)
+            print("[%s] REJECTED %s: %s" % (stempel, name, fehler))
+            self._antwort(400, "rejected: " + fehler)
             return
 
         ordner = PROTOKOLL if name.startswith("scanlog-") else INBOX
         with SPERRE:
             if id_bekannt(scan_id):
-                print("[%s] schon empfangen (%s), verworfen: %s (%d Bytes)" % (
+                print("[%s] already received (%s), discarded: %s (%d bytes)" % (
                     stempel, scan_id, name, len(daten)))
-                self._antwort(200, "OK (Duplikat, nicht erneut abgelegt)", duplikat=True)
+                self._antwort(200, "OK (duplicate, not stored again)", duplikat=True)
                 return
-            ziel = ablegen(ordner, name, daten)   # Datei sicher, dann erst die Kennung
+            ziel = ablegen(ordner, name, daten)   # file safe first, then the id
             id_merken(scan_id)
-        print("[%s] empfangen: %s (%d Bytes, id %s) von %s" % (
+        print("[%s] received: %s (%d bytes, id %s) from %s" % (
             stempel, os.path.basename(ziel), len(daten),
-            scan_id or "ohne", self.client_address[0]))
+            scan_id or "none", self.client_address[0]))
         self._antwort(200, "OK")
 
     def do_GET(self):
-        self._antwort(200, "scan-receiver laeuft")
+        self._antwort(200, "scan-receiver is running")
 
     def log_message(self, *a):
-        pass  # eigene Ausgabe reicht
+        pass  # our own output is enough
 
 
 class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -175,5 +174,5 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 if __name__ == "__main__":
-    print("scan-receiver auf 0.0.0.0:%d, Ablage %s" % (PORT, INBOX))
+    print("scan-receiver on 0.0.0.0:%d, inbox %s" % (PORT, INBOX))
     Server(("0.0.0.0", PORT), Handler).serve_forever()
