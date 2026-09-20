@@ -1,0 +1,38 @@
+name: Other destination
+description: A receiver for another storage target (cloud, mail, DMS, NAS ...)
+title: "[receiver] "
+labels: [receiver]
+body:
+  - type: input
+    id: target
+    attributes:
+      label: Destination
+      placeholder: e.g. Nextcloud via WebDAV, Paperless-ngx, mail
+    validations:
+      required: true
+  - type: dropdown
+    id: state
+    attributes:
+      label: State
+      options:
+        - Idea or wish
+        - Built it, want to share (link or pull request)
+        - Built it, but something with the stick side is missing
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: Details
+      description: How the receiver works, what the stick would need to send differently, link to your code if any
+    validations:
+      required: true
+  - type: checkboxes
+    id: contract
+    attributes:
+      label: Contract with the stick
+      description: A receiver must keep these rules so the stick does not delete a scan that did not arrive
+      options:
+        - label: Only answers 200 after the file is safely stored
+        - label: Rejects incomplete uploads (Content-Length mismatch, missing %%EOF)
+        - label: Recognizes repeated uploads by the id parameter and answers with the word "duplicate"

@@ -1,0 +1,50 @@
+name: Other printer
+description: Report how the stick behaves on a printer other than the HP PageWide 780
+title: "[printer] "
+labels: [printer]
+body:
+  - type: input
+    id: model
+    attributes:
+      label: Printer model and firmware version
+      placeholder: e.g. Brother MFC-L8900CDW, firmware ZA1234
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Stick firmware version
+      description: Shown on the status page and on the display at power-on
+      placeholder: e.g. v40
+    validations:
+      required: true
+  - type: dropdown
+    id: result
+    attributes:
+      label: What works?
+      options:
+        - Printer does not recognize the stick at all
+        - Printer recognizes the stick, but the scan fails
+        - Scan is written, but the stick does not detect it (no upload)
+        - Everything works, just reporting a success
+        - Something else (describe below)
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: What did you see?
+      description: Printer messages and error codes, what the stick display showed, timing
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Stick log
+      description: Copy the log page (/log) after the scan. Please remove anything private (IPs, names).
+      render: text
+  - type: input
+    id: card
+    attributes:
+      label: Card
+      placeholder: size, brand, formatted with the stick (yes/no)

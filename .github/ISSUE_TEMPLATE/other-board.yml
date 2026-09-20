@@ -1,0 +1,35 @@
+name: Other board
+description: Port to a board other than the LILYGO T-Dongle-S3
+title: "[board] "
+labels: [board]
+body:
+  - type: input
+    id: board
+    attributes:
+      label: Board
+      placeholder: e.g. Espressif ESP32-S3-USB-OTG, Waveshare ESP32-S3-...
+    validations:
+      required: true
+  - type: checkboxes
+    id: features
+    attributes:
+      label: What does the board have?
+      options:
+        - label: ESP32-S3 (native USB - required)
+        - label: microSD/SD card slot on SD_MMC
+        - label: USB-A plug (fits the printer directly)
+        - label: Display
+        - label: Status LED
+  - type: textarea
+    id: pins
+    attributes:
+      label: Pins and build settings
+      description: SD pins, display pins, LED pins, flash size, FQBN / partition scheme you used
+      render: text
+  - type: textarea
+    id: state
+    attributes:
+      label: State
+      description: Does it compile, does the printer see it, does a scan arrive? What is missing?
+    validations:
+      required: true
