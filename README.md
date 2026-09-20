@@ -29,12 +29,24 @@ Drucker schreibt Sektoren   →   Stick erkennt Schreibzugriffe
                                  ↓
                             Datei vollständig?  (%%EOF vorhanden, 3 s Ruhe)
                                  ↓
-                            Medium kurz abmelden  ← erst jetzt gefahrlos
+                            FENSTER, ein bis zwei Sekunden, Medium abgemeldet:
+                              Geister austragen · Erledigtes wegräumen · Scan nach /senden
                                  ↓
-                            umbenennen → hochladen → löschen oder nach /gesendet
+                            Medium wieder anmelden  ← der Drucker kann sofort weiterscannen
                                  ↓
-                            Medium wieder anmelden
+                            aus /senden hochladen (nur lesen, das Verzeichnis gehört dem Stick)
+                                 ↓
+                            im nächsten Fenster: löschen oder nach /gesendet
 ```
+
+Die Karte wird ausschließlich im Fenster verändert. Der Upload selbst läuft, während der
+Drucker den Stick schon wieder hat, und sein Ergebnis wird erst beim nächsten Fenster
+umgesetzt. Vorher war das Medium für die ganze Dauer des Uploads weg, fünf bis sieben
+Sekunden bei zwei Megabyte, und jeder Scan in dieser Zeit scheiterte am Drucker.
+
+Die Karte sollte **klein partitioniert** sein, etwa 4 GB mit 32-kB-Clustern: Nach jedem
+Fenster hängt der Drucker den Stick neu ein und liest dabei die Belegungstabelle. Bei
+64 GB sind das 60 MB über USB, bei 4 GB mit großen Clustern 512 kB.
 
 ## Hardware
 
@@ -59,14 +71,15 @@ müssen einmalig auf FAT32 umformatiert werden, **in einem richtigen Kartenleser
 ```bash
 # Linux/macOS, /dev/sdX durch das tatsächliche Gerät ersetzen – Vorsicht, löscht alles
 sudo parted -s /dev/sdX mklabel msdos
-sudo parted -s /dev/sdX mkpart primary fat32 1MiB 100%
+sudo parted -s /dev/sdX mkpart primary fat32 1MiB 4097MiB   # 4 GB reichen, siehe Ablauf
 sudo parted -s /dev/sdX set 1 lba on
-sudo mkfs.vfat -F 32 -n SCANS /dev/sdX1
+sudo mkfs.vfat -F 32 -s 64 -n SCANS /dev/sdX1                 # 32-kB-Cluster: kleine Belegungstabelle
 ```
 
 Unter Windows tut es ein Werkzeug wie „FAT32 Format", die Bordmittel bieten FAT32
-oberhalb von 32 GB nicht an. **Nicht** über den eingesteckten Stick formatieren: Der
-hält die Dauerschreiblast eines Formatiervorgangs nicht durch und bricht ab.
+oberhalb von 32 GB nicht an. Eine kleine Partition lässt sich auch über den eingesteckten
+Stick anlegen (4 GB mit großen Clustern in vier Sekunden); eine 64-GB-Partition dagegen
+nicht, das Formatieren schreibt dann minutenlang und der Stick bricht ab.
 
 ### 2. Firmware aufspielen
 
