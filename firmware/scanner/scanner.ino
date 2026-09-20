@@ -338,7 +338,7 @@ static volatile uint32_t g_bytesGeschrieben = 0;   // seit dem letzten Verarbeit
 static uint32_t g_naechsterVersuch = 0;   // 0 = sofort faellig
 static int      g_versuche         = 0;
 
-#define FW_VERSION "v27"
+#define FW_VERSION "v28"
 
 String cfgEndpoint;
 // Bekannte WLAN-Netze - mehrere, damit derselbe Stick an verschiedenen Standorten
@@ -370,6 +370,11 @@ static bool       g_updateBegonnen = false;   // Update.begin() ist tatsaechlich
 // Deshalb: Sperre setzen, warten bis kein Zugriff mehr laeuft, erst dann anfassen.
 static volatile int  g_usbZugriffe = 0;      // gerade laufende onRead/onWrite
 static volatile bool g_sdGesperrt  = false;  // Hauptschleife hat die Karte
+// Diagnose: die letzten Schreibzugriffe des Hosts (Sektor, Anzahl) - daran ist
+// zu sehen, ob er Verzeichnis, Belegungstabelle oder Daten schreibt.
+#define SPUR_ANZAHL 32
+static volatile uint32_t g_spurLba[SPUR_ANZAHL], g_spurN[SPUR_ANZAHL], g_spurT[SPUR_ANZAHL];
+static volatile int      g_spurIdx = 0;
 static void logZeile(const String &msg);     // steht weiter unten
 
 static int32_t onWrite(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize)
@@ -390,6 +395,9 @@ static int32_t onWrite(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t 
         g_lastWrite = millis();
         g_dirty = true;
         g_bytesGeschrieben += bufsize;   // Messung: kommen ueberhaupt Scandaten an?
+        int i = g_spurIdx;
+        g_spurLba[i] = lba; g_spurN[i] = bufsize / (sec ? sec : 512); g_spurT[i] = millis();
+        g_spurIdx = (i + 1) % SPUR_ANZAHL;
     }
     g_lastHost = millis();
     g_usbZugriffe--;
@@ -1607,6 +1615,19 @@ static void webStatus()
                 String(g_rssiMax) + " dBm <small>(" + String(g_rssiAnzahl) + " Messungen)</small>");
     if (g_rssiLetztLast)
         h += zl("Empfang am Ende des letzten Uploads", String(g_rssiLetztLast) + " dBm");
+    {
+        String spur;
+        for (int k = 0; k < SPUR_ANZAHL; k++) {
+            int i = (g_spurIdx + k) % SPUR_ANZAHL;
+            if (!g_spurT[i]) continue;
+            uint32_t lba = g_spurLba[i];
+            const char *wo = !g_fat.gueltig ? "?" : lba < g_fat.fatStart ? "Boot"
+                           : lba < g_fat.ersterDatenSektor ? "FAT"
+                           : lba < clusterSektor(g_fat.rootCluster) + g_fat.sektorenProCluster ? "Wurzel" : "Daten";
+            spur += String("vor ") + dauer(millis() - g_spurT[i]) + ": " + lba + " +" + g_spurN[i] + " (" + wo + ")<br>";
+        }
+        h += zl("Letzte Schreibzugriffe des Hosts", spur.length() ? "<small>" + spur + "</small>" : "keine");
+    }
     h += zl("Laufzeit", dauer(millis()));
     h += zl("Letzter Startgrund", g_startGrund);
     h += zl("Freier Speicher", menschlich(ESP.getFreeHeap()));
@@ -2410,11 +2431,22 @@ void loop()
         if (rohVerzeichnis(anz, summe) && anz > 0) {
             if (anz == g_rohAnzahl && summe == g_rohSumme) {
                 if (++g_rohStabil >= ROH_STABIL) {
-                    logZeile(String("[roh] ") + anz + " Datei(en), " + (summe / 1024) +
-                             " kB, Groesse stabil - verarbeite sofort");
                     g_rohStabil = 0;
                     g_rohAnzahl = 0;
                     g_rohSumme = 0;
+                    if (!rohOffen()) {
+                        // Der Drucker hat geschrieben, aber es liegt nichts Neues -
+                        // etwa seine Verzeichnisdaten. Vorher lief das alle vier
+                        // Sekunden im Kreis, mit einem Protokoll-Upload pro Runde.
+                        logZeile(String("[roh] ") + anz + " Datei(en) stabil, alle schon gesendet - nichts zu tun");
+                        g_dirty = false;
+                        g_versuche = 0;
+                        g_naechsterVersuch = 0;
+                        logFlushNetz();
+                        return;
+                    }
+                    logZeile(String("[roh] ") + anz + " Datei(en), " + (summe / 1024) +
+                             " kB, Groesse stabil - verarbeite sofort");
                     verarbeiteRoh(false);
                     return;
                 }
