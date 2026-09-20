@@ -29,23 +29,31 @@ Drucker schreibt Sektoren   →   Stick erkennt Schreibzugriffe
                                  ↓
                             Datei vollständig?  (%%EOF vorhanden, 3 s Ruhe)
                                  ↓
-                            FENSTER, ein bis zwei Sekunden, Medium abgemeldet:
-                              Geister austragen · Erledigtes wegräumen · Scan nach /senden
+                            liest die Datei roh entlang der Belegungskette und lädt sie hoch
+                            — der Drucker hat das Medium die ganze Zeit
                                  ↓
-                            Medium wieder anmelden  ← der Drucker kann sofort weiterscannen
+                            merkt sich im Flash: gesendet (Startcluster, Größe, Kennzahl)
                                  ↓
-                            aus /senden hochladen (nur lesen, das Verzeichnis gehört dem Stick)
-                                 ↓
-                            im nächsten Fenster: löschen oder nach /gesendet
+                            später, wenn der Drucker n Minuten nichts angefasst hat:
+                            Medium für unter eine Sekunde weg, Gesendetes löschen
+                            oder nach /gesendet, Geister austragen
 ```
 
-Die Karte wird ausschließlich im Fenster verändert. Der Upload selbst läuft, während der
-Drucker den Stick schon wieder hat, und sein Ergebnis wird erst beim nächsten Fenster
-umgesetzt. Vorher war das Medium für die ganze Dauer des Uploads weg, fünf bis sieben
-Sekunden bei zwei Megabyte, und jeder Scan in dieser Zeit scheiterte am Drucker.
+**Im Betrieb wird das Medium nie abgemeldet.** Der Stick fasst weder den Dateisystem-Treiber
+noch die Karte an, solange gescannt wird: Er liest Verzeichnis, Belegungstabelle und
+Datenblöcke direkt aus den Sektoren. Umbenennen ist unnötig, der Drucker nennt den nächsten
+Scan von selbst `[Untitled]_<Zeit>.pdf`. Was gesendet ist, steht in einer Merkliste im
+Flash und wird nicht erneut gesendet.
+
+Aufgeräumt wird nur in einer Ruhephase: nach einer einstellbaren Zeit ohne jeden Zugriff des
+Druckers (Vorgabe 15 Minuten), wenn die Merkliste voll wird, oder auf Knopfdruck in der
+Weboberfläche. Das ist der einzige Moment, in dem das Medium kurz weg ist, und dann steht
+niemand am Gerät. Frühere Fassungen nahmen dem Drucker das Medium bei jedem Scan weg, zuerst
+für die Dauer des Uploads, zuletzt für eine halbe Sekunde; jeder Job, der genau dann startete
+oder während der Drucker den Stick neu einhängte, scheiterte.
 
 Die Karte sollte **klein partitioniert** sein, etwa 4 GB mit 32-kB-Clustern: Nach jedem
-Fenster hängt der Drucker den Stick neu ein und liest dabei die Belegungstabelle. Bei
+Aufräumen hängt der Drucker den Stick neu ein und liest dabei die Belegungstabelle. Bei
 64 GB sind das 60 MB über USB, bei 4 GB mit großen Clustern 512 kB.
 
 ## Hardware
@@ -225,7 +233,7 @@ Erreichbar über `http://scanstick.local/` oder die angezeigte Adresse.
 |---|---|
 | Status | Karte, Empfang samt gewähltem Zugangspunkt, offene Schreibvorgänge, Uhrzeit, Laufzeit |
 | Protokoll | vollständiger Ablauf seit dem Start |
-| Dateien | Inhalt der Karte, einzeln herunterladbar |
+| Dateien | Wurzel roh gelesen mit Stand (gesendet, offen, Geist), Ordner, einzeln herunterladbar |
 | Roh | was der Stick ohne Dateisystem-Treiber sieht (Diagnose) |
 | Einstellungen | siehe unten |
 | Firmware | Aktualisierung über WLAN |
@@ -247,7 +255,7 @@ curl -u scan:PASSWORT -X POST http://scanstick.local/neustart
 
 ## Einstellungen
 
-Upload-Ziel · Namensanfang der Dateien (z. B. Standortkennung) · Ruhefrist ·
+Upload-Ziel · Namensanfang der Dateien (z. B. Standortkennung) · Ruhefrist · Aufräumen nach n Minuten Ruhe ·
 nach dem Senden löschen oder nach `/gesendet` verschieben · Passwort ·
 Geräteschlüssel für den Upload · Helligkeit der Status-LED (0 = aus) ·
 Farbumkehr des Displays · acht Zustandsfarben für Display und LED
