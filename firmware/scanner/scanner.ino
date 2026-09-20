@@ -338,7 +338,7 @@ static volatile uint32_t g_bytesGeschrieben = 0;   // seit dem letzten Verarbeit
 static uint32_t g_naechsterVersuch = 0;   // 0 = sofort faellig
 static int      g_versuche         = 0;
 
-#define FW_VERSION "v26"
+#define FW_VERSION "v27"
 
 String cfgEndpoint;
 // Bekannte WLAN-Netze - mehrere, damit derselbe Stick an verschiedenen Standorten
@@ -2399,8 +2399,11 @@ void loop()
     // Ruhe heisst: weder Schreiben NOCH Lesen. Ein Host, der nach dem Schreiben
     // noch liest (Linux beim Aushaengen, ein Drucker beim Nachpruefen), ist nicht
     // fertig - ihm jetzt das Medium zu entziehen bringt nur Fehler auf seiner Seite.
+    // ... aber nicht schneller als der Wartezyklus erlaubt: liegt nur Bekanntes
+    // in der Wurzel, lief das sonst alle vier Sekunden im Kreis.
     if (g_dirty && !g_warteAnzeige && nun - g_lastHost > ROH_RUHE &&
-        nun - g_rohLetzt > ROH_INTERVALL) {
+        nun - g_rohLetzt > ROH_INTERVALL &&
+        (g_naechsterVersuch == 0 || (int32_t)(nun - g_naechsterVersuch) >= 0)) {
         g_rohLetzt = nun;
         int anz = 0;
         uint32_t summe = 0;
