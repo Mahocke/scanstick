@@ -11,7 +11,7 @@
  * Zugangsdaten kommen NICHT in den Code, sondern aus /wifi.cfg auf der SD-Karte:
  *   ssid=...
  *   pass=...
- *   endpoint=http://192.168.1.50:8080/scan
+ *   endpoint=http://192.168.1.50:8080/scan      (Beispiel - die Adresse des eigenen Empfaengers)
  *
  * Board: ESP32S3 Dev Module, USB Mode = USB-OTG (TinyUSB), USB CDC on Boot = Enabled
  */
@@ -360,7 +360,7 @@ static volatile uint32_t g_bytesGeschrieben = 0;   // seit dem letzten Verarbeit
 static uint32_t g_naechsterVersuch = 0;   // 0 = sofort faellig
 static int      g_versuche         = 0;
 
-#define FW_VERSION "v36"
+#define FW_VERSION "v38"
 
 String cfgEndpoint;
 // Bekannte WLAN-Netze - mehrere, damit derselbe Stick an verschiedenen Standorten
@@ -370,6 +370,17 @@ String cfgEndpoint;
 static String    cfgNetzSsid[MAX_NETZE], cfgNetzPass[MAX_NETZE];
 static int       cfgNetze = 0;
 static WiFiMulti g_wifiMulti;
+// Geraetename mit den letzten vier Stellen der Funkadresse: zwei Sticks im selben
+// Netz hiessen sonst beide scanstick.local, und der Pruefstand sprach am 20.09.2026
+// prompt mit dem falschen. Der Name steht im Protokoll und auf der Statusseite.
+static String geraeteName()
+{
+    uint8_t mac[6];
+    WiFi.macAddress(mac);
+    char t[24];
+    snprintf(t, sizeof t, "scanstick-%02x%02x", mac[4], mac[5]);
+    return String(t);
+}
 String cfgWebPass;   // Schutz der Weboberflaeche; leer = offen
 String cfgPraefix = "scan";   // Namensanfang der Dateien, z.B. "buero-774"
 String cfgSchluessel;         // Geraeteschluessel: signiert jeden Upload; leer = ohne
@@ -1419,7 +1430,9 @@ static void kartePruefen(bool heilen, const char *anlass)
     if (kaputt) { b.gekuerzt++; if (heilen) b.geaendert = true; }
     if (!pruefeVerzeichnis(g_fat.rootCluster, 0, bits, sek, fatBuf, heilen, b)) b.heillos = true;
 
-    // 3. Verwaiste Cluster: belegt, aber von niemandem erreicht
+    // 3. Verwaiste Cluster: belegt, aber von niemandem erreicht. Nebenbei die
+    //    freien zaehlen - der Freizaehler im FSInfo-Sektor wird gleich mit gerichtet.
+    uint32_t frei = 0, ersterFrei = 0;
     if (!b.heillos) {
         for (uint32_t x = 0; x < g_fat.fatSektoren; x++) {
             if (!sdLesen(sek, g_fat.fatStart + x)) break;
@@ -1427,24 +1440,31 @@ static void kartePruefen(bool heilen, const char *anlass)
             for (int j = 0; j < 128; j++) {
                 uint32_t c = x * 128 + j;
                 if (c < 2 || c >= g_fat.gesamtCluster + 2) continue;
-                if ((le32(sek + j * 4) & 0x0FFFFFFF) == 0 || bitDa(bits, c)) continue;
-                b.verwaist++;
-                if (heilen) { sek[j * 4] = 0; sek[j * 4 + 1] = 0; sek[j * 4 + 2] = 0; sek[j * 4 + 3] &= 0xF0; geaendert = true; }
+                bool belegt = (le32(sek + j * 4) & 0x0FFFFFFF) != 0;
+                if (belegt && !bitDa(bits, c)) {
+                    b.verwaist++;
+                    if (heilen) { sek[j * 4] = 0; sek[j * 4 + 1] = 0; sek[j * 4 + 2] = 0; sek[j * 4 + 3] &= 0xF0; geaendert = true; belegt = false; }
+                }
+                if (!belegt) { frei++; if (!ersterFrei) ersterFrei = c; }
             }
             if (geaendert) {
                 if (sdSchreiben(sek, g_fat.fatStart + x)) b.geaendert = true;
                 if (g_fat.anzahlFats > 1) sdSchreiben(sek, g_fat.fatStart + g_fat.fatSektoren + x);
             }
         }
-        // Freizaehler im FSInfo-Sektor stimmt dann nicht mehr: als "unbekannt" markieren
-        if (b.verwaist && heilen && g_fat.fsInfoSektor && sdLesen(sek, g_fat.partStart + g_fat.fsInfoSektor) &&
-            le32(sek) == 0x41615252) {
-            memset(sek + 488, 0xFF, 8);
-            sdSchreiben(sek, g_fat.partStart + g_fat.fsInfoSektor);
+        if (heilen && g_fat.fsInfoSektor && sdLesen(sek, g_fat.partStart + g_fat.fsInfoSektor) && le32(sek) == 0x41615252) {
+            if (le32(sek + 488) != frei) {
+                uint32_t v = frei;                  memcpy(sek + 488, &v, 4);
+                v = ersterFrei ? ersterFrei : 2;    memcpy(sek + 492, &v, 4);
+                sdSchreiben(sek, g_fat.partStart + g_fat.fsInfoSektor);
+            }
         }
     }
 
-    // 4. Schmutzmarke: Bit 27 "sauber ausgehaengt", Bit 26 "keine Fehler" im zweiten Eintrag
+    // 4. Schmutzmarke, zweifach: Bit 27 "sauber ausgehaengt" und Bit 26 "keine
+    //    Fehler" im zweiten Tabelleneintrag (Windows), und Bit 0 im Byte 65 des
+    //    Bootsektors (Linux setzt es beim Einhaengen, loescht es beim Aushaengen;
+    //    faellt das Medium vorher weg, bleibt es stehen - fsck: "Dirty bit is set").
     if (!b.heillos && sdLesen(sek, g_fat.fatStart)) {
         uint32_t v = le32(sek + 4);
         if ((v & 0x0C000000) != 0x0C000000) {
@@ -1455,6 +1475,15 @@ static void kartePruefen(bool heilen, const char *anlass)
                 if (sdSchreiben(sek, g_fat.fatStart)) b.geaendert = true;
                 if (g_fat.anzahlFats > 1) sdSchreiben(sek, g_fat.fatStart + g_fat.fatSektoren);
             }
+        }
+    }
+    if (!b.heillos && sdLesen(sek, g_fat.partStart) && (sek[65] & 0x01)) {
+        b.schmutzig = true;
+        if (heilen) {
+            sek[65] &= ~0x01;
+            if (sdSchreiben(sek, g_fat.partStart)) b.geaendert = true;
+            uint16_t sicherung = (uint16_t)sek[50] | ((uint16_t)sek[51] << 8);   // Sicherungskopie des Bootsektors
+            if (sicherung && sicherung < 32) sdSchreiben(sek, g_fat.partStart + sicherung);
         }
     }
 
@@ -1643,7 +1672,7 @@ static void cfgAusNvs()
     cfgSchluessel = g_nvs.getString("schluessel", "");
     g_idleMs    = g_nvs.getUInt("idle", IDLE_VORGABE);
     g_aufraeumMin = g_nvs.getUInt("aufraeum", AUFRAEUM_VORGABE);
-    g_loeschen  = g_nvs.getBool("loeschen", true);
+    g_loeschen  = true;   // "nach /gesendet verschieben" gibt es nicht mehr (Kreuzverkettungen, 20.09.2026)
     g_invertiert = g_nvs.getBool("invers", true);
     g_ledHell   = (uint8_t)g_nvs.getUChar("ledhell", 5);
     for (int i = 0; i < Z_ANZAHL; i++) {
@@ -1703,7 +1732,7 @@ static void wlanStarten()
 {
     if (!cfgNetze) { logZeile("[wifi] kein Netz bekannt"); return; }
     WiFi.mode(WIFI_STA);
-    WiFi.setHostname("scanstick");
+    WiFi.setHostname(geraeteName().c_str());
     g_wifiMulti.APlistClean();
     for (int i = 0; i < cfgNetze; i++) g_wifiMulti.addAP(cfgNetzSsid[i].c_str(), cfgNetzPass[i].c_str());
 
@@ -2079,7 +2108,7 @@ static void webStatus()
             (g_fertigAnzahl ? " <small>(werden in der naechsten Ruhephase geraeumt)</small>" : ""));
     h += zl("Aufraeumen", String("nach ") + g_aufraeumMin + " min ohne Zugriff des Druckers" +
             (g_letztesAufraeumen ? ", zuletzt vor " + dauer(millis() - g_letztesAufraeumen) : ", noch nie"));
-    h += zl("Nach dem Senden", g_loeschen ? "loeschen" : "nach /gesendet verschieben");
+    h += zl("Nach dem Senden", "von der Karte loeschen <small>(die Kopie liegt beim Empfaenger)</small>");
     h += zl("Weboberflaeche", cfgWebPass.length() ? "<span class=\"ok\">passwortgeschuetzt</span>"
                                                   : "<span class=\"bad\">offen, jeder im WLAN kann die Scans lesen</span>");
     h += zl("Upload-Signatur", cfgSchluessel.length() ? "<span class=\"ok\">Geraeteschluessel gesetzt</span>"
@@ -2107,6 +2136,7 @@ static void webStatus()
                     " <small>(vor " + dauer(millis() - g_befundZeit) + ")</small>");
         }
     }
+    h += zl("Geraetename", geraeteName() + ".local");
     h += zl("Laufzeit", dauer(millis()));
     h += zl("Letzter Startgrund", g_startGrund);
     h += zl("Freier Speicher", menschlich(ESP.getFreeHeap()));
@@ -2329,7 +2359,6 @@ static void webEinstellungen()
             uint32_t sek = g_web.arg("idle").toInt();
             if (sek >= 5 && sek <= 600) g_idleMs = sek * 1000;
         }
-        if (g_web.hasArg("nachher")) g_loeschen = (g_web.arg("nachher") == "loeschen");
         if (g_web.hasArg("speichern")) {
             bool neu = g_web.hasArg("invers");
             if (neu != g_invertiert) { g_invertiert = neu; g_gfx->invertDisplay(g_invertiert); g_screen = -1; }
@@ -2387,11 +2416,6 @@ static void webEinstellungen()
     h += "<tr><td>Ruhefrist in Sekunden<br><small>so lange Stille, bis ein Scan als fertig gilt "
          "(der 780 braucht 45)</small></td><td><input name=\"idle\" type=\"number\" min=\"5\" max=\"600\" value=\"" +
          String(g_idleMs / 1000) + "\"></td></tr>";
-    h += String("<tr><td>Nach dem Senden</td><td>"
-         "<label><input type=\"radio\" name=\"nachher\" value=\"loeschen\"") + (g_loeschen ? " checked" : "") +
-         "> von der Karte loeschen</label><br>"
-         "<label><input type=\"radio\" name=\"nachher\" value=\"aufheben\"" + (g_loeschen ? "" : " checked") +
-         "> nach /gesendet verschieben</label></td></tr>";
     h += "<tr><td>Passwort der Weboberflaeche<br><small>Benutzername ist <b>scan</b>. "
          "Leer lassen = unveraendert.</small></td><td><input name=\"webpass\" type=\"password\" size=\"18\">"
          "<br><label><small><input type=\"checkbox\" name=\"passweg\" value=\"ja\"> Schutz entfernen</small></label></td></tr>";
@@ -2489,10 +2513,10 @@ static void webStarten()
     const char *kopf[] = { "Origin", "Referer" };
     g_web.collectHeaders(kopf, 2);
     g_web.begin();
-    if (MDNS.begin("scanstick")) MDNS.addService("http", "tcp", 80);
+    if (MDNS.begin(geraeteName().c_str())) MDNS.addService("http", "tcp", 80);
     g_webAn = true;
     logZeile(String("[web] erreichbar unter http://") + WiFi.localIP().toString() +
-             "/ und http://scanstick.local/");
+             "/ und http://" + geraeteName() + ".local/");
 }
 
 // ---- nach Scan-Ende: neue Dateien hochladen ----

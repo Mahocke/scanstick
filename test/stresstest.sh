@@ -7,7 +7,8 @@
 # ob jede Datei vollstaendig und genau einmal ankommt.
 #
 #   sudo test/stresstest.sh [Stick-Adresse] [Partition]
-#     Stick-Adresse  http://scanstick.local  (Vorgabe)
+#     Stick-Adresse  http://scanstick-1a2b.local  (Vorgabe scanstick.local; besser den eigenen Namen oder die IP,
+#                    mit zwei Sticks im Netz trifft der Name sonst den falschen)
 #     Partition      /dev/sda1               (Vorgabe)
 #
 #   Umgebung: SCAN_WEBPASS=...  Passwort der Weboberflaeche (Benutzer scan)

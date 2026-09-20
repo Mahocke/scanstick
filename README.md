@@ -35,8 +35,8 @@ Drucker schreibt Sektoren   →   Stick erkennt Schreibzugriffe
                             merkt sich im Flash: gesendet (Startcluster, Größe, Kennzahl)
                                  ↓
                             später, wenn der Drucker n Minuten nichts angefasst hat:
-                            Medium für unter eine Sekunde weg, Gesendetes löschen
-                            oder nach /gesendet, Geister austragen
+                            Medium für unter eine Sekunde weg, Gesendetes löschen,
+                            Geister austragen, Karte prüfen und heilen
 ```
 
 **Im Betrieb wird das Medium nie abgemeldet.** Der Stick fasst weder den Dateisystem-Treiber
@@ -248,10 +248,11 @@ legt er die Partition neu an (`POST /formatieren` tut das auch auf Knopfdruck, n
 nichts Ungesendetes liegt). Das Ergebnis steht auf der Statusseite unter „Kartenprüfung".
 Der Prüfstand hat dafür Szenario E.
 
-**Nach dem Senden löschen, nicht verschieben.** Ein nach `/gesendet` verschobener Eintrag
-behält seine Blöcke. Schreibt der Drucker danach seinen alten Wurzeleintrag zurück und
-ersetzt ihn, gibt er genau diese Blöcke frei — Kreuzverkettung. Gelöschte Blöcke sind
-frei, da kann ein Geist nichts mehr anrichten. Die Kopien liegen ohnehin beim Empfänger.
+**Nach dem Senden wird gelöscht, nicht verschoben.** Ein nach `/gesendet` verschobener
+Eintrag behält seine Blöcke. Schreibt der Drucker danach seinen alten Wurzeleintrag zurück
+und ersetzt ihn, gibt er genau diese Blöcke frei — Kreuzverkettung. Gelöschte Blöcke sind
+frei, da kann ein Geist nichts mehr anrichten. Die Option „nach /gesendet verschieben"
+gibt es deshalb seit v37 nicht mehr; die Kopie liegt beim Empfänger.
 
 **Bei mehreren Zugangspunkten mit derselben Kennung** nimmt `WiFi.begin(ssid, pass)`
 den erstbesten, nicht den stärksten. Der Stick sucht deshalb vorher (`WiFiMulti`) und
@@ -261,7 +262,9 @@ der Stick deshalb von vorn, über alle bekannten Netze.
 
 ## Weboberfläche
 
-Erreichbar über `http://scanstick.local/` oder die angezeigte Adresse.
+Erreichbar über `http://scanstick-XXXX.local/` (XXXX = die letzten vier Stellen der
+Funkadresse, steht im Protokoll und auf der Statusseite) oder die angezeigte IP-Adresse.
+So kommen sich mehrere Sticks im selben Netz nicht in die Quere.
 
 | Seite | Inhalt |
 |---|---|
@@ -283,8 +286,8 @@ starten, denn ein gespeichertes Passwort schickt der Browser automatisch mit. We
 wie `curl` schicken keine `Origin`-Kopfzeile und funktionieren weiter:
 
 ```bash
-curl -u scan:PASSWORT --data-urlencode 'endpoint=http://192.168.1.50:8080/scan' http://scanstick.local/einstellungen
-curl -u scan:PASSWORT -X POST http://scanstick.local/neustart
+curl -u scan:PASSWORT --data-urlencode 'endpoint=http://192.168.1.50:8080/scan' http://scanstick-1a2b.local/einstellungen
+curl -u scan:PASSWORT -X POST http://scanstick-1a2b.local/neustart
 ```
 
 ## Einstellungen
@@ -341,7 +344,7 @@ und eine zweite Datei im engsten Moment, sobald das Medium nach dem ersten Uploa
 wieder da ist.
 
 ```bash
-sudo SCAN_WEBPASS=PASSWORT test/stresstest.sh http://scanstick.local /dev/sda1
+sudo SCAN_WEBPASS=PASSWORT test/stresstest.sh http://scanstick-1a2b.local /dev/sda1
 ```
 
 Das Upload-Ziel des Sticks wird für die Dauer des Tests umgestellt und danach
