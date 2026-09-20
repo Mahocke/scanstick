@@ -29,6 +29,7 @@
 #include <Update.h>
 #include <functional>
 #include "mbedtls/md.h"
+#include "tusb.h"
 
 #define SD_D0  14
 #define SD_D1  17
@@ -338,7 +339,7 @@ static volatile uint32_t g_bytesGeschrieben = 0;   // seit dem letzten Verarbeit
 static uint32_t g_naechsterVersuch = 0;   // 0 = sofort faellig
 static int      g_versuche         = 0;
 
-#define FW_VERSION "v28"
+#define FW_VERSION "v29"
 
 String cfgEndpoint;
 // Bekannte WLAN-Netze - mehrere, damit derselbe Stick an verschiedenen Standorten
@@ -443,6 +444,22 @@ static void karteZurueckgeben()
 {
     g_sdGesperrt = false;
     MSC.mediaPresent(true);
+}
+
+// Neustart, der auch am Drucker ueberlebt. Der 780 schaltet dem USB-Port kurz
+// den Strom ab, sobald sich ein Geraet abmeldet. Startet der Stick sofort neu,
+// trifft dieser Stromschnitt die gerade erst gebootete Firmware, bevor sie sich
+// beim Bootloader als gueltig gemeldet hat - und der faellt auf die vorige
+// zurueck (Rollback ist im Core eingeschaltet). Zweimal blieb so v27 stehen,
+// obwohl v28 sauber eingespielt war. Deshalb: erst am USB abmelden, den
+// Stromschnitt in der ALTEN Firmware abwarten, dann neu starten.
+static void sanftNeustarten()
+{
+    logFlushNetz();
+    MSC.mediaPresent(false);
+    tud_disconnect();
+    delay(2500);
+    ESP.restart();
 }
 
 // SCSI START STOP UNIT. Geraete senden das oft am Jobende ("auswerfen",
@@ -1830,9 +1847,9 @@ static void webNeustart()
     if (!webAuth() || !herkunftPruefen()) return;
     g_web.send(200, "text/html; charset=utf-8",
                htmlKopf("Neustart") + "<p>Der Stick startet neu. Diese Seite ist in etwa "
-               "10 Sekunden wieder da.</p>" + htmlFuss());
+               "15 Sekunden wieder da.</p>" + htmlFuss());
     delay(300);
-    ESP.restart();
+    sanftNeustarten();
 }
 
 static void webEinstellungen()
@@ -1974,7 +1991,7 @@ static void webStarten()
                            : "<p class=\"bad\">Es wurde kein vollstaendiges Abbild geschrieben, "
                              "die bisherige Firmware laeuft weiter.</p>") + htmlFuss());
             delay(600);
-            if (ok) ESP.restart();
+            if (ok) sanftNeustarten();
         },
         []() {
             // Hier nur pruefen, nicht antworten - die Antwort gibt der Abschluss.
