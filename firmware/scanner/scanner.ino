@@ -20,12 +20,16 @@
 #include "FS.h"
 #include "SD_MMC.h"
 #include <WiFi.h>
+#include <WiFiMulti.h>
 #include <HTTPClient.h>
 #include <Arduino_GFX_Library.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
 #include <Update.h>
+#include <functional>
+#include "mbedtls/md.h"
+#include "tusb.h"
 
 #define SD_D0  14
 #define SD_D1  17
@@ -33,6 +37,12 @@
 #define SD_D3  18
 #define SD_CLK 12
 #define SD_CMD 16
+
+// Datentypen, die in Funktionssignaturen vorkommen, stehen hier oben: der Arduino-
+// Builder erzeugt Prototypen vor der ersten Funktion und muss die Typen dort kennen.
+struct RohEintrag { uint32_t start; uint32_t groesse; char name[64]; };
+struct Fertig { uint32_t start, groesse, kennzahl; char name[40]; };
+struct KartenBefund { int fatAbweichungen, kreuz, verwaist, gekuerzt; bool schmutzig, heillos, geaendert, zuGross; };
 
 #define IDLE_VORGABE  45000    // Ruhe bis "Scan fertig" - Vorgabe, per Weboberflaeche aenderbar
 static uint32_t g_idleMs   = IDLE_VORGABE;   // Ruhefrist, aus dem Flash
@@ -265,12 +275,21 @@ static uint32_t g_rohLetzt  = 0;
 static uint32_t g_rohSumme  = 0;
 static int      g_rohAnzahl = 0;
 static int      g_rohStabil = 0;
+// Fuer die Anzeige zaehlt nur, was noch nicht gesendet ist - sonst stand nach
+// jedem Schreibzugriff des Druckers "SCAN ERKANNT" mit der Groesse laengst
+// gesendeter Dateien auf dem Display.
+static int      g_zeigAnzahl  = 0;
+static uint32_t g_zeigSumme   = 0;
+static uint32_t g_rohGeprueft = 0;   // millis() der letzten rohen Nachschau
+static int      g_fristModus  = -1;
 
 static void zeigeFrist(uint32_t restSek)
 {
+    int modus = g_zeigAnzahl ? 1 : 0;
     if (g_screen != Z_FRIST) {
         g_screen = Z_FRIST;
         g_fristLetzt = -1;
+        g_fristModus = -1;
         uint32_t rgb = g_farbe[Z_FRIST];
         ledColor(rgb >> 16, (rgb >> 8) & 0xFF, rgb & 0xFF);
         g_gfx->fillScreen(rgb565(rgb));
@@ -278,21 +297,27 @@ static void zeigeFrist(uint32_t restSek)
         g_gfx->setTextSize(2);
         g_gfx->setCursor(5, 4);
         g_gfx->print("SCAN ERKANNT");
+    }
+    if (modus != g_fristModus) {
+        g_fristModus = modus;
+        g_fristLetzt = -1;
+        g_gfx->fillRect(5, 66, 150, 12, rgb565(g_farbe[Z_FRIST]));
+        g_gfx->setTextColor(COL_BLACK);
         g_gfx->setTextSize(1);
         g_gfx->setCursor(5, 68);
-        g_gfx->print(g_rohAnzahl ? "pruefe ob fertig" : "warte auf Ruhe");
+        g_gfx->print(modus ? "pruefe ob fertig" : "warte auf Ruhe");
     }
-    // Sobald wir die Datei roh sehen, ist ihre Groesse die ehrlichere Angabe
+    // Sobald wir die neue Datei roh sehen, ist ihre Groesse die ehrlichere Angabe
     // als ein Countdown, der ohnehin vorzeitig endet.
-    int wert = g_rohAnzahl ? (int)(g_rohSumme / 1024) : (int)restSek;
+    int wert = modus ? (int)(g_zeigSumme / 1024) : (int)restSek;
     if (wert != g_fristLetzt) {
         g_fristLetzt = wert;
         g_gfx->fillRect(5, 26, 150, 36, rgb565(g_farbe[Z_FRIST]));
         g_gfx->setTextColor(COL_BLACK);
-        g_gfx->setTextSize(g_rohAnzahl ? 3 : 4);
+        g_gfx->setTextSize(modus ? 3 : 4);
         g_gfx->setCursor(5, 30);
-        if (g_rohAnzahl) g_gfx->printf("%d kB", wert);
-        else             g_gfx->printf("%ds", wert);
+        if (modus) g_gfx->printf("%d kB", wert);
+        else       g_gfx->printf("%ds", wert);
     }
 }
 
@@ -331,18 +356,23 @@ static volatile uint32_t g_lastWrite = 0;
 static volatile uint32_t g_lastHost  = 0;   // wann hat der Host zuletzt gelesen/geschrieben
 static volatile bool     g_dirty     = false;
 static volatile uint32_t g_bytesGeschrieben = 0;   // seit dem letzten Verarbeiten
-// Merkmale der zuletzt gesendeten Datei - gegen doppelte Uploads
-static uint32_t g_letzteGroesse = 0;
-static uint32_t g_letztePruef   = 0;
 
 static uint32_t g_naechsterVersuch = 0;   // 0 = sofort faellig
 static int      g_versuche         = 0;
 
-#define FW_VERSION "v18"
+#define FW_VERSION "v33"
 
-String cfgSsid, cfgPass, cfgEndpoint;
+String cfgEndpoint;
+// Bekannte WLAN-Netze - mehrere, damit derselbe Stick an verschiedenen Standorten
+// laeuft. Beim Suchlauf gewinnt ueber ALLE bekannten Netze hinweg der staerkste
+// Zugangspunkt; WiFiMulti verbindet gezielt mit dessen Kennung und Kanal.
+#define MAX_NETZE 4
+static String    cfgNetzSsid[MAX_NETZE], cfgNetzPass[MAX_NETZE];
+static int       cfgNetze = 0;
+static WiFiMulti g_wifiMulti;
 String cfgWebPass;   // Schutz der Weboberflaeche; leer = offen
 String cfgPraefix = "scan";   // Namensanfang der Dateien, z.B. "buero-774"
+String cfgSchluessel;         // Geraeteschluessel: signiert jeden Upload; leer = ohne
 static bool g_zeitOk        = false;   // NTP-Zeit vorhanden?
 static bool g_einmalSchauen = false;   // Knopf "Jetzt schauen": einmal, ohne Wartezyklus
 static bool g_startGeprueft = false;   // nach dem Hochlaufen einmal nachsehen
@@ -350,31 +380,117 @@ static bool g_startGeprueft = false;   // nach dem Hochlaufen einmal nachsehen
 static WebServer  g_web(80);
 static Preferences g_nvs;
 static bool       g_webAn = false;
+static bool       g_updateBegonnen = false;   // Update.begin() ist tatsaechlich gelaufen
 
 // ---- MSC: der Host greift auf die SD zu, jeder Sektor laeuft durch uns ----
+// Uebergabe der Karte zwischen USB-Task und Hauptschleife. mediaPresent(false)
+// haelt nur NEUE Kommandos ab - ein Lesevorgang, der gerade laeuft, laeuft weiter.
+// Ein Linux-Host liest beim Aushaengen die FAT in 120-kB-Bloecken, das dauert
+// laenger als die 200 ms, die wir vor SD_MMC.end() gewartet haben. Der USB-Task
+// hing dann auf dem abgebauten Treiber, nach 5 s schlug der Task-Watchdog zu
+// (im Pruefstand zweimal hintereinander, im Kernel-Log "cmd_age=5s").
+// Deshalb: Sperre setzen, warten bis kein Zugriff mehr laeuft, erst dann anfassen.
+static volatile int  g_usbZugriffe = 0;      // gerade laufende onRead/onWrite
+static volatile bool g_sdGesperrt  = false;  // Hauptschleife hat die Karte
+// Diagnose: die letzten Schreibzugriffe des Hosts (Sektor, Anzahl) - daran ist
+// zu sehen, ob er Verzeichnis, Belegungstabelle oder Daten schreibt.
+#define SPUR_ANZAHL 32
+static volatile uint32_t g_spurLba[SPUR_ANZAHL], g_spurN[SPUR_ANZAHL], g_spurT[SPUR_ANZAHL];
+static volatile int      g_spurIdx = 0;
+// Abgewiesene Host-Zugriffe: Antwort -1 heisst fuer den Drucker "Medienfehler".
+// Passiert das mitten in einem Scan, bricht er still ab - deshalb zaehlen und
+// im Protokoll und auf der Statusseite zeigen.
+static volatile uint32_t g_usbFehlerLesen = 0, g_usbFehlerSchreiben = 0;
+static volatile uint32_t g_usbFehlerLba = 0, g_usbFehlerZeit = 0;
+static uint32_t          g_usbFehlerGemeldet = 0;
+static void logZeile(const String &msg);     // steht weiter unten
+static bool remount();                       // ebenfalls
+static void logFlushNetz();                  // ebenfalls
+
 static int32_t onWrite(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize)
 {
+    // Rueckgabe 0 heisst fuer TinyUSB "beschaeftigt, gleich nochmal" - bei einem
+    // echten Kartenfehler haengt der Host damit endlos. Negativ = sauberer Fehler.
+    if (g_sdGesperrt) { g_usbFehlerSchreiben++; g_usbFehlerLba = lba; g_usbFehlerZeit = millis(); g_lastHost = millis(); return -1; }
+    g_usbZugriffe++;
+    int32_t ergebnis = -1;
     uint32_t sec = SD_MMC.sectorSize();
-    if (!sec) return 0;
-    for (uint32_t x = 0; x < bufsize / sec; x++) {
-        if (!SD_MMC.writeRAW(buffer + sec * x, lba + x)) return 0;
+    if (sec) {
+        ergebnis = bufsize;
+        for (uint32_t x = 0; x < bufsize / sec; x++) {
+            if (g_sdGesperrt || !SD_MMC.writeRAW(buffer + sec * x, lba + x)) { ergebnis = -1; break; }
+        }
     }
-    g_lastWrite = millis();
+    if (ergebnis > 0) {
+        g_lastWrite = millis();
+        g_dirty = true;
+        g_bytesGeschrieben += bufsize;   // Messung: kommen ueberhaupt Scandaten an?
+        int i = g_spurIdx;
+        g_spurLba[i] = lba; g_spurN[i] = bufsize / (sec ? sec : 512); g_spurT[i] = millis();
+        g_spurIdx = (i + 1) % SPUR_ANZAHL;
+    }
+    if (ergebnis < 0) { g_usbFehlerSchreiben++; g_usbFehlerLba = lba; g_usbFehlerZeit = millis(); }
     g_lastHost = millis();
-    g_dirty = true;
-    g_bytesGeschrieben += bufsize;   // Messung: kommen ueberhaupt Scandaten an?
-    return bufsize;
+    g_usbZugriffe--;
+    return ergebnis;
 }
 
 static int32_t onRead(uint32_t lba, uint32_t offset, void *buffer, uint32_t bufsize)
 {
+    if (g_sdGesperrt) { g_usbFehlerLesen++; g_usbFehlerLba = lba; g_usbFehlerZeit = millis(); g_lastHost = millis(); return -1; }
+    g_usbZugriffe++;
+    int32_t ergebnis = -1;
     uint32_t sec = SD_MMC.sectorSize();
-    if (!sec) return 0;
-    for (uint32_t x = 0; x < bufsize / sec; x++) {
-        if (!SD_MMC.readRAW((uint8_t *)buffer + x * sec, lba + x)) return 0;
+    if (sec) {
+        ergebnis = bufsize;
+        for (uint32_t x = 0; x < bufsize / sec; x++) {
+            if (g_sdGesperrt || !SD_MMC.readRAW((uint8_t *)buffer + x * sec, lba + x)) { ergebnis = -1; break; }
+        }
     }
+    if (ergebnis < 0) { g_usbFehlerLesen++; g_usbFehlerLba = lba; g_usbFehlerZeit = millis(); }
     g_lastHost = millis();
-    return bufsize;
+    g_usbZugriffe--;
+    return ergebnis;
+}
+
+// Karte dem Host entziehen und warten, bis wirklich niemand mehr darauf zugreift.
+// Liefert false, wenn ein Zugriff nach 5 s immer noch laeuft - dann lieber
+// nicht anfassen und den Host behalten lassen.
+static bool karteUebernehmen()
+{
+    MSC.mediaPresent(false);
+    g_sdGesperrt = true;
+    uint32_t t0 = millis();
+    while (millis() - t0 < 5000) {
+        if (g_usbZugriffe == 0 && millis() - g_lastHost > 300) return true;
+        delay(10);
+    }
+    logZeile(String("[usb] Host laesst nicht los (") + (int)g_usbZugriffe + " Zugriffe offen)");
+    g_sdGesperrt = false;
+    MSC.mediaPresent(true);
+    return false;
+}
+
+static void karteZurueckgeben()
+{
+    g_sdGesperrt = false;
+    MSC.mediaPresent(true);
+}
+
+// Neustart, der auch am Drucker ueberlebt. Der 780 schaltet dem USB-Port kurz
+// den Strom ab, sobald sich ein Geraet abmeldet. Startet der Stick sofort neu,
+// trifft dieser Stromschnitt die gerade erst gebootete Firmware, bevor sie sich
+// beim Bootloader als gueltig gemeldet hat - und der faellt auf die vorige
+// zurueck (Rollback ist im Core eingeschaltet). Zweimal blieb so v27 stehen,
+// obwohl v28 sauber eingespielt war. Deshalb: erst am USB abmelden, den
+// Stromschnitt in der ALTEN Firmware abwarten, dann neu starten.
+static void sanftNeustarten()
+{
+    logFlushNetz();
+    MSC.mediaPresent(false);
+    tud_disconnect();
+    delay(2500);
+    ESP.restart();
 }
 
 // SCSI START STOP UNIT. Geraete senden das oft am Jobende ("auswerfen",
@@ -404,29 +520,58 @@ static bool onStartStop(uint8_t pc, bool start, bool eject)
 // Vorgang, den wir beobachten wollen. Der USB-CDC reisst beim WLAN-Start ab,
 // deshalb ist das Netz der einzige verlaessliche Kanal.
 static String g_logPuffer;
+static size_t g_logGesendet = 0;   // bis hierhin ist der Puffer schon beim Empfaenger
 
 static void logZeile(const String &msg)
 {
     Serial.println(msg);
     g_logPuffer += String(millis()) + " " + msg + "\n";
-    if (g_logPuffer.length() > 8000) g_logPuffer.remove(0, 4000);   // Deckel, RAM ist knapp
+    if (g_logPuffer.length() > 8000) {                             // Deckel, RAM ist knapp
+        g_logPuffer.remove(0, 4000);
+        g_logGesendet = g_logGesendet > 4000 ? g_logGesendet - 4000 : 0;
+    }
 }
 
-// Puffer wegschicken. Beruehrt die SD-Karte nicht.
+// Geraeteauthentifizierung: HMAC-SHA256 ueber Name, Kennung und Laenge mit dem
+// Geraeteschluessel, als Kopfzeile X-Scan-Auth. Der Empfaenger weist alles ohne
+// gueltige Signatur ab. Einen Zeitstempel braucht es nicht: eine Wiederholung
+// desselben Uploads ist unschaedlich, der Empfaenger dedupliziert per Kennung.
+// Kein TLS - im LAN reicht das, und ein TLS-Kontext kostet auf dem Stick rund
+// 40 kB Arbeitsspeicher und jeden Upload spuerbar Zeit.
+static String uploadSignatur(const String &name, const String &id, uint32_t laenge)
+{
+    if (cfgSchluessel.isEmpty()) return "";
+    String nachricht = name + "\n" + id + "\n" + String(laenge);
+    uint8_t mac[32];
+    if (mbedtls_md_hmac(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
+                        (const uint8_t *)cfgSchluessel.c_str(), cfgSchluessel.length(),
+                        (const uint8_t *)nachricht.c_str(), nachricht.length(), mac) != 0) return "";
+    String hex;
+    for (int i = 0; i < 32; i++) { char t[3]; snprintf(t, sizeof t, "%02x", mac[i]); hex += t; }
+    return hex;
+}
+
+// Nur das Neue seit dem letzten Mal wegschicken. Beruehrt die SD-Karte nicht.
+// Vorher ging jedes Mal der ganze Puffer raus - pro Scan eine Protokolldatei
+// mit der gesamten Vorgeschichte. Der Puffer selbst bleibt stehen, die
+// Weboberflaeche soll den ganzen Verlauf zeigen.
 static void logFlushNetz()
 {
-    if (g_logPuffer.isEmpty() || cfgEndpoint.isEmpty()) return;
+    if (g_logGesendet >= g_logPuffer.length() || cfgEndpoint.isEmpty()) return;
     if (WiFi.status() != WL_CONNECTED) return;
+    String teil = g_logPuffer.substring(g_logGesendet);
     HTTPClient http;
+    String dateiname = "scanlog-" + String(millis()) + ".txt";
     String url = cfgEndpoint;
     url += (url.indexOf('?') < 0) ? "?name=" : "&name=";
-    url += "scanlog-" + String(millis()) + ".txt";
+    url += dateiname;
     if (!http.begin(url)) return;
     http.addHeader("Content-Type", "text/plain");
-    int code = http.POST(g_logPuffer);
+    String sig = uploadSignatur(dateiname, "", teil.length());
+    if (sig.length()) http.addHeader("X-Scan-Auth", sig);
+    int code = http.POST(teil);
     http.end();
-    // Puffer bleibt stehen: die Weboberflaeche soll den ganzen Verlauf zeigen
-    (void)code;
+    if (code >= 200 && code < 300) g_logGesendet = g_logPuffer.length();
 }
 
 // ---- MBR-Partitionstyp auf FAT32-LBA (0x0C) setzen ----
@@ -457,6 +602,28 @@ static void fixMbrTyp()
 // daran erkennen wir, dass eine Datei fertig ist.
 
 #define ROH_MIN_GROESSE 2048   // darunter: Hilfsdateien wie wifi.cfg, kein Scan
+#define MAX_FUND 24            // so viele Dateien je Durchlauf
+
+// Was gilt als Scan? EIN Massstab fuer den Rohleser (sieht nur den 8.3-Kurznamen)
+// und den Sammler (sieht den langen Namen). Vorher zaehlte der Rohleser jede
+// Datei ab 2 kB, der Sammler uebersprang aber alles mit fuehrendem Punkt. Eine
+// "._wifi.cfg" vom Mac (4 kB, Kurzname "_WIFI~1.CFG") war roh sichtbar, im
+// Sammellauf aber nicht - der Stick meldete das Medium daraufhin fuenfmal in
+// Folge ab und wieder an, nach jedem Start und nach jedem Schreibzugriff.
+static bool istScanEndung(const uint8_t *e)   // 3 Zeichen aus dem Kurznamen, gross
+{
+    return !memcmp(e, "PDF", 3) || !memcmp(e, "JPG", 3) || !memcmp(e, "JPE", 3) ||
+           !memcmp(e, "TIF", 3);
+}
+
+static bool istScanName(const String &basis)
+{
+    int p = basis.lastIndexOf('.');
+    if (p < 0) return false;
+    String e = basis.substring(p + 1);
+    e.toUpperCase();
+    return e == "PDF" || e == "JPG" || e == "JPEG" || e == "TIF" || e == "TIFF";
+}
 
 struct FatLage {
     bool     gueltig;
@@ -464,8 +631,14 @@ struct FatLage {
     uint32_t fatStart;
     uint32_t ersterDatenSektor;
     uint32_t rootCluster;
+    uint32_t partStart;        // fuer die Selbstpruefung und das Formatieren
+    uint32_t partSektoren;
+    uint32_t fatSektoren;
+    uint8_t  anzahlFats;
+    uint32_t gesamtCluster;    // Datencluster (Nummern 2 .. gesamt+1)
+    uint16_t fsInfoSektor;
 };
-static FatLage g_fat = { false, 0, 0, 0, 0 };
+static FatLage g_fat = { false, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 
 static uint32_t le32(const uint8_t *d)
 {
@@ -478,24 +651,36 @@ static void fatLageLesen()
     uint8_t *s = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
     if (!s) return;
 
-    uint32_t partStart = 0;
-    if (SD_MMC.readRAW(s, 0) && s[510] == 0x55 && s[511] == 0xAA)
-        partStart = le32(s + 446 + 8);          // Startsektor der ersten Partition
+    uint32_t partStart = 0, partSektoren = 0;
+    if (SD_MMC.readRAW(s, 0) && s[510] == 0x55 && s[511] == 0xAA) {
+        partStart    = le32(s + 446 + 8);       // Startsektor der ersten Partition
+        partSektoren = le32(s + 446 + 12);
+    }
     if (!SD_MMC.readRAW(s, partStart)) { free(s); return; }
 
     uint16_t bytesProSektor = (uint16_t)s[11] | ((uint16_t)s[12] << 8);
     uint8_t  spc            = s[13];
     uint16_t reserviert     = (uint16_t)s[14] | ((uint16_t)s[15] << 8);
     uint8_t  anzahlFats     = s[16];
+    uint32_t sektoren       = le32(s + 32);
     uint32_t fatGroesse     = le32(s + 36);
     uint32_t rootCluster    = le32(s + 44);
+    uint16_t fsInfo         = (uint16_t)s[48] | ((uint16_t)s[49] << 8);
+    bool     signatur       = s[510] == 0x55 && s[511] == 0xAA;
     free(s);
 
-    if (bytesProSektor != 512 || !spc || !fatGroesse || rootCluster < 2) return;
+    if (!signatur || bytesProSektor != 512 || !spc || !fatGroesse || rootCluster < 2 || !anzahlFats) return;
     g_fat.sektorenProCluster = spc;
     g_fat.fatStart           = partStart + reserviert;
     g_fat.ersterDatenSektor  = partStart + reserviert + (uint32_t)anzahlFats * fatGroesse;
     g_fat.rootCluster        = rootCluster;
+    g_fat.partStart          = partStart;
+    g_fat.partSektoren       = partSektoren ? partSektoren : sektoren;
+    g_fat.fatSektoren        = fatGroesse;
+    g_fat.anzahlFats         = anzahlFats;
+    g_fat.fsInfoSektor       = fsInfo;
+    uint32_t daten = sektoren > reserviert + anzahlFats * fatGroesse ? sektoren - reserviert - anzahlFats * fatGroesse : 0;
+    g_fat.gesamtCluster      = daten / spc;
     g_fat.gueltig            = true;
 }
 
@@ -536,6 +721,7 @@ static bool rohVerzeichnis(int &anzahl, uint32_t &summe)
                 uint8_t attr = d[11];
                 if (attr == 0x0F) continue;                   // Teil eines langen Namens
                 if (attr & 0x18) continue;                    // Ordner oder Datentraegername
+                if (!istScanEndung(d + 8)) continue;          // Endung im Kurznamen: Byte 8-10
                 uint32_t gr = le32(d + 28);
                 if (gr < ROH_MIN_GROESSE) continue;           // Hilfsdatei, kein Scan
                 anzahl++;
@@ -549,24 +735,845 @@ static bool rohVerzeichnis(int &anzahl, uint32_t &summe)
     return true;
 }
 
+// Erster Cluster eines Verzeichniseintrags (Bytes 20/21 hoch, 26/27 tief)
+static uint32_t eintragCluster(const uint8_t *d)
+{
+    return ((uint32_t)(d[20] | (d[21] << 8)) << 16) | (uint32_t)(d[26] | (d[27] << 8));
+}
+
+// Einen Eintrag in einem Verzeichnis roh als geloescht markieren (erstes Byte
+// 0xE5), OHNE die Blockzuordnung anzufassen. Lange Namen liegen in Stuecken zu
+// 13 Zeichen VOR dem Kurzeintrag, in umgekehrter Reihenfolge; auch die werden
+// markiert. Gesucht wird per Name (wenn angegeben) oder per Startcluster.
+// Nur bei abgemeldetem Medium und VOR dem naechsten Mount aufrufen, sonst
+// schreibt der Dateisystem-Treiber seinen gepufferten Sektor wieder darueber.
+static bool rohEintragLoeschenIn(uint32_t dirCluster, const String &name, uint32_t groesse, uint32_t startCluster)
+{
+    if (!g_fat.gueltig) fatLageLesen();
+    if (!g_fat.gueltig) return false;
+    uint8_t *sek    = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
+    uint8_t *fatBuf = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
+    if (!sek || !fatBuf) { if (sek) free(sek); if (fatBuf) free(fatBuf); return false; }
+
+    String ziel = name;
+    ziel.toLowerCase();
+    String lang;
+    uint32_t lfnSektor[20];
+    int      lfnOffset[20];
+    int      lfnAnzahl = 0;
+    bool getroffen = false, fertig = false;
+    static const uint8_t pos[13] = { 1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30 };
+
+    uint32_t cl = dirCluster ? dirCluster : g_fat.rootCluster;
+    for (int schutz = 0; !fertig && !getroffen && cl >= 2 && cl < 0x0FFFFFF8 && schutz < 128; schutz++) {
+        for (uint8_t i = 0; i < g_fat.sektorenProCluster && !fertig && !getroffen; i++) {
+            uint32_t sektor = clusterSektor(cl) + i;
+            if (!SD_MMC.readRAW(sek, sektor)) { fertig = true; break; }
+            for (int e = 0; e < 512 && !getroffen; e += 32) {
+                uint8_t *d = sek + e;
+                if (d[0] == 0x00) { fertig = true; break; }
+                if (d[0] == 0xE5) { lang = ""; lfnAnzahl = 0; continue; }
+                if (d[11] == 0x0F) {
+                    String stueck;
+                    for (int k = 0; k < 13; k++) {
+                        uint16_t ch = d[pos[k]] | ((uint16_t)d[pos[k] + 1] << 8);
+                        if (ch == 0 || ch == 0xFFFF) break;
+                        stueck += (ch < 128) ? (char)ch : '?';
+                    }
+                    lang = stueck + lang;
+                    if (lfnAnzahl < 20) { lfnSektor[lfnAnzahl] = sektor; lfnOffset[lfnAnzahl] = e; lfnAnzahl++; }
+                    continue;
+                }
+                String kandidat = lang;
+                if (kandidat.isEmpty()) {                       // nur Kurzname: "NAME    EXT"
+                    for (int k = 0; k < 8 && d[k] != ' '; k++) kandidat += (char)d[k];
+                    if (d[8] != ' ') { kandidat += '.'; for (int k = 8; k < 11 && d[k] != ' '; k++) kandidat += (char)d[k]; }
+                }
+                kandidat.toLowerCase();
+                bool trifft = ziel.length() ? (kandidat == ziel) : (eintragCluster(d) == startCluster);
+                if (!(d[11] & 0x18) && trifft && le32(d + 28) == groesse) {
+                    d[0] = 0xE5;
+                    for (int k = 0; k < lfnAnzahl; k++) if (lfnSektor[k] == sektor) sek[lfnOffset[k]] = 0xE5;
+                    getroffen = SD_MMC.writeRAW(sek, sektor);
+                    for (int k = 0; k < lfnAnzahl && getroffen; k++) {   // Stuecke in frueheren Sektoren
+                        if (lfnSektor[k] == sektor) continue;
+                        if (!SD_MMC.readRAW(sek, lfnSektor[k])) { getroffen = false; break; }
+                        for (int m = 0; m < lfnAnzahl; m++) if (lfnSektor[m] == lfnSektor[k]) sek[lfnOffset[m]] = 0xE5;
+                        if (!SD_MMC.writeRAW(sek, lfnSektor[k])) getroffen = false;
+                        sektor = lfnSektor[k];   // diese Gruppe ist erledigt
+                    }
+                    break;
+                }
+                lang = "";
+                lfnAnzahl = 0;
+            }
+        }
+        if (!fertig && !getroffen) cl = fatNaechster(cl, fatBuf);
+    }
+    free(sek);
+    free(fatBuf);
+    return getroffen;
+}
+
+// Cluster eines Unterordners der Wurzel, per 8.3-Name (11 Zeichen, gross,
+// mit Leerzeichen aufgefuellt). 0 = nicht vorhanden.
+static uint32_t rohOrdnerCluster(const char *name83)
+{
+    if (!g_fat.gueltig) fatLageLesen();
+    if (!g_fat.gueltig) return 0;
+    uint8_t *sek    = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
+    uint8_t *fatBuf = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
+    if (!sek || !fatBuf) { if (sek) free(sek); if (fatBuf) free(fatBuf); return 0; }
+    uint32_t ergebnis = 0;
+    bool fertig = false;
+    uint32_t cl = g_fat.rootCluster;
+    for (int schutz = 0; !fertig && !ergebnis && cl >= 2 && cl < 0x0FFFFFF8 && schutz < 128; schutz++) {
+        for (uint8_t i = 0; i < g_fat.sektorenProCluster && !fertig && !ergebnis; i++) {
+            if (!SD_MMC.readRAW(sek, clusterSektor(cl) + i)) { fertig = true; break; }
+            for (int e = 0; e < 512; e += 32) {
+                uint8_t *d = sek + e;
+                if (d[0] == 0x00) { fertig = true; break; }
+                if (d[0] == 0xE5 || d[11] == 0x0F || !(d[11] & 0x10)) continue;
+                if (!memcmp(d, name83, 11)) { ergebnis = eintragCluster(d); break; }
+            }
+        }
+        if (!fertig && !ergebnis) cl = fatNaechster(cl, fatBuf);
+    }
+    free(sek);
+    free(fatBuf);
+    return ergebnis;
+}
+
+// Startcluster und Groessen aller Dateien eines Verzeichnisses roh einsammeln.
+// Liefert die Anzahl. dirCluster 0 = Wurzel.
+static int rohEintraege(uint32_t dirCluster, uint32_t *starts, uint32_t *groessen, int max, bool nurScans)
+{
+    if (!g_fat.gueltig) fatLageLesen();
+    if (!g_fat.gueltig) return 0;
+    uint8_t *sek    = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
+    uint8_t *fatBuf = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
+    if (!sek || !fatBuf) { if (sek) free(sek); if (fatBuf) free(fatBuf); return 0; }
+    int n = 0;
+    bool fertig = false;
+    uint32_t cl = dirCluster ? dirCluster : g_fat.rootCluster;
+    for (int schutz = 0; !fertig && n < max && cl >= 2 && cl < 0x0FFFFFF8 && schutz < 128; schutz++) {
+        for (uint8_t i = 0; i < g_fat.sektorenProCluster && !fertig && n < max; i++) {
+            if (!SD_MMC.readRAW(sek, clusterSektor(cl) + i)) { fertig = true; break; }
+            for (int e = 0; e < 512 && n < max; e += 32) {
+                uint8_t *d = sek + e;
+                if (d[0] == 0x00) { fertig = true; break; }
+                if (d[0] == 0xE5 || d[11] == 0x0F || (d[11] & 0x18)) continue;
+                if (nurScans && (!istScanEndung(d + 8) || le32(d + 28) < ROH_MIN_GROESSE)) continue;
+                starts[n] = eintragCluster(d);
+                groessen[n] = le32(d + 28);
+                n++;
+            }
+        }
+        if (!fertig && n < max) cl = fatNaechster(cl, fatBuf);
+    }
+    free(sek);
+    free(fatBuf);
+    return n;
+}
+
+// Geisterjagd in der Wurzel - roh, bei abgemeldetem Medium, VOR dem Mount.
+// Der 780 schreibt nach dem Wiederanmelden seine alte Verzeichnissicht zurueck:
+// der vorige Scan liegt dann erneut als [Untitled].pdf in der Wurzel und zeigt
+// auf Bloecke, die entweder schon einer Datei in /senden oder /gesendet
+// gehoeren oder laengst frei sind. Solche Eintraege werden nur ausgetragen,
+// die Blockzuordnung bleibt unangetastet. Liefert die Zahl der Geister.
+static int geisterJagen()
+{
+    uint32_t fremd[64];
+    uint32_t fremdGr[64];
+    int nFremd = 0;
+    uint32_t cs = rohOrdnerCluster("SENDEN     ");
+    if (cs) nFremd += rohEintraege(cs, fremd + nFremd, fremdGr + nFremd, 64 - nFremd, false);
+    uint32_t cg = rohOrdnerCluster("GESENDET   ");
+    if (cg) nFremd += rohEintraege(cg, fremd + nFremd, fremdGr + nFremd, 64 - nFremd, false);
+
+    uint32_t wurzel[MAX_FUND], wurzelGr[MAX_FUND];
+    int nWurzel = rohEintraege(0, wurzel, wurzelGr, MAX_FUND, true);
+    if (!nWurzel) return 0;
+
+    uint8_t *fatBuf = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
+    if (!fatBuf) return 0;
+    uint32_t clusterBytes = (uint32_t)g_fat.sektorenProCluster * 512;
+    int geister = 0;
+    for (int i = 0; i < nWurzel; i++) {
+        uint32_t st = wurzel[i];
+        const char *grund = nullptr;
+        if (st < 2 || fatNaechster(st, fatBuf) == 0) grund = "zeigt auf freie Bloecke";
+        for (int k = 0; !grund && k < nFremd; k++)
+            if (fremd[k] == st) grund = "zeigt auf Bloecke einer schon weggeraeumten Datei";
+        for (int k = 0; !grund && k < nWurzel; k++) {
+            if (k == i || wurzel[k] != st) continue;
+            // Zwei Wurzeleintraege auf denselben Bloecken: der Geist ist der,
+            // dessen Groesse nicht zur Kettenlaenge passt.
+            uint32_t n = 0, c = st;
+            while (c >= 2 && c < 0x0FFFFFF8 && n < 300000) { n++; c = fatNaechster(c, fatBuf); }
+            uint32_t passt = (wurzelGr[i] + clusterBytes - 1) / clusterBytes;
+            if (passt != n) grund = "teilt Bloecke mit einem anderen Eintrag und passt nicht zur Kette";
+        }
+        if (!grund) continue;
+        bool ok = rohEintragLoeschenIn(0, "", wurzelGr[i], st);
+        logZeile(String("[geist] Wurzeleintrag mit ") + (wurzelGr[i] / 1024) + " kB " + grund +
+                 (ok ? " - ausgetragen" : " - austragen fehlgeschlagen"));
+        if (ok) geister++;
+    }
+    free(fatBuf);
+    return geister;
+}
+
+// ---- Rohes Lesen ganzer Dateien und die Merkliste (siehe Ablauf ab v26 unten) ----
+
+// Verzeichnis roh listen, mit langen Namen. dirCluster 0 = Wurzel.
+static int rohListe(uint32_t dirCluster, RohEintrag *liste, int max, bool nurScans)
+{
+    if (!g_fat.gueltig) fatLageLesen();
+    if (!g_fat.gueltig) return 0;
+    uint8_t *sek    = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
+    uint8_t *fatBuf = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
+    if (!sek || !fatBuf) { if (sek) free(sek); if (fatBuf) free(fatBuf); return 0; }
+    static const uint8_t pos[13] = { 1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30 };
+    String lang;
+    int n = 0;
+    bool fertig = false;
+    uint32_t cl = dirCluster ? dirCluster : g_fat.rootCluster;
+    for (int schutz = 0; !fertig && cl >= 2 && cl < 0x0FFFFFF8 && schutz < 128; schutz++) {
+        for (uint8_t i = 0; i < g_fat.sektorenProCluster && !fertig; i++) {
+            if (!SD_MMC.readRAW(sek, clusterSektor(cl) + i)) { fertig = true; break; }
+            for (int e = 0; e < 512; e += 32) {
+                uint8_t *d = sek + e;
+                if (d[0] == 0x00) { fertig = true; break; }
+                if (d[0] == 0xE5) { lang = ""; continue; }
+                if (d[11] == 0x0F) {
+                    String stueck;
+                    for (int k = 0; k < 13; k++) {
+                        uint16_t ch = d[pos[k]] | ((uint16_t)d[pos[k] + 1] << 8);
+                        if (ch == 0 || ch == 0xFFFF) break;
+                        stueck += (ch < 128) ? (char)ch : '?';
+                    }
+                    lang = stueck + lang;
+                    continue;
+                }
+                if (d[11] & 0x18) { lang = ""; continue; }
+                bool scan = istScanEndung(d + 8) && le32(d + 28) >= ROH_MIN_GROESSE;
+                if (nurScans && !scan) { lang = ""; continue; }
+                String name = lang;
+                if (name.isEmpty()) {
+                    for (int k = 0; k < 8 && d[k] != ' '; k++) name += (char)d[k];
+                    if (d[8] != ' ') { name += '.'; for (int k = 8; k < 11 && d[k] != ' '; k++) name += (char)d[k]; }
+                }
+                lang = "";
+                if (n < max) {
+                    liste[n].start = eintragCluster(d);
+                    liste[n].groesse = le32(d + 28);
+                    strncpy(liste[n].name, name.c_str(), 63);
+                    liste[n].name[63] = 0;
+                    n++;
+                }
+            }
+        }
+        if (!fertig) cl = fatNaechster(cl, fatBuf);
+    }
+    free(sek);
+    free(fatBuf);
+    return n;
+}
+
+// Absoluter Sektor Nummer sektorIndex einer Datei ab Startcluster, 0 = Fehler
+static uint32_t rohSektor(uint32_t start, uint32_t sektorIndex, uint8_t *fatBuf)
+{
+    uint32_t cl = start;
+    for (uint32_t i = 0; i < sektorIndex / g_fat.sektorenProCluster; i++) {
+        cl = fatNaechster(cl, fatBuf);
+        if (cl < 2 || cl >= 0x0FFFFFF8) return 0;
+    }
+    if (cl < 2 || cl >= 0x0FFFFFF8) return 0;
+    return clusterSektor(cl) + sektorIndex % g_fat.sektorenProCluster;
+}
+
+// Fertig geschrieben? Bei PDF steht %%EOF in den letzten 1024 Bytes - roh gelesen.
+static bool rohVollstaendig(const RohEintrag &e)
+{
+    String n = e.name;
+    n.toLowerCase();
+    if (!n.endsWith(".pdf")) return true;
+    if (e.groesse < 32) return false;
+    uint8_t *sek    = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
+    uint8_t *fatBuf = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
+    if (!sek || !fatBuf) { if (sek) free(sek); if (fatBuf) free(fatBuf); return false; }
+    char puffer[1025];
+    int len = 0;
+    uint32_t letzter = (e.groesse - 1) / 512;
+    for (uint32_t idx = letzter >= 1 ? letzter - 1 : 0; idx <= letzter; idx++) {
+        uint32_t sk = rohSektor(e.start, idx, fatBuf);
+        if (!sk || !SD_MMC.readRAW(sek, sk)) { len = 0; break; }
+        uint32_t im = (idx == letzter) ? ((e.groesse - 1) % 512 + 1) : 512;
+        memcpy(puffer + len, sek, im);
+        len += im;
+    }
+    free(sek);
+    free(fatBuf);
+    for (int i = 0; i + 4 < len; i++) if (!memcmp(puffer + i, "%%EOF", 5)) return true;
+    return false;
+}
+
+// Kennzahl aus Groesse, ersten 256 und letzten bis zu 256 Bytes - roh gelesen
+static uint32_t rohKennzahl(const RohEintrag &e)
+{
+    uint8_t *sek    = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
+    uint8_t *fatBuf = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
+    if (!sek || !fatBuf) { if (sek) free(sek); if (fatBuf) free(fatBuf); return 0; }
+    uint32_t summe = e.groesse;
+    uint32_t sk = rohSektor(e.start, 0, fatBuf);
+    if (sk && SD_MMC.readRAW(sek, sk)) {
+        uint32_t n = e.groesse < 256 ? e.groesse : 256;
+        for (uint32_t i = 0; i < n; i++) summe = summe * 31u + sek[i];
+    }
+    if (e.groesse > 512) {
+        sk = rohSektor(e.start, (e.groesse - 1) / 512, fatBuf);
+        if (sk && SD_MMC.readRAW(sek, sk)) {
+            uint32_t im = (e.groesse - 1) % 512 + 1;
+            for (uint32_t i = im > 256 ? im - 256 : 0; i < im; i++) summe = summe * 31u + sek[i];
+        }
+    }
+    if (e.groesse > 2048) {                         // und ein Stueck aus der Mitte (Bilddaten)
+        sk = rohSektor(e.start, e.groesse / 1024, fatBuf);
+        if (sk && SD_MMC.readRAW(sek, sk))
+            for (uint32_t i = 0; i < 256; i++) summe = summe * 31u + sek[i];
+    }
+    free(sek);
+    free(fatBuf);
+    return summe;
+}
+
+// Liest eine Datei roh entlang der Belegungskette, sektorweise
+struct RohLeser {
+    uint32_t groesse = 0, pos = 0, cluster = 0;
+    uint8_t  idx = 0;
+    uint8_t *sek = nullptr, *fatBuf = nullptr;
+    bool beginnen(uint32_t start, uint32_t g)
+    {
+        groesse = g; pos = 0; cluster = start; idx = 0;
+        sek    = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
+        fatBuf = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
+        return sek && fatBuf;
+    }
+    int lesen(uint8_t *ziel, size_t n)
+    {
+        size_t gelesen = 0;
+        while (gelesen + 512 <= n && pos < groesse) {
+            if (cluster < 2 || cluster >= 0x0FFFFFF8) return gelesen ? (int)gelesen : -1;
+            if (!SD_MMC.readRAW(sek, clusterSektor(cluster) + idx)) return -1;
+            size_t k = groesse - pos < 512 ? groesse - pos : 512;
+            memcpy(ziel + gelesen, sek, k);
+            gelesen += k;
+            pos += k;
+            if (++idx >= g_fat.sektorenProCluster) { idx = 0; cluster = fatNaechster(cluster, fatBuf); }
+        }
+        return (int)gelesen;
+    }
+    void ende() { if (sek) free(sek); if (fatBuf) free(fatBuf); sek = fatBuf = nullptr; }
+};
+
+// ---- Merkliste: gesendet, liegt noch auf der Karte ----
+#define MAX_FERTIG    64
+#define MAX_GELOESCHT 16
+static Fertig g_fertig[MAX_FERTIG];
+static int    g_fertigAnzahl = 0;
+static Fertig g_geloescht[MAX_GELOESCHT];   // Signaturen weggeraeumter Dateien: so erkennt man ihre Geister
+static int    g_geloeschtAnzahl = 0;
+
+static void fertigSpeichern()
+{
+    g_nvs.begin("scanstick", false);
+    if (g_fertigAnzahl) g_nvs.putBytes("fertig", g_fertig, g_fertigAnzahl * sizeof(Fertig));
+    else g_nvs.remove("fertig");
+    if (g_geloeschtAnzahl) g_nvs.putBytes("geloescht", g_geloescht, g_geloeschtAnzahl * sizeof(Fertig));
+    else g_nvs.remove("geloescht");
+    g_nvs.end();
+}
+
+static void fertigLaden()
+{
+    g_nvs.begin("scanstick", true);
+    size_t n = g_nvs.getBytesLength("fertig");
+    if (n && n <= sizeof g_fertig && n % sizeof(Fertig) == 0) { g_nvs.getBytes("fertig", g_fertig, n); g_fertigAnzahl = n / sizeof(Fertig); }
+    n = g_nvs.getBytesLength("geloescht");
+    if (n && n <= sizeof g_geloescht && n % sizeof(Fertig) == 0) { g_nvs.getBytes("geloescht", g_geloescht, n); g_geloeschtAnzahl = n / sizeof(Fertig); }
+    g_nvs.end();
+    if (g_fertigAnzahl) logZeile(String("[merk] ") + g_fertigAnzahl + " gesendete Datei(en) liegen laut Flash noch auf der Karte");
+}
+
+static int fertigIndex(uint32_t start, uint32_t groesse)
+{
+    for (int i = 0; i < g_fertigAnzahl; i++) if (g_fertig[i].start == start && g_fertig[i].groesse == groesse) return i;
+    return -1;
+}
+
+static bool istGeloescht(uint32_t start, uint32_t groesse)
+{
+    for (int i = 0; i < g_geloeschtAnzahl; i++) if (g_geloescht[i].start == start && g_geloescht[i].groesse == groesse) return true;
+    return false;
+}
+
+// Startblock und Groesse allein reichen NICHT: nach dem Aufraeumen ist die Karte
+// leer, der naechste Scan landet auf demselben Startblock, und zweimal dasselbe
+// Blatt hat dieselbe Groesse. Am 20.09.2026 galt so eine neue Datei als Geist
+// und wurde nie gesendet. Erst die Kennzahl aus dem Inhalt unterscheidet die
+// Wiederkehr einer alten Datei von einer neuen an derselben Stelle.
+static int fertigIndexE(const RohEintrag &e)
+{
+    int i = fertigIndex(e.start, e.groesse);
+    if (i >= 0 && g_fertig[i].kennzahl && rohKennzahl(e) != g_fertig[i].kennzahl) return -1;
+    return i;
+}
+
+static bool istGeloeschtE(const RohEintrag &e)
+{
+    for (int i = 0; i < g_geloeschtAnzahl; i++)
+        if (g_geloescht[i].start == e.start && g_geloescht[i].groesse == e.groesse)
+            return !g_geloescht[i].kennzahl || rohKennzahl(e) == g_geloescht[i].kennzahl;
+    return false;
+}
+
+static void fertigMerken(const RohEintrag &e, uint32_t kennzahl, const String &sendeName)
+{
+    if (fertigIndex(e.start, e.groesse) >= 0) return;
+    if (g_fertigAnzahl >= MAX_FERTIG) { memmove(g_fertig, g_fertig + 1, (MAX_FERTIG - 1) * sizeof(Fertig)); g_fertigAnzahl = MAX_FERTIG - 1; }
+    Fertig &f = g_fertig[g_fertigAnzahl++];
+    f.start = e.start; f.groesse = e.groesse; f.kennzahl = kennzahl;
+    strncpy(f.name, sendeName.c_str(), 39); f.name[39] = 0;
+    fertigSpeichern();
+}
+
+static void geloeschtMerken(const Fertig &f)
+{
+    if (g_geloeschtAnzahl >= MAX_GELOESCHT) { memmove(g_geloescht, g_geloescht + 1, (MAX_GELOESCHT - 1) * sizeof(Fertig)); g_geloeschtAnzahl = MAX_GELOESCHT - 1; }
+    g_geloescht[g_geloeschtAnzahl++] = f;
+}
+
+// Liegt in der Wurzel ein Scan, der weder gesendet noch als Geist bekannt ist?
+// Liegt in der Wurzel etwas, das noch zu senden ist? Geister zaehlen nicht:
+// Eintraege auf freie Bloecke oder auf die Bloecke eines anderen Eintrags sind
+// Sache des Aufraeumfensters - sonst drehte sich der Waechter an ihnen im Kreis.
+static bool rohOffen()
+{
+    RohEintrag liste[MAX_FUND];
+    int n = rohListe(0, liste, MAX_FUND, true);
+    uint8_t *fatBuf = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
+    bool offen = false;
+    for (int i = 0; i < n && !offen; i++) {
+        RohEintrag &e = liste[i];
+        if (fertigIndexE(e) >= 0 || istGeloeschtE(e)) continue;
+        if (e.start < 2 || (fatBuf && fatNaechster(e.start, fatBuf) == 0)) continue;
+        bool geteilt = false;
+        for (int k = 0; k < n; k++) if (k != i && liste[k].start == e.start) geteilt = true;
+        if (!geteilt) offen = true;
+    }
+    if (fatBuf) free(fatBuf);
+    return offen;
+}
+
+// Was in der Wurzel noch NICHT gesendet ist - fuer die Anzeige.
+static void rohOffenSumme(int &anzahl, uint32_t &summe)
+{
+    anzahl = 0; summe = 0;
+    RohEintrag liste[MAX_FUND];
+    int n = rohListe(0, liste, MAX_FUND, true);
+    for (int i = 0; i < n; i++)
+        if (fertigIndexE(liste[i]) < 0 && !istGeloeschtE(liste[i])) {
+            anzahl++;
+            summe += liste[i].groesse;
+        }
+}
+
+
+// ---- Selbstpruefung der Karte: ein kleines fsck auf den rohen Sektoren ----
+// Der 780 schreibt seine alte Verzeichnissicht zurueck und bricht Jobs ab. Was
+// dabei liegen bleibt - doppelt belegte Bloecke, verwaiste Ketten, zu kurze
+// Ketten, die Schmutzmarke - liess ihn am 20.09.2026 die Karte ganz ablehnen
+// ("USB-Stick anschliessen"). Laeuft nur, wenn der Drucker die Karte nicht
+// sieht: beim Start vor dem Anmelden und im Aufraeumfenster.
+static KartenBefund g_befund = {};
+static uint32_t     g_befundZeit = 0;
+static int          g_heillosFolge = 0;
+
+static inline bool bitDa(const uint8_t *bits, uint32_t c) { return bits[c >> 3] & (1 << (c & 7)); }
+static inline void bitSetzen(uint8_t *bits, uint32_t c)   { bits[c >> 3] |= (1 << (c & 7)); }
+static inline void bitLoeschen(uint8_t *bits, uint32_t c) { bits[c >> 3] &= ~(1 << (c & 7)); }
+
+// Einen Tabelleneintrag in beide Tabellen schreiben (obere 4 Bit bleiben)
+static bool fatSetzen(uint32_t c, uint32_t wert, uint8_t *fatBuf)
+{
+    uint32_t versatz = c * 4, sek = versatz / 512, off = versatz % 512;
+    if (!SD_MMC.readRAW(fatBuf, g_fat.fatStart + sek)) return false;
+    fatBuf[off] = wert & 0xFF; fatBuf[off + 1] = (wert >> 8) & 0xFF; fatBuf[off + 2] = (wert >> 16) & 0xFF;
+    fatBuf[off + 3] = (fatBuf[off + 3] & 0xF0) | ((wert >> 24) & 0x0F);
+    bool ok = SD_MMC.writeRAW(fatBuf, g_fat.fatStart + sek);
+    if (ok && g_fat.anzahlFats > 1) ok = SD_MMC.writeRAW(fatBuf, g_fat.fatStart + g_fat.fatSektoren + sek);
+    return ok;
+}
+
+// Kette ab 'start' in der Belegungskarte markieren. sollCluster > 0: so lang darf
+// die Datei hoechstens sein, dahinter wird die Kette abgeschnitten. Liefert die
+// Anzahl markierter Cluster. kreuz: ein Cluster gehoerte schon jemand anderem.
+// kaputt: die Kette lief ins Leere oder war zu lang (bei 'heilen' repariert).
+static uint32_t ketteMarkieren(uint32_t start, uint32_t sollCluster, uint8_t *bits, uint8_t *fatBuf,
+                               bool heilen, bool &kreuz, bool &kaputt)
+{
+    kreuz = false; kaputt = false;
+    uint32_t n = 0, c = start, vorher = 0;
+    while (c >= 2 && c < g_fat.gesamtCluster + 2) {
+        if (bitDa(bits, c)) { kreuz = true; return n; }
+        bitSetzen(bits, c);
+        n++;
+        vorher = c;
+        uint32_t next = fatNaechster(c, fatBuf);
+        if (sollCluster && n == sollCluster) {
+            if (next < 0x0FFFFFF8) { kaputt = true; if (heilen) fatSetzen(c, 0x0FFFFFFF, fatBuf); }
+            return n;
+        }
+        if (n > g_fat.gesamtCluster) { kaputt = true; break; }
+        c = next;
+    }
+    if (c >= 0x0FFFFFF8) return n;                 // sauberes Ende
+    kaputt = true;                                  // 0, reserviert oder ausserhalb
+    if (heilen && vorher) fatSetzen(vorher, 0x0FFFFFFF, fatBuf);
+    return n;
+}
+
+static void ketteEntmarkieren(uint32_t start, uint32_t n, uint8_t *bits, uint8_t *fatBuf)
+{
+    uint32_t c = start;
+    for (uint32_t i = 0; i < n && c >= 2 && c < g_fat.gesamtCluster + 2; i++) {
+        bitLoeschen(bits, c);
+        c = fatNaechster(c, fatBuf);
+    }
+}
+
+// Ein Verzeichnis ablaufen: jede Datei und jeden Unterordner markieren, Schaeden
+// zaehlen und bei 'heilen' beheben. Bei Doppelbelegung gewinnt der zuerst
+// gefundene Eintrag - die Wurzel, also die Datei des Druckers, kommt zuerst.
+static bool pruefeVerzeichnis(uint32_t dirCluster, int tiefe, uint8_t *bits, uint8_t *sek, uint8_t *fatBuf,
+                              bool heilen, KartenBefund &b)
+{
+    if (tiefe > 3) return true;
+    uint32_t clusterBytes = (uint32_t)g_fat.sektorenProCluster * 512;
+    uint32_t lfnSektor[20]; int lfnOffset[20]; int lfnN = 0;
+    uint32_t cl = dirCluster;
+    for (int schutz = 0; cl >= 2 && cl < 0x0FFFFFF8 && schutz < 1024; schutz++) {
+        for (uint8_t i = 0; i < g_fat.sektorenProCluster; i++) {
+            uint32_t sektor = clusterSektor(cl) + i;
+            if (!SD_MMC.readRAW(sek, sektor)) return false;
+            bool geaendert = false;
+            for (int e = 0; e < 512; e += 32) {
+                uint8_t *d = sek + e;
+                if (d[0] == 0x00) { if (geaendert) SD_MMC.writeRAW(sek, sektor); return true; }
+                if (d[0] == 0xE5) { lfnN = 0; continue; }
+                if (d[11] == 0x0F) { if (lfnN < 20) { lfnSektor[lfnN] = sektor; lfnOffset[lfnN] = e; lfnN++; } continue; }
+                if ((d[11] & 0x08) || d[0] == '.') { lfnN = 0; continue; }   // Datentraegername, . und ..
+                uint32_t start = eintragCluster(d), groesse = le32(d + 28);
+                bool istOrdner = d[11] & 0x10;
+                if (start < 2) { lfnN = 0; continue; }                        // leere Datei
+                bool kreuz, kaputt;
+                uint32_t soll = istOrdner ? 0 : (groesse + clusterBytes - 1) / clusterBytes;
+                uint32_t n = ketteMarkieren(start, soll, bits, fatBuf, heilen, kreuz, kaputt);
+                if (kreuz) {
+                    b.kreuz++;
+                    if (heilen) {
+                        ketteEntmarkieren(start, n, bits, fatBuf);   // was frei bleibt, raeumt der Waisenlauf
+                        d[0] = 0xE5;
+                        for (int k = 0; k < lfnN; k++) {
+                            if (lfnSektor[k] == sektor) { sek[lfnOffset[k]] = 0xE5; continue; }
+                            bool schon = false;
+                            for (int m = 0; m < k; m++) if (lfnSektor[m] == lfnSektor[k]) schon = true;
+                            if (schon || !SD_MMC.readRAW(fatBuf, lfnSektor[k])) continue;
+                            for (int m = 0; m < lfnN; m++) if (lfnSektor[m] == lfnSektor[k]) fatBuf[lfnOffset[m]] = 0xE5;
+                            SD_MMC.writeRAW(fatBuf, lfnSektor[k]);
+                        }
+                        geaendert = true;
+                        b.geaendert = true;
+                    }
+                } else {
+                    if (kaputt) { b.gekuerzt++; if (heilen) b.geaendert = true; }
+                    if (!istOrdner && n < soll) {                                // Kette kuerzer als die Groesse
+                        if (!kaputt) b.gekuerzt++;
+                        if (heilen) {
+                            uint32_t neu = n * clusterBytes;
+                            d[28] = neu & 0xFF; d[29] = (neu >> 8) & 0xFF; d[30] = (neu >> 16) & 0xFF; d[31] = (neu >> 24) & 0xFF;
+                            geaendert = true;
+                            b.geaendert = true;
+                        }
+                    }
+                    if (istOrdner) {
+                        if (geaendert) { SD_MMC.writeRAW(sek, sektor); geaendert = false; }
+                        if (!pruefeVerzeichnis(start, tiefe + 1, bits, sek, fatBuf, heilen, b)) return false;
+                        if (!SD_MMC.readRAW(sek, sektor)) return false;
+                    }
+                }
+                lfnN = 0;
+            }
+            if (geaendert) SD_MMC.writeRAW(sek, sektor);
+        }
+        cl = fatNaechster(cl, fatBuf);
+    }
+    return true;
+}
+
+static String befundText(const KartenBefund &b)
+{
+    if (b.zuGross) return "Partition zu gross fuer die Pruefung";
+    if (b.heillos) return "Dateisystem nicht lesbar";
+    String t;
+    if (b.fatAbweichungen) t += String(b.fatAbweichungen) + " Tabellensektor(en) abweichend, ";
+    if (b.kreuz)           t += String(b.kreuz) + " Kreuzverkettung(en), ";
+    if (b.verwaist)        t += String(b.verwaist) + " verwaiste Cluster, ";
+    if (b.gekuerzt)        t += String(b.gekuerzt) + " Kette(n) gekuerzt, ";
+    if (b.schmutzig)       t += "Schmutzmarke, ";
+    if (t.isEmpty()) return "in Ordnung";
+    t.remove(t.length() - 2);
+    return t + (b.geaendert ? " - behoben" : "");
+}
+
+// Die eigentliche Pruefung. Nur aufrufen, wenn der Host die Karte nicht sieht.
+static void kartePruefen(bool heilen, const char *anlass)
+{
+    uint32_t t0 = millis();
+    KartenBefund b = {};
+    g_fat.gueltig = false;
+    fatLageLesen();
+    if (!g_fat.gueltig || g_fat.gesamtCluster < 16) {
+        b.heillos = true;
+        g_heillosFolge++;
+        g_befund = b; g_befundZeit = millis();
+        logZeile(String("[karte] ") + anlass + ": Dateisystem nicht lesbar (" + g_heillosFolge + ". Mal in Folge)");
+        return;
+    }
+    uint32_t bytes = (g_fat.gesamtCluster + 2 + 7) / 8;
+    if (bytes > 65536) {
+        b.zuGross = true;
+        g_befund = b; g_befundZeit = millis();
+        logZeile(String("[karte] ") + anlass + ": " + g_fat.gesamtCluster + " Cluster - zu gross fuer die Pruefung, Partition kleiner machen");
+        return;
+    }
+    uint8_t *bits   = (uint8_t *)calloc(bytes, 1);
+    uint8_t *sek    = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
+    uint8_t *fatBuf = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
+    if (!bits || !sek || !fatBuf) {
+        if (bits) free(bits); if (sek) free(sek); if (fatBuf) free(fatBuf);
+        logZeile("[karte] kein Speicher fuer die Pruefung");
+        return;
+    }
+
+    // 1. Beide Tabellen vergleichen - die erste gilt
+    if (g_fat.anzahlFats > 1) {
+        for (uint32_t x = 0; x < g_fat.fatSektoren; x++) {
+            if (!SD_MMC.readRAW(sek, g_fat.fatStart + x) || !SD_MMC.readRAW(fatBuf, g_fat.fatStart + g_fat.fatSektoren + x)) break;
+            if (memcmp(sek, fatBuf, 512)) {
+                b.fatAbweichungen++;
+                if (heilen && SD_MMC.writeRAW(sek, g_fat.fatStart + g_fat.fatSektoren + x)) b.geaendert = true;
+            }
+        }
+    }
+
+    // 2. Wurzel und alles darunter ablaufen
+    bool kreuz, kaputt;
+    ketteMarkieren(g_fat.rootCluster, 0, bits, fatBuf, heilen, kreuz, kaputt);
+    if (kaputt) { b.gekuerzt++; if (heilen) b.geaendert = true; }
+    if (!pruefeVerzeichnis(g_fat.rootCluster, 0, bits, sek, fatBuf, heilen, b)) b.heillos = true;
+
+    // 3. Verwaiste Cluster: belegt, aber von niemandem erreicht
+    if (!b.heillos) {
+        for (uint32_t x = 0; x < g_fat.fatSektoren; x++) {
+            if (!SD_MMC.readRAW(sek, g_fat.fatStart + x)) break;
+            bool geaendert = false;
+            for (int j = 0; j < 128; j++) {
+                uint32_t c = x * 128 + j;
+                if (c < 2 || c >= g_fat.gesamtCluster + 2) continue;
+                if ((le32(sek + j * 4) & 0x0FFFFFFF) == 0 || bitDa(bits, c)) continue;
+                b.verwaist++;
+                if (heilen) { sek[j * 4] = 0; sek[j * 4 + 1] = 0; sek[j * 4 + 2] = 0; sek[j * 4 + 3] &= 0xF0; geaendert = true; }
+            }
+            if (geaendert) {
+                if (SD_MMC.writeRAW(sek, g_fat.fatStart + x)) b.geaendert = true;
+                if (g_fat.anzahlFats > 1) SD_MMC.writeRAW(sek, g_fat.fatStart + g_fat.fatSektoren + x);
+            }
+        }
+        // Freizaehler im FSInfo-Sektor stimmt dann nicht mehr: als "unbekannt" markieren
+        if (b.verwaist && heilen && g_fat.fsInfoSektor && SD_MMC.readRAW(sek, g_fat.partStart + g_fat.fsInfoSektor) &&
+            le32(sek) == 0x41615252) {
+            memset(sek + 488, 0xFF, 8);
+            SD_MMC.writeRAW(sek, g_fat.partStart + g_fat.fsInfoSektor);
+        }
+    }
+
+    // 4. Schmutzmarke: Bit 27 "sauber ausgehaengt", Bit 26 "keine Fehler" im zweiten Eintrag
+    if (!b.heillos && SD_MMC.readRAW(sek, g_fat.fatStart)) {
+        uint32_t v = le32(sek + 4);
+        if ((v & 0x0C000000) != 0x0C000000) {
+            b.schmutzig = true;
+            if (heilen) {
+                v |= 0x0C000000;
+                sek[4] = v & 0xFF; sek[5] = (v >> 8) & 0xFF; sek[6] = (v >> 16) & 0xFF; sek[7] = (v >> 24) & 0xFF;
+                if (SD_MMC.writeRAW(sek, g_fat.fatStart)) b.geaendert = true;
+                if (g_fat.anzahlFats > 1) SD_MMC.writeRAW(sek, g_fat.fatStart + g_fat.fatSektoren);
+            }
+        }
+    }
+
+    g_heillosFolge = b.heillos ? g_heillosFolge + 1 : 0;
+    g_befund = b; g_befundZeit = millis();
+    logZeile(String("[karte] ") + anlass + ", " + (millis() - t0) + " ms: " + befundText(b));
+    free(bits); free(sek); free(fatBuf);
+}
+
+// Letzte Stufe: die Partition frisch als FAT32 anlegen (32-kB-Cluster wie
+// mkfs.vfat -s 64). Nur, wenn nichts Ungesendetes mehr drauf ist - die
+// Einstellungen liegen im Flash, auf der Karte geht nichts verloren, was nicht
+// schon beim Empfaenger waere.
+static bool karteFormatieren(const char *anlass)
+{
+    uint8_t *s = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
+    if (!s) return false;
+    uint32_t partStart = 0, partSektoren = 0;
+    if (SD_MMC.readRAW(s, 0) && s[510] == 0x55 && s[511] == 0xAA) {
+        partStart = le32(s + 446 + 8); partSektoren = le32(s + 446 + 12);
+    }
+    uint32_t karte = SD_MMC.sectorSize() ? (uint32_t)(SD_MMC.cardSize() / SD_MMC.sectorSize()) : 0;
+    if (!partStart || !partSektoren || partStart + partSektoren > karte) { free(s); logZeile("[karte] Formatieren: keine brauchbare Partition"); return false; }
+    const uint8_t spc = 64; const uint16_t rsv = 32; const uint8_t nfat = 2;
+    uint32_t fatSek = 0;
+    for (int i = 0; i < 4; i++) {                     // Tabellengroesse einpendeln
+        uint32_t cl = (partSektoren - rsv - nfat * fatSek) / spc;
+        fatSek = ((cl + 2) * 4 + 511) / 512;
+    }
+    uint32_t cluster = (partSektoren - rsv - nfat * fatSek) / spc;
+    if (cluster < 65525) { free(s); logZeile("[karte] Formatieren: Partition zu klein fuer FAT32"); return false; }
+    logZeile(String("[karte] formatiere (") + anlass + "): " + (partSektoren / 2048) + " MB, " + cluster + " Cluster");
+    uint32_t t0 = millis();
+    bool ok = true;
+    // Tabellen leeren
+    memset(s, 0, 512);
+    for (uint32_t x = 0; x < nfat * fatSek && ok; x++) ok = SD_MMC.writeRAW(s, partStart + rsv + x);
+    // Wurzel leeren (ein Cluster)
+    for (uint32_t x = 0; x < spc && ok; x++) ok = SD_MMC.writeRAW(s, partStart + rsv + nfat * fatSek + x);
+    // Ersten Tabellensektor: Medienbyte, sauber-Marken, Wurzel-Ende
+    const uint8_t kopf[12] = { 0xF8, 0xFF, 0xFF, 0x0F, 0xFF, 0xFF, 0xFF, 0x0F, 0xFF, 0xFF, 0xFF, 0x0F };
+    memset(s, 0, 512); memcpy(s, kopf, 12);
+    for (int f = 0; f < nfat && ok; f++) ok = SD_MMC.writeRAW(s, partStart + rsv + f * fatSek);
+    // Bootsektor
+    memset(s, 0, 512);
+    const uint8_t bs[] = { 0xEB, 0x58, 0x90, 'M','S','W','I','N','4','.','1' };
+    memcpy(s, bs, sizeof(bs));
+    s[11] = 0x00; s[12] = 0x02; s[13] = spc; s[14] = rsv & 0xFF; s[15] = rsv >> 8; s[16] = nfat;
+    s[21] = 0xF8; s[24] = 32; s[26] = 64;
+    uint32_t v = partStart;    memcpy(s + 28, &v, 4);
+    v = partSektoren;          memcpy(s + 32, &v, 4);
+    v = fatSek;                memcpy(s + 36, &v, 4);
+    v = 2;                     memcpy(s + 44, &v, 4);
+    s[48] = 1; s[50] = 6; s[64] = 0x80; s[66] = 0x29;
+    v = esp_random();          memcpy(s + 67, &v, 4);
+    memcpy(s + 71, "SCANS      ", 11); memcpy(s + 82, "FAT32   ", 8);
+    s[510] = 0x55; s[511] = 0xAA;
+    if (ok) ok = SD_MMC.writeRAW(s, partStart) && SD_MMC.writeRAW(s, partStart + 6);
+    // FSInfo
+    memset(s, 0, 512);
+    v = 0x41615252; memcpy(s, &v, 4);
+    v = 0x61417272; memcpy(s + 484, &v, 4);
+    v = cluster - 1; memcpy(s + 488, &v, 4);
+    v = 3;           memcpy(s + 492, &v, 4);
+    s[510] = 0x55; s[511] = 0xAA;
+    if (ok) ok = SD_MMC.writeRAW(s, partStart + 1) && SD_MMC.writeRAW(s, partStart + 7);
+    free(s);
+    g_fat.gueltig = false;
+    g_fertigAnzahl = 0; g_geloeschtAnzahl = 0; fertigSpeichern();
+    logZeile(String("[karte] formatiert in ") + (millis() - t0) + " ms" + (ok ? "" : " - MIT FEHLERN"));
+    return ok;
+}
+
+#define AUFRAEUM_VORGABE 3           // Minuten ohne Zugriff des Druckers (der 780 fasst den Stick zwischen Jobs gar nicht an)
+static uint32_t g_aufraeumMin      = AUFRAEUM_VORGABE;
+static bool     g_aufraeumJetzt    = false;
+static uint32_t g_letztesAufraeumen = 0;
+
+
 // ---- Konfiguration von der SD lesen ----
-static void ladeConfig()
+// Die Datei gilt nur, wenn sie sich seit dem letzten Uebernehmen GEAENDERT hat.
+// Vorher gewann sie bei jedem Start - wer das Upload-Ziel in der Weboberflaeche
+// umstellte, bekam beim naechsten Neustart still den alten Wert aus der Datei
+// zurueck. Der Pruefstand ist genau daran gescheitert. Liefert true, wenn die
+// Werte uebernommen wurden.
+static bool ladeConfig()
 {
     File f = SD_MMC.open("/wifi.cfg");
-    if (!f) { Serial.println("[cfg] /wifi.cfg fehlt"); return; }
-    while (f.available()) {
-        String line = f.readStringUntil('\n');
+    if (!f) { logZeile("[cfg] /wifi.cfg fehlt"); return false; }
+    String inhalt = f.readString();
+    f.close();
+
+    uint32_t stand = 2166136261u;                    // FNV-1a ueber den Dateiinhalt
+    for (unsigned i = 0; i < inhalt.length(); i++) { stand ^= (uint8_t)inhalt[i]; stand *= 16777619u; }
+    g_nvs.begin("scanstick", true);
+    uint32_t bekannt = g_nvs.getUInt("cfgstand", 0);
+    g_nvs.end();
+    if (stand == bekannt) {
+        logZeile("[cfg] /wifi.cfg unveraendert - Einstellungen aus dem Flash gelten");
+        return false;
+    }
+
+    // Jede ssid=-Zeile beginnt ein neues Netz, pass= gehoert zur letzten ssid.
+    String neuSsid[MAX_NETZE], neuPass[MAX_NETZE];
+    int neu = 0;
+    int von = 0;
+    while (von < (int)inhalt.length()) {
+        int bis = inhalt.indexOf('\n', von);
+        if (bis < 0) bis = inhalt.length();
+        String line = inhalt.substring(von, bis);
+        von = bis + 1;
         line.trim();
         int eq = line.indexOf('=');
         if (eq < 1) continue;
         String k = line.substring(0, eq); k.trim();
         String v = line.substring(eq + 1); v.trim();
-        if (k == "ssid") cfgSsid = v;
-        else if (k == "pass") cfgPass = v;
+        if (k == "ssid") { if (neu < MAX_NETZE) { neuSsid[neu] = v; neuPass[neu] = ""; neu++; } }
+        else if (k == "pass") { if (neu) neuPass[neu - 1] = v; }
         else if (k == "endpoint") cfgEndpoint = v;
+        else if (k == "schluessel") cfgSchluessel = v;
     }
-    f.close();
-    logZeile(String("[cfg] ssid=") + cfgSsid + " endpoint=" + cfgEndpoint);
+    if (neu) {
+        cfgNetze = neu;
+        for (int i = 0; i < neu; i++) { cfgNetzSsid[i] = neuSsid[i]; cfgNetzPass[i] = neuPass[i]; }
+    }
+    g_nvs.begin("scanstick", false);
+    g_nvs.putUInt("cfgstand", stand);
+    g_nvs.end();
+    String liste;
+    for (int i = 0; i < cfgNetze; i++) liste += (i ? ", " : "") + cfgNetzSsid[i];
+    logZeile(String("[cfg] /wifi.cfg neu uebernommen: Netze=") + liste + " endpoint=" + cfgEndpoint);
+    return true;
+}
+
+// Warum sind wir gestartet? Ohne diese Zeile ist ein Neustart im Betrieb nicht
+// von einem Stromausfall zu unterscheiden - und Brownout, Absturz und Watchdog
+// verlangen voellig verschiedene Gegenmassnahmen.
+static const char *g_startGrund = "unbekannt";
+static const char *resetGrund()
+{
+    switch (esp_reset_reason()) {
+        case ESP_RST_POWERON:  return "Strom eingeschaltet";
+        case ESP_RST_SW:       return "Software-Neustart";
+        case ESP_RST_PANIC:    return "Absturz (Panic)";
+        case ESP_RST_INT_WDT:  return "Interrupt-Watchdog";
+        case ESP_RST_TASK_WDT: return "Task-Watchdog";
+        case ESP_RST_WDT:      return "Watchdog";
+        case ESP_RST_BROWNOUT: return "Brownout (Spannungseinbruch)";
+        case ESP_RST_DEEPSLEEP: return "Tiefschlaf";
+        case ESP_RST_EXT:      return "externer Reset";
+        case ESP_RST_USB:      return "USB-Reset";
+        default:               return "unbekannt";
+    }
 }
 
 // ---- Zugangsdaten zusaetzlich im NVS-Flash ----
@@ -576,17 +1583,35 @@ static void ladeConfig()
 static void cfgAusNvs()
 {
     g_nvs.begin("scanstick", true);
-    cfgSsid     = g_nvs.getString("ssid", "");
-    cfgPass     = g_nvs.getString("pass", "");
+    // Netze als Zeilen "ssid<TAB>pass". Aeltere Staende kennen nur ssid/pass.
+    String netze = g_nvs.getString("netze", "");
+    cfgNetze = 0;
+    if (netze.isEmpty()) {
+        String s = g_nvs.getString("ssid", "");
+        if (s.length()) { cfgNetzSsid[0] = s; cfgNetzPass[0] = g_nvs.getString("pass", ""); cfgNetze = 1; }
+    } else {
+        int von = 0;
+        while (von < (int)netze.length() && cfgNetze < MAX_NETZE) {
+            int bis = netze.indexOf('\n', von);
+            if (bis < 0) bis = netze.length();
+            String zeile = netze.substring(von, bis);
+            von = bis + 1;
+            int tab = zeile.indexOf('\t');
+            if (tab < 1) continue;
+            cfgNetzSsid[cfgNetze] = zeile.substring(0, tab);
+            cfgNetzPass[cfgNetze] = zeile.substring(tab + 1);
+            cfgNetze++;
+        }
+    }
     cfgEndpoint = g_nvs.getString("endpoint", "");
     cfgWebPass  = g_nvs.getString("webpass", "");
     cfgPraefix  = g_nvs.getString("praefix", "scan");
+    cfgSchluessel = g_nvs.getString("schluessel", "");
     g_idleMs    = g_nvs.getUInt("idle", IDLE_VORGABE);
+    g_aufraeumMin = g_nvs.getUInt("aufraeum", AUFRAEUM_VORGABE);
     g_loeschen  = g_nvs.getBool("loeschen", true);
     g_invertiert = g_nvs.getBool("invers", true);
     g_ledHell   = (uint8_t)g_nvs.getUChar("ledhell", 5);
-    g_letzteGroesse = g_nvs.getUInt("dubgr", 0);
-    g_letztePruef   = g_nvs.getUInt("dubpr", 0);
     for (int i = 0; i < Z_ANZAHL; i++) {
         char k[10];
         snprintf(k, sizeof k, "farbe%d", i);
@@ -595,18 +1620,21 @@ static void cfgAusNvs()
     g_farbeSendet = g_nvs.getUInt("fsendet", g_farbeSendet);
     g_farbeFertig = g_nvs.getUInt("ffertig", g_farbeFertig);
     g_nvs.end();
-    if (cfgSsid.length()) logZeile(String("[nvs] Zugangsdaten aus Flash: ssid=") + cfgSsid);
+    if (cfgNetze) logZeile(String("[nvs] ") + cfgNetze + " Netz(e) aus dem Flash, erstes: " + cfgNetzSsid[0]);
 }
 
 static void cfgNachNvs()
 {
     g_nvs.begin("scanstick", false);
-    g_nvs.putString("ssid", cfgSsid);
-    g_nvs.putString("pass", cfgPass);
+    String netze;
+    for (int i = 0; i < cfgNetze; i++) netze += cfgNetzSsid[i] + "\t" + cfgNetzPass[i] + "\n";
+    g_nvs.putString("netze", netze);
     g_nvs.putString("endpoint", cfgEndpoint);
     g_nvs.putString("webpass", cfgWebPass);
     g_nvs.putString("praefix", cfgPraefix);
+    g_nvs.putString("schluessel", cfgSchluessel);
     g_nvs.putUInt("idle", g_idleMs);
+    g_nvs.putUInt("aufraeum", g_aufraeumMin);
     g_nvs.putBool("loeschen", g_loeschen);
     g_nvs.putBool("invers", g_invertiert);
     g_nvs.putUChar("ledhell", g_ledHell);
@@ -625,57 +1653,44 @@ static void cfgNachNvs()
 static String  g_apKennung;      // Kennung des gewaehlten Zugangspunkts
 static int     g_apKanal  = 0;
 static long    g_apRssi   = 0;
-static int     g_apAnzahl = 0;   // wie viele tragen dieselbe SSID
+static uint32_t g_wlanVerloren = 0;   // seit wann ohne Netz (0 = verbunden)
+#define WLAN_NEUSUCHE 120000          // so lange ohne Netz, dann neu suchen
 
-// Mehrere Zugangspunkte koennen dieselbe SSID tragen (einzelne APs, kein Mesh).
-// WiFi.begin(ssid, pass) nimmt dann den erstbesten - nicht den staerksten.
-// Deshalb vorher suchen und gezielt zur besten Kennung verbinden.
+// Mehrere Zugangspunkte koennen dieselbe SSID tragen (einzelne APs, kein Mesh),
+// und der Stick kennt mehrere Netze. WiFiMulti sucht ueber alle bekannten Netze
+// hinweg, nimmt den staerksten Zugangspunkt und verbindet gezielt mit dessen
+// Kennung und Kanal. Blockiert bis zur Verbindung oder WIFI_TIMEOUT - deshalb
+// laeuft das erst, wenn der Drucker den Stick schon als Laufwerk sieht.
+//
+// Die feste Kennung hat eine Kehrseite: faellt genau dieser Zugangspunkt aus,
+// versucht der Auto-Reconnect nur ihn. Darum sucht loop() nach zwei Minuten
+// ohne Netz von vorn - dann darf es auch ein anderer Zugangspunkt sein.
 static void wlanStarten()
 {
-    if (cfgSsid.isEmpty()) { logZeile("[wifi] keine SSID bekannt"); return; }
+    if (!cfgNetze) { logZeile("[wifi] kein Netz bekannt"); return; }
     WiFi.mode(WIFI_STA);
     WiFi.setHostname("scanstick");
+    g_wifiMulti.APlistClean();
+    for (int i = 0; i < cfgNetze; i++) g_wifiMulti.addAP(cfgNetzSsid[i].c_str(), cfgNetzPass[i].c_str());
 
-    int gefunden = WiFi.scanNetworks(false, false);
-    int besterIndex = -1;
-    long bestesRssi = -1000;
-    g_apAnzahl = 0;
-    for (int i = 0; i < gefunden; i++) {
-        if (WiFi.SSID(i) != cfgSsid) continue;
-        g_apAnzahl++;
-        if (WiFi.RSSI(i) > bestesRssi) { bestesRssi = WiFi.RSSI(i); besterIndex = i; }
-    }
-
-    if (besterIndex >= 0) {
-        g_apKennung = WiFi.BSSIDstr(besterIndex);
-        g_apKanal   = WiFi.channel(besterIndex);
-        g_apRssi    = bestesRssi;
-        logZeile(String("[wifi] ") + g_apAnzahl + " Zugangspunkt(e) mit dieser SSID, nehme " +
-                 g_apKennung + " auf Kanal " + g_apKanal + " mit " + g_apRssi + " dBm");
-        WiFi.begin(cfgSsid.c_str(), cfgPass.c_str(), g_apKanal, WiFi.BSSID(besterIndex));
+    if (g_wifiMulti.run(WIFI_TIMEOUT) == WL_CONNECTED) {
+        g_apKennung = WiFi.BSSIDstr();
+        g_apKanal   = WiFi.channel();
+        g_apRssi    = WiFi.RSSI();
+        g_wlanVerloren = 0;
+        logZeile(String("[wifi] ") + WiFi.SSID() + " ueber " + g_apKennung + " auf Kanal " +
+                 g_apKanal + " mit " + g_apRssi + " dBm, IP " + WiFi.localIP().toString());
     } else {
-        logZeile(String("[wifi] ") + cfgSsid + " nicht gefunden, versuche es trotzdem");
         g_apKennung = "";
-        WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
+        logZeile("[wifi] kein bekanntes Netz erreichbar");
     }
-    WiFi.scanDelete();
 }
 
 static bool wifiVerbinden()
 {
     if (WiFi.status() == WL_CONNECTED) return true;
-    if (cfgSsid.isEmpty()) { Serial.println("[wifi] keine SSID"); return false; }
-    Serial.printf("[wifi] verbinde mit %s ...\n", cfgSsid.c_str());
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
-    uint32_t t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_TIMEOUT) delay(200);
-    if (WiFi.status() == WL_CONNECTED) {
-        logZeile(String("[wifi] verbunden, IP=") + WiFi.localIP().toString());
-        return true;
-    }
-    logZeile("[wifi] Zeitueberschreitung");
-    return false;
+    wlanStarten();
+    return WiFi.status() == WL_CONNECTED;
 }
 
 // http://host[:port]/pfad zerlegen
@@ -764,13 +1779,14 @@ static bool dateiVollstaendig(const String &pfad, uint32_t groesse)
     return false;
 }
 
-// Merkmale der zuletzt gesendeten Datei. Der Drucker stellt nach dem
+// Kennung der Datei fuer den Empfaenger. Der Drucker stellt nach dem
 // Verschieben gern seine alte Verzeichnissicht wieder her - dann zeigt
-// "[Untitled].pdf" erneut auf dieselben Daten und wir wuerden sie ein zweites
-// Mal hochladen. Genau das ist heute zweimal passiert.
-
-// Kurze Kennzahl aus Groesse plus erstem und letztem Block - reicht voellig,
-// um dieselbe Datei wiederzuerkennen, und kostet kaum Lesezeit.
+// "[Untitled].pdf" erneut auf dieselben Daten und wir laden sie ein zweites
+// Mal hoch. Der Empfaenger erkennt die Wiederholung an dieser Kennung.
+//
+// Kurze Kennzahl aus Groesse plus erstem und letztem Block - reicht, um
+// dieselbe Datei wiederzuerkennen, und kostet kaum Lesezeit. Zum LOESCHEN ohne
+// Upload taugt sie bewusst nicht (siehe sendeGefundene).
 static uint32_t dateiKennzahl(const String &pfad, uint32_t groesse)
 {
     File f = SD_MMC.open(pfad);
@@ -788,19 +1804,20 @@ static uint32_t dateiKennzahl(const String &pfad, uint32_t groesse)
     return summe;
 }
 
-static bool ladeHoch(fs::FS &fs, const String &pfad, const String &name, const String &id)
+#define UP_FEHLER   0
+#define UP_OK       1
+#define UP_DUPLIKAT 2   // angenommen, aber der Empfaenger kannte die Datei schon
+// Upload aus einer beliebigen Quelle: lese(puffer, n) liefert Bytes, 0 = Ende,
+// negativ = Fehler. Datei per Dateisystem oder roh entlang der Belegungskette.
+static int ladeHochQuelle(const String &name, const String &id, uint32_t len,
+                          std::function<int(uint8_t *, size_t)> lese)
 {
-    File f = fs.open(pfad);
-    if (!f) { logZeile("[up] " + pfad + " nicht oeffenbar"); return false; }
-    uint32_t len = f.size();
-    if (!len) { f.close(); logZeile("[up] " + name + " ist leer, uebersprungen"); return false; }
-
+    if (!len) { logZeile("[up] " + name + " ist leer, uebersprungen"); return UP_FEHLER; }
     String host, ziel;
     uint16_t port;
     if (!urlTeile(cfgEndpoint, host, port, ziel)) {
         logZeile("[up] Ziel-Adresse unbrauchbar: " + cfgEndpoint);
-        f.close();
-        return false;
+        return UP_FEHLER;
     }
     ziel += (ziel.indexOf('?') < 0) ? "?name=" : "&name=";
     ziel += name;
@@ -823,18 +1840,20 @@ static bool ladeHoch(fs::FS &fs, const String &pfad, const String &name, const S
             delay(1500);
         }
     }
-    if (!verbunden) { f.close(); return false; }
+    if (!verbunden) return UP_FEHLER;
+    String sig = uploadSignatur(name, id, len);
     c.print(String("POST ") + ziel + " HTTP/1.1\r\n" +
             "Host: " + host + ":" + port + "\r\n" +
             "Content-Type: application/octet-stream\r\n" +
             "Content-Length: " + len + "\r\n" +
+            (sig.length() ? "X-Scan-Auth: " + sig + "\r\n" : String("")) +
             "Connection: close\r\n\r\n");
 
     zeigeSendenStart(name, len);
     uint8_t puffer[1024];
     uint32_t geschickt = 0, t0 = millis();
     while (geschickt < len) {
-        int gelesen = f.read(puffer, sizeof puffer);
+        int gelesen = lese(puffer, sizeof puffer);
         if (gelesen <= 0) { logZeile("[up] Karte liefert keine Daten mehr"); break; }
         int raus = c.write(puffer, gelesen);
         if (raus != gelesen) { logZeile("[up] Verbindung brach beim Senden ab"); break; }
@@ -842,24 +1861,43 @@ static bool ladeHoch(fs::FS &fs, const String &pfad, const String &name, const S
         zeigeSendenFortschritt(geschickt, len);
         if (millis() - t0 > 180000) { logZeile("[up] Zeitueberschreitung beim Senden"); break; }
     }
-    f.close();
 
-    if (geschickt != len) { c.stop(); return false; }
+    if (geschickt != len) { c.stop(); return UP_FEHLER; }
 
     int code = 0;
+    bool duplikat = false;
     uint32_t tw = millis();
     while (c.connected() && !c.available() && millis() - tw < 15000) delay(10);
     if (c.available()) {
         String zeile = c.readStringUntil('\n');          // "HTTP/1.1 200 OK"
         int sp = zeile.indexOf(' ');
         if (sp > 0) code = zeile.substring(sp + 1, sp + 4).toInt();
+        // Rest der Antwort: sagt der Empfaenger "Duplikat", kannte er die Datei
+        // schon - dann ist unser Eintrag ein Geist (siehe sendeGefundene).
+        uint32_t tr = millis();
+        while ((c.connected() || c.available()) && millis() - tr < 3000) {
+            if (!c.available()) { delay(10); continue; }
+            String z = c.readStringUntil('\n');
+            if (z.indexOf("Duplikat") >= 0) duplikat = true;
+        }
     }
     c.stop();
     if (WiFi.status() == WL_CONNECTED) { g_rssiLetztLast = WiFi.RSSI(); rssiErfassen(g_rssiLetztLast); }
     logZeile(String("[up] ") + name + " " + (geschickt / 1024) + " kB HTTP " + code +
-             " in " + ((millis() - t0) / 1000) + " s");
-    if (code >= 200 && code < 300) { zeigeFertig(geschickt); delay(1200); return true; }
-    return false;
+             (duplikat ? " (Duplikat)" : "") + " in " + ((millis() - t0) / 1000) + " s");
+    if (code >= 200 && code < 300) { zeigeFertig(geschickt); delay(1200); return duplikat ? UP_DUPLIKAT : UP_OK; }
+    return UP_FEHLER;
+}
+
+// Upload per Dateisystem (fuer Reste in /senden aus v25)
+static int ladeHoch(fs::FS &fs, const String &pfad, const String &name, const String &id)
+{
+    File f = fs.open(pfad);
+    if (!f) { logZeile("[up] " + pfad + " nicht oeffenbar"); return UP_FEHLER; }
+    uint32_t len = f.size();
+    int erg = ladeHochQuelle(name, id, len, [&](uint8_t *b, size_t n) { return f.read(b, n); });
+    f.close();
+    return erg;
 }
 
 // ================= Weboberflaeche =================
@@ -877,6 +1915,8 @@ static String menschlich(uint64_t b)
     return String(t);
 }
 
+static String spurText(bool html);
+
 static String dauer(uint32_t ms)
 {
     char t[32];
@@ -885,6 +1925,24 @@ static String dauer(uint32_t ms)
     else if (sek < 5400) snprintf(t, sizeof t, "%u min %u s", sek / 60, sek % 60);
     else snprintf(t, sizeof t, "%u h %u min", sek / 3600, (sek % 3600) / 60);
     return String(t);
+}
+
+// Die letzten Schreibzugriffe des Hosts als Text: fuer die Statusseite (html)
+// und fuers Protokoll, wenn ein Zyklus nichts hochgeladen hat.
+static String spurText(bool html)
+{
+    String spur;
+    for (int k = 0; k < SPUR_ANZAHL; k++) {
+        int i = (g_spurIdx + k) % SPUR_ANZAHL;
+        if (!g_spurT[i]) continue;
+        uint32_t lba = g_spurLba[i];
+        const char *wo = !g_fat.gueltig ? "?" : lba < g_fat.fatStart ? "Boot"
+                       : lba < g_fat.ersterDatenSektor ? "FAT"
+                       : lba < clusterSektor(g_fat.rootCluster) + g_fat.sektorenProCluster ? "Wurzel" : "Daten";
+        if (html) spur += String("vor ") + dauer(millis() - g_spurT[i]) + ": " + lba + " +" + g_spurN[i] + " (" + wo + ")<br>";
+        else      spur += String(lba) + "+" + g_spurN[i] + wo[0] + " ";
+    }
+    return spur;
 }
 
 // Die Seite gibt gescannte Post zum Herunterladen frei. Ohne Passwort kann
@@ -968,13 +2026,24 @@ static void webStatus()
               : "<span class=\"bad\">nicht verbunden</span>");
     if (g_apKennung.length())
         h += zl("Zugangspunkt", g_apKennung + ", Kanal " + String(g_apKanal) +
-                ", bei der Wahl " + String(g_apRssi) + " dBm <small>(" + String(g_apAnzahl) +
-                " mit dieser SSID gefunden, staerkster genommen)</small>");
+                ", bei der Wahl " + String(g_apRssi) + " dBm <small>(staerkster ueber alle "
+                "bekannten Netze)</small>");
+    {
+        String liste;
+        for (int i = 0; i < cfgNetze; i++) liste += (i ? ", " : "") + cfgNetzSsid[i];
+        h += zl("Bekannte Netze", cfgNetze ? liste : "<span class=\"bad\">keine</span>");
+    }
     h += zl("Ziel fuer Uploads", cfgEndpoint.length() ? cfgEndpoint : "<span class=\"bad\">nicht gesetzt</span>");
     h += zl("Ruhefrist bis \"fertig\"", dauer(g_idleMs));
+    h += zl("Gesendet, liegt noch auf der Karte", String(g_fertigAnzahl) + " Datei(en)" +
+            (g_fertigAnzahl ? " <small>(werden in der naechsten Ruhephase geraeumt)</small>" : ""));
+    h += zl("Aufraeumen", String("nach ") + g_aufraeumMin + " min ohne Zugriff des Druckers" +
+            (g_letztesAufraeumen ? ", zuletzt vor " + dauer(millis() - g_letztesAufraeumen) : ", noch nie"));
     h += zl("Nach dem Senden", g_loeschen ? "loeschen" : "nach /gesendet verschieben");
     h += zl("Weboberflaeche", cfgWebPass.length() ? "<span class=\"ok\">passwortgeschuetzt</span>"
                                                   : "<span class=\"bad\">offen, jeder im WLAN kann die Scans lesen</span>");
+    h += zl("Upload-Signatur", cfgSchluessel.length() ? "<span class=\"ok\">Geraeteschluessel gesetzt</span>"
+                                                       : "<span class=\"warn\">keiner, der Empfaenger nimmt alles an</span>");
     h += zl("Uhrzeit", g_zeitOk ? "<span class=\"ok\">per NTP gestellt</span>"
                                  : "<span class=\"warn\">unbekannt, Namen mit Laufzeit</span>");
     h += zl("Namensschema", cfgPraefix + "-JJJJMMTT-HHMMSS.pdf");
@@ -984,10 +2053,29 @@ static void webStatus()
                 String(g_rssiMax) + " dBm <small>(" + String(g_rssiAnzahl) + " Messungen)</small>");
     if (g_rssiLetztLast)
         h += zl("Empfang am Ende des letzten Uploads", String(g_rssiLetztLast) + " dBm");
+    {
+        String spur = spurText(true);
+        h += zl("Letzte Schreibzugriffe des Hosts", spur.length() ? "<small>" + spur + "</small>" : "keine");
+        String fehler = String((uint32_t)g_usbFehlerLesen) + " lesen, " + String((uint32_t)g_usbFehlerSchreiben) + " schreiben";
+        if (g_usbFehlerZeit) fehler += " <small>(zuletzt vor " + dauer(millis() - g_usbFehlerZeit) + ", Sektor " + String((uint32_t)g_usbFehlerLba) + ")</small>";
+        h += zl("Abgewiesene Host-Zugriffe", (g_usbFehlerLesen || g_usbFehlerSchreiben) ? "<span class=warn>" + fehler + "</span>" : "keine");
+        if (g_befundZeit) {
+            String t = befundText(g_befund);
+            bool schlecht = g_befund.heillos || g_befund.zuGross || (t != "in Ordnung" && !g_befund.geaendert);
+            h += zl("Kartenpruefung", String(schlecht ? "<span class=bad>" : "") + t + (schlecht ? "</span>" : "") +
+                    " <small>(vor " + dauer(millis() - g_befundZeit) + ")</small>");
+        }
+    }
     h += zl("Laufzeit", dauer(millis()));
+    h += zl("Letzter Startgrund", g_startGrund);
     h += zl("Freier Speicher", menschlich(ESP.getFreeHeap()));
-    h += "</table><p><a class=\"btn\" href=\"/jetzt-schauen\">Jetzt nach Scans schauen</a>"
-         "<a class=\"btn\" href=\"/neustart\">Neu starten</a></p>";
+    h += "</table><p>"
+         "<form method=\"post\" action=\"/jetzt-schauen\" style=\"display:inline\">"
+         "<button class=\"btn\" type=\"submit\">Jetzt nach Scans schauen</button></form>"
+         "<form method=\"post\" action=\"/aufraeumen\" style=\"display:inline\">"
+         "<button class=\"btn\" type=\"submit\">Jetzt aufraeumen</button></form>"
+         "<form method=\"post\" action=\"/neustart\" style=\"display:inline\">"
+         "<button class=\"btn\" type=\"submit\">Neu starten</button></form></p>";
     g_web.send(200, "text/html; charset=utf-8", h + htmlFuss());
 }
 
@@ -1032,20 +2120,23 @@ static void webDateien()
         // bediente - trafen beide zusammen, griff der USB-Teil auf einen gerade
         // abgeraeumten Kartentreiber zu und der Stick startete neu. Ein blosser
         // Blick auf diese Seite durfte den Betrieb nie gefaehrden.
-        h += "<table><tr><th>Name</th><th>Groesse</th></tr>";
-        webDateienListe("/", h, 0);
+        // Wurzel roh gelesen - so sieht sie der Drucker gerade wirklich
+        RohEintrag liste[MAX_FUND];
+        int n = rohListe(0, liste, MAX_FUND, false);
+        h += "<table><tr><th>Wurzel (roh)</th><th>Groesse</th><th>Stand</th></tr>";
+        for (int i = 0; i < n; i++) {
+            String nm = liste[i].name;
+            String stand = fertigIndexE(liste[i]) >= 0 ? "<span class=\"ok\">gesendet</span>"
+                         : istGeloeschtE(liste[i]) ? "<span class=\"warn\">Geist</span>"
+                         : istScanName(nm) && liste[i].groesse >= ROH_MIN_GROESSE ? "<span class=\"warn\">offen</span>" : "";
+            h += "<tr><td><a href=\"/holen?p=" + urlKodiert("/" + nm) + "\">" + nm + "</a></td><td>" +
+                 menschlich(liste[i].groesse) + "</td><td>" + stand + "</td></tr>";
+        }
         h += "</table>";
-
-        // Fuer den frischen Stand brauchen wir kein Anhaengen: der Rohleser
-        // schaut direkt auf die Sektoren.
-        int anz = 0;
-        uint32_t summe = 0;
-        if (rohVerzeichnis(anz, summe) && anz > 0)
-            h += "<p class=\"warn\">Roh gelesen liegen gerade " + String(anz) +
-                 " Datei(en) mit zusammen " + menschlich(summe) + " in der Wurzel - "
-                 "frisch vom Drucker und oben moeglicherweise noch nicht sichtbar.</p>";
-        h += "<p><small>Die Liste zeigt den Stand, den der Stick selbst kennt. Ganz frische "
-             "Schreibvorgaenge des Druckers erscheinen erst nach dem naechsten Durchlauf.</small></p>";
+        h += "<table><tr><th>Ordner</th><th>Groesse</th></tr>";
+        webDateienListe("/gesendet", h, 1);
+        webDateienListe("/senden", h, 1);
+        h += "</table>";
     }
     g_web.send(200, "text/html; charset=utf-8", h + htmlFuss());
 }
@@ -1055,6 +2146,28 @@ static void webHolen()
     if (!webAuth()) return;
     String pfad = g_web.arg("p");
     if (!pfad.startsWith("/")) { g_web.send(400, "text/plain; charset=utf-8", "Pfad fehlt\n"); return; }
+    if (pfad.lastIndexOf('/') == 0) {
+        // Wurzel: roh lesen, der Mount vom Start kennt frische Dateien nicht
+        RohEintrag liste[MAX_FUND];
+        int n = rohListe(0, liste, MAX_FUND, false);
+        for (int i = 0; i < n; i++) {
+            if (pfad.substring(1) != liste[i].name) continue;
+            String nm = liste[i].name;
+            String typ = nm.endsWith(".pdf") ? "application/pdf" : "application/octet-stream";
+            RohLeser rl;
+            if (!rl.beginnen(liste[i].start, liste[i].groesse)) break;
+            g_web.sendHeader("Content-Disposition", "inline; filename=\"" + nm + "\"");
+            g_web.setContentLength(liste[i].groesse);
+            g_web.send(200, typ, "");
+            uint8_t puffer[1024];
+            WiFiClient cl = g_web.client();
+            for (int k; (k = rl.lesen(puffer, sizeof puffer)) > 0;) if (cl.write(puffer, k) != (size_t)k) break;
+            rl.ende();
+            return;
+        }
+        g_web.send(404, "text/plain; charset=utf-8", "nicht gefunden\n");
+        return;
+    }
     File f = SD_MMC.open(pfad);
     if (!f || f.isDirectory()) { g_web.send(404, "text/plain; charset=utf-8", "nicht gefunden\n"); return; }
     // Ohne Dateinamen hiess der Download im Browser "holen" und ohne passenden
@@ -1071,9 +2184,33 @@ static void webHolen()
     f.close();
 }
 
+// Formulare nur von der eigenen Seite annehmen. Ein Browser schickt bei einer
+// Absendung von einer fremden Seite immer die Kopfzeile Origin mit - stimmt sie
+// nicht mit unserem Host ueberein, war es nicht unsere Seite. So konnte eine
+// beliebige Webseite im selben Browser das Upload-Ziel umbiegen oder den Stick
+// mitten im Upload neu starten; ein gespeichertes Passwort schickt der Browser
+// automatisch mit. Werkzeuge wie curl schicken kein Origin und duerfen weiter,
+// sie haben ohnehin kein im Browser gespeichertes Passwort.
+static bool herkunftOk()
+{
+    String eigen = "http://" + g_web.hostHeader();
+    String origin = g_web.header("Origin");
+    if (origin.length()) return origin == eigen;
+    String referer = g_web.header("Referer");
+    if (referer.length()) return referer.startsWith(eigen + "/");
+    return true;
+}
+
+static bool herkunftPruefen()
+{
+    if (herkunftOk()) return true;
+    g_web.send(403, "text/plain; charset=utf-8", "Anfrage kam nicht von dieser Seite\n");
+    return false;
+}
+
 static void webJetztSchauen()
 {
-    if (!webAuth()) return;
+    if (!webAuth() || !herkunftPruefen()) return;
     // Einmal nachschauen. Frueher wurde hier g_dirty gesetzt - das loeste den
     // Wiederhol-Mechanismus fuer den Drucker-Commit aus, der hier nicht gemeint ist.
     g_einmalSchauen = true;
@@ -1128,12 +2265,12 @@ static void webRoh()
 
 static void webNeustart()
 {
-    if (!webAuth()) return;
+    if (!webAuth() || !herkunftPruefen()) return;
     g_web.send(200, "text/html; charset=utf-8",
                htmlKopf("Neustart") + "<p>Der Stick startet neu. Diese Seite ist in etwa "
-               "10 Sekunden wieder da.</p>" + htmlFuss());
+               "15 Sekunden wieder da.</p>" + htmlFuss());
     delay(300);
-    ESP.restart();
+    sanftNeustarten();
 }
 
 static void webEinstellungen()
@@ -1141,7 +2278,12 @@ static void webEinstellungen()
     if (!webAuth()) return;
 
     if (g_web.method() == HTTP_POST) {
+        if (!herkunftPruefen()) return;
         if (g_web.hasArg("endpoint")) cfgEndpoint = g_web.arg("endpoint");
+        if (g_web.hasArg("aufraeum")) {
+            uint32_t m = g_web.arg("aufraeum").toInt();
+            if (m >= 1 && m <= 1440) g_aufraeumMin = m;
+        }
         if (g_web.hasArg("idle")) {
             uint32_t sek = g_web.arg("idle").toInt();
             if (sek >= 5 && sek <= 600) g_idleMs = sek * 1000;
@@ -1164,6 +2306,8 @@ static void webEinstellungen()
         // sonst schaltet ein unbedachtes Speichern den Schutz ab.
         if (g_web.hasArg("webpass") && g_web.arg("webpass").length()) cfgWebPass = g_web.arg("webpass");
         if (g_web.hasArg("passweg") && g_web.arg("passweg") == "ja") cfgWebPass = "";
+        if (g_web.hasArg("schluessel") && g_web.arg("schluessel").length()) cfgSchluessel = g_web.arg("schluessel");
+        if (g_web.hasArg("schluesselweg") && g_web.arg("schluesselweg") == "ja") cfgSchluessel = "";
         for (int i = 0; i < Z_ANZAHL; i++) {
             char k[10];
             snprintf(k, sizeof k, "f%d", i);
@@ -1195,6 +2339,10 @@ static void webEinstellungen()
     h += "<tr><td>Namensanfang der Dateien<br><small>ergibt z.B. <code>" + cfgPraefix +
          "-20260919-143205.pdf</code>; bei mehreren Sticks den Standort hier eintragen</small></td>"
          "<td><input name=\"praefix\" size=\"16\" value=\"" + cfgPraefix + "\"></td></tr>";
+    h += "<tr><td>Aufraeumen nach Minuten Ruhe<br><small>so lange darf der Drucker den Stick nicht "
+         "angefasst haben, bevor Gesendetes von der Karte geraeumt wird - das ist der einzige Moment, "
+         "in dem das Medium kurz weg ist</small></td><td><input name=\"aufraeum\" type=\"number\" "
+         "min=\"1\" max=\"1440\" value=\"" + String(g_aufraeumMin) + "\"></td></tr>";
     h += "<tr><td>Ruhefrist in Sekunden<br><small>so lange Stille, bis ein Scan als fertig gilt "
          "(der 780 braucht 45)</small></td><td><input name=\"idle\" type=\"number\" min=\"5\" max=\"600\" value=\"" +
          String(g_idleMs / 1000) + "\"></td></tr>";
@@ -1206,6 +2354,11 @@ static void webEinstellungen()
     h += "<tr><td>Passwort der Weboberflaeche<br><small>Benutzername ist <b>scan</b>. "
          "Leer lassen = unveraendert.</small></td><td><input name=\"webpass\" type=\"password\" size=\"18\">"
          "<br><label><small><input type=\"checkbox\" name=\"passweg\" value=\"ja\"> Schutz entfernen</small></label></td></tr>";
+    h += String("<tr><td>Geraeteschluessel fuer den Upload<br><small>signiert jeden Upload "
+         "(HMAC-SHA256); derselbe Schluessel gehoert in den Empfaenger (<code>SCAN_KEY</code>). "
+         "Leer lassen = unveraendert. Zurzeit: ") + (cfgSchluessel.length() ? "gesetzt" : "keiner") +
+         "</small></td><td><input name=\"schluessel\" type=\"password\" size=\"18\">"
+         "<br><label><small><input type=\"checkbox\" name=\"schluesselweg\" value=\"ja\"> Schluessel entfernen</small></label></td></tr>";
     for (int i = 0; i < Z_ANZAHL; i++) {
         char k[10];
         snprintf(k, sizeof k, "f%d", i);
@@ -1231,27 +2384,57 @@ static void webStarten()
     g_web.on("/einstellungen", HTTP_GET, webEinstellungen);
     g_web.on("/einstellungen", HTTP_POST, webEinstellungen);
     g_web.on("/holen", webHolen);
-    g_web.on("/jetzt-schauen", webJetztSchauen);
-    g_web.on("/neustart", webNeustart);
+    // Nebenwirkungen nur per POST: ein GET laesst sich von jeder fremden Seite
+    // als Bild-Adresse unterschieben, ein POST nicht ohne Origin-Kopfzeile.
+    g_web.on("/jetzt-schauen", HTTP_POST, webJetztSchauen);
+    g_web.on("/neustart", HTTP_POST, webNeustart);
+    g_web.on("/formatieren", HTTP_POST, []() {
+        if (!webAuth() || !herkunftPruefen()) return;
+        if (g_dirty || rohOffen()) { g_web.send(409, "text/plain", "Es liegt noch etwas Ungesendetes auf der Karte"); return; }
+        if (!karteUebernehmen()) { g_web.send(503, "text/plain", "Der Host laesst die Karte nicht los"); return; }
+        bool ok = karteFormatieren("auf Knopfdruck");
+        remount();
+        karteZurueckgeben();
+        logFlushNetz();
+        g_web.sendHeader("Location", "/");
+        g_web.send(303, "text/plain", ok ? "formatiert" : "fehlgeschlagen");
+    });
+    g_web.on("/aufraeumen", HTTP_POST, []() {
+        if (!webAuth() || !herkunftPruefen()) return;
+        g_aufraeumJetzt = true;
+        logZeile("[web] Aufraeumen angefordert");
+        g_web.sendHeader("Location", "/log");
+        g_web.send(303, "text/plain; charset=utf-8", "");
+    });
     g_web.on("/update", HTTP_GET, webUpdateSeite);
     g_web.on("/update", HTTP_POST,
         []() {
-            bool fehler = Update.hasError();
-            g_web.send(200, "text/html; charset=utf-8",
-                       htmlKopf(fehler ? "Update fehlgeschlagen" : "Update eingespielt") +
-                       (fehler ? "<p class=\"bad\">Das Abbild wurde verworfen, die bisherige "
-                                 "Firmware laeuft weiter.</p>"
-                               : "<p class=\"ok\">Der Stick startet jetzt neu. Diese Seite ist in "
-                                 "etwa 10 Sekunden wieder da.</p>") + htmlFuss());
+            // Der Abschluss lief frueher ohne Passwortpruefung und startete den
+            // Stick auch dann neu, wenn gar kein Abbild geschrieben worden war.
+            // Ein "curl -X POST /update" von irgendwem im WLAN genuegte damit,
+            // einen laufenden Upload abzuschiessen.
+            if (!webAuth() || !herkunftPruefen()) return;
+            bool ok = g_updateBegonnen && Update.isFinished() && !Update.hasError();
+            g_updateBegonnen = false;
+            g_web.send(ok ? 200 : 400, "text/html; charset=utf-8",
+                       htmlKopf(ok ? "Update eingespielt" : "Update fehlgeschlagen") +
+                       (ok ? "<p class=\"ok\">Der Stick startet jetzt neu. Diese Seite ist in "
+                             "etwa 10 Sekunden wieder da.</p>"
+                           : "<p class=\"bad\">Es wurde kein vollstaendiges Abbild geschrieben, "
+                             "die bisherige Firmware laeuft weiter.</p>") + htmlFuss());
             delay(600);
-            if (!fehler) ESP.restart();
+            if (ok) sanftNeustarten();
         },
         []() {
-            if (!webAuth()) return;
+            // Hier nur pruefen, nicht antworten - die Antwort gibt der Abschluss.
+            // Ein Passwort ist gesetzt und fehlt: Abbild gar nicht erst annehmen.
+            if (cfgWebPass.length() && !g_web.authenticate("scan", cfgWebPass.c_str())) return;
+            if (!herkunftOk()) return;
             HTTPUpload &up = g_web.upload();
             if (up.status == UPLOAD_FILE_START) {
                 logZeile("[update] Start: " + up.filename);
-                if (!Update.begin(UPDATE_SIZE_UNKNOWN)) logZeile("[update] begin fehlgeschlagen");
+                g_updateBegonnen = Update.begin(UPDATE_SIZE_UNKNOWN);
+                if (!g_updateBegonnen) logZeile("[update] begin fehlgeschlagen");
             } else if (up.status == UPLOAD_FILE_WRITE) {
                 if (Update.write(up.buf, up.currentSize) != up.currentSize)
                     logZeile("[update] Schreibfehler");
@@ -1261,6 +2444,9 @@ static void webStarten()
             }
         });
     g_web.onNotFound([]() { g_web.sendHeader("Location", "/"); g_web.send(303, "text/plain", ""); });
+    // Der WebServer behaelt nur angeforderte Kopfzeilen; Host merkt er sich immer.
+    const char *kopf[] = { "Origin", "Referer" };
+    g_web.collectHeaders(kopf, 2);
     g_web.begin();
     if (MDNS.begin("scanstick")) MDNS.addService("http", "tcp", 80);
     g_webAn = true;
@@ -1270,9 +2456,13 @@ static void webStarten()
 
 // ---- nach Scan-Ende: neue Dateien hochladen ----
 // Ordner rekursiv durchgehen, Dateien hochladen; loggt jeden Eintrag (Diagnose)
-#define MAX_FUND 24
 static String g_fund[MAX_FUND];
 static int    g_fundAnzahl = 0;
+// Geist-Eintraege (siehe sendeGefundene), die nach dem Remount roh ausgetragen werden
+#define MAX_GEISTER 8
+static String   g_geisterName[MAX_GEISTER];
+static uint32_t g_geisterGroesse[MAX_GEISTER];
+static int      g_geisterAnzahl = 0;
 
 // SCHRITT 1: nur suchen. Reines Lesen - das darf gefahrlos passieren,
 // waehrend der Drucker das Medium noch hat.
@@ -1289,155 +2479,145 @@ static void sammleDateien(const String &pfad, int tiefe)
         if (sl >= 0) basis = basis.substring(sl + 1);
         logZeile(String("[fund] ") + (istDir ? "DIR " : "DAT ") + voll + " " + sz + "B");
         if (istDir) {
-            if (tiefe < 3 && !basis.startsWith(".") && !basis.equalsIgnoreCase("gesendet"))
+            if (tiefe < 3 && !basis.startsWith(".") && !basis.equalsIgnoreCase("gesendet") &&
+                !basis.equalsIgnoreCase("senden"))
                 sammleDateien(voll, tiefe + 1);
             continue;
         }
-        if (basis.equalsIgnoreCase("wifi.cfg") || basis.startsWith(".")) continue;
+        if (!istScanName(basis)) continue;   // derselbe Massstab wie im Rohleser
         if (!sz) continue;
         if (g_fundAnzahl < MAX_FUND) g_fund[g_fundAnzahl++] = voll;
     }
 }
 
-// SCHRITT 2: umbenennen, senden, aufraeumen. Hier wird die FAT veraendert -
-// der Aufrufer MUSS dem Host das Medium vorher entzogen haben, sonst schreibt
-// der Drucker seine alte Sicht darueber und die Aenderungen sind weg.
-static void sendeGefundene(bool wifi, int &hoch, int &fehler)
+// ================= Ablauf ab v26: das Medium bleibt beim Drucker =================
+// Im Betrieb wird das Medium NIE abgemeldet. Fertige Scans liest der Stick roh -
+// Verzeichnis, Belegungskette, Datenbloecke - und laedt sie hoch, waehrend der
+// Drucker die Karte weiter hat. Was gesendet ist, merkt er sich im Flash
+// (Startcluster, Groesse, Kennzahl). Umbenennen ist unnoetig: der Drucker
+// nennt den naechsten Scan von selbst [Untitled]_<Zeit>.pdf. Aufgeraeumt wird
+// erst in einer Ruhephase - wenn der Drucker eine Weile nichts angefasst hat,
+// die Merkliste voll wird oder jemand den Knopf drueckt. Nur dann ist das
+// Medium fuer unter eine Sekunde weg, und niemand steht am Geraet.
+// v25 hatte das Fenster bei jedem Scan; v18-v24 sogar fuer die Dauer des Uploads.
+
+// ---- Reste aus v25: /senden ----
+static String g_erledigtPfad[MAX_FUND];   // in /senden, erfolgreich hochgeladen
+static int    g_erledigtAnzahl = 0;
+
+static bool sendenLeer()
 {
-    for (int i = 0; i < g_fundAnzahl; i++) {
-        String voll = g_fund[i];
-        String basis = voll;
-        int sl = basis.lastIndexOf('/');
-        if (sl >= 0) basis = basis.substring(sl + 1);
+    File dir = SD_MMC.open("/senden");
+    if (!dir) return true;
+    bool leer = true;
+    for (File e = dir.openNextFile(); e && leer; e = dir.openNextFile())
+        if (!e.isDirectory() && istScanName(String(e.name()))) leer = false;
+    return leer;
+}
 
-        // Ist das dieselbe Datei, die wir gerade eben gesendet haben?
+static bool remount()
+{
+    SD_MMC.end();
+    delay(80);
+    SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0, SD_D1, SD_D2, SD_D3);
+    return SD_MMC.begin();
+}
+
+static void sendenAusSenden(int &hoch, int &fehler)
+{
+    File dir = SD_MMC.open("/senden");
+    if (!dir) return;
+    String namen[MAX_FUND];
+    int n = 0;
+    for (File e = dir.openNextFile(); e && n < MAX_FUND; e = dir.openNextFile())
+        if (!e.isDirectory() && istScanName(String(e.name())) && e.size()) namen[n++] = String(e.name());
+    dir.close();
+    for (int i = 0; i < n; i++) {
+        String pfad = "/senden/" + namen[i];
+        bool schonErledigt = false;
+        for (int k = 0; k < g_erledigtAnzahl; k++) if (g_erledigtPfad[k] == pfad) schonErledigt = true;
+        if (schonErledigt) continue;
         uint32_t groesse = 0;
-        {
-            File pf = SD_MMC.open(voll);
-            if (pf) { groesse = pf.size(); pf.close(); }
-        }
-        if (!dateiVollstaendig(voll, groesse)) {
-            logZeile("[warte] " + basis + " (" + (groesse / 1024) +
-                     " kB) hat noch keine Endmarke - der Drucker schreibt noch");
-            fehler++;
-            continue;
-        }
-        uint32_t kennzahl = dateiKennzahl(voll, groesse);
-        if (groesse && groesse == g_letzteGroesse && kennzahl == g_letztePruef) {
-            logZeile("[dub] " + basis + " ist die zuletzt gesendete Datei - nur wegraeumen");
-            SD_MMC.remove(voll);
-            continue;
-        }
-
-        // Umbenennen, bevor gesendet wird: der Drucker nennt jeden Scan gleich
-        // ("[Untitled].pdf"), der Name muss sofort wieder frei sein.
-        String sendePfad = voll, sendeName = basis;
-        if (basis.startsWith(cfgPraefix + "-")) {
-            // Traegt schon unseren Namen: ein frueherer Upload ist gescheitert,
-            // die Datei liegt noch. Nicht erneut umbenennen.
-            logZeile("[um] " + basis + " hat schon unseren Namen, zweiter Anlauf");
-        } else {
-            String ordner = (sl >= 0) ? voll.substring(0, sl + 1) : String("/");
-            String zielName = neuerName(basis);
-            String zielPfad = ordner + zielName;
-            if (SD_MMC.rename(voll, zielPfad)) {
-                sendePfad = zielPfad;
-                sendeName = zielName;
-                logZeile("[um] " + basis + " -> " + zielName);
-            } else {
-                logZeile("[um] Umbenennen fehlgeschlagen, sende unter " + basis);
-            }
-        }
-
+        { File pf = SD_MMC.open(pfad); if (pf) { groesse = pf.size(); pf.close(); } }
+        uint32_t kennzahl = dateiKennzahl(pfad, groesse);
         char idText[32];
         snprintf(idText, sizeof idText, "%08x-%08x", (unsigned)groesse, (unsigned)kennzahl);
-        if (wifi && ladeHoch(SD_MMC, sendePfad, sendeName, String(idText))) {
-            if (g_loeschen) {
-                SD_MMC.remove(sendePfad);
-            } else {
-                // Aufheben statt loeschen. Aus der Wurzel raus, sonst findet der
-                // naechste Durchlauf die Datei wieder und schickt sie erneut.
-                if (!SD_MMC.exists("/gesendet")) SD_MMC.mkdir("/gesendet");
-                String ziel = "/gesendet/" + sendeName;
-                for (int n = 1; SD_MMC.exists(ziel) && n < 100; n++) {
-                    int punkt = sendeName.lastIndexOf('.');
-                    ziel = "/gesendet/" + (punkt > 0 ? sendeName.substring(0, punkt) : sendeName) +
-                           "_" + n + (punkt > 0 ? sendeName.substring(punkt) : String(""));
-                }
-                if (SD_MMC.rename(sendePfad, ziel)) logZeile("[up] aufgehoben als " + ziel);
-                else { logZeile("[up] Verschieben fehlgeschlagen, loesche"); SD_MMC.remove(sendePfad); }
-            }
-            g_letzteGroesse = groesse;
-            g_letztePruef   = kennzahl;
-            g_nvs.begin("scanstick", false);          // Neustart soll das nicht vergessen
-            g_nvs.putUInt("dubgr", g_letzteGroesse);
-            g_nvs.putUInt("dubpr", g_letztePruef);
-            g_nvs.end();
+        int erg = ladeHoch(SD_MMC, pfad, namen[i], String(idText));
+        if (erg == UP_OK || erg == UP_DUPLIKAT) {
+            if (g_erledigtAnzahl < MAX_FUND) g_erledigtPfad[g_erledigtAnzahl++] = pfad;
             hoch++;
-        } else {
-            fehler++;
-        }
+        } else fehler++;
     }
 }
 
-static void verarbeiteScans(bool manuell)
+// ---- Verarbeiten: roh lesen und hochladen, das Medium bleibt beim Drucker ----
+static void verarbeiteRoh(bool manuell)
 {
     uint32_t begonnen = millis();
     g_warteAnzeige = false;
     logZeile(manuell ? "[scan] manuelle Suche" : "[scan] Scan fertig, verarbeite");
     zeigeScreen(Z_SUCHT);
 
-    // SCHRITT 1: roh nachsehen. Reines Lesen von Sektoren - das stoert den
-    // Drucker nicht und fasst den Kartentreiber nicht an. Ist nichts da, sparen
-    // wir uns alles Weitere und damit jedes Risiko. (Der Rohleser sieht nur das
-    // Wurzelverzeichnis; genau dort legt der Drucker seine Scans ab.)
-    int rohAnz = 0;
-    uint32_t rohGroesse = 0;
-    rohVerzeichnis(rohAnz, rohGroesse);
+    RohEintrag liste[MAX_FUND];
+    int n = rohListe(0, liste, MAX_FUND, true);
+    int hoch = 0, fehler = 0, bekannt = 0, geister = 0;
+    bool wifiGeprueft = false, wifi = false;
+    uint8_t *fatBuf = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
 
-    int hoch = 0, fehler = 0;
-    if (rohAnz > 0) {
-        // SCHRITT 2: ERST den Host abmelden, DANN die Karte neu anhaengen.
-        // Vorher lief das Ab- und Anhaengen bei angemeldetem Medium. Traf in
-        // dieses Fenster ein Zugriff des Druckers, griff der USB-Teil auf einen
-        // gerade abgeraeumten Kartentreiber zu und der Stick startete neu -
-        // derselbe Fehler, der frueher in der Dateien-Seite steckte. Gefahrlos
-        // ist der Entzug hier, weil roh bereits eine fertige Datei zu sehen war.
-        MSC.mediaPresent(false);
-        delay(200);
-
-        SD_MMC.end();
-        delay(100);
-        SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0, SD_D1, SD_D2, SD_D3);
-        if (!SD_MMC.begin()) {
-            logZeile("[scan] remount fehlgeschlagen");
-            MSC.mediaPresent(true);          // Medium auf keinen Fall verlieren
-            return;
+    for (int i = 0; i < n && fatBuf; i++) {
+        RohEintrag &e = liste[i];
+        if (fertigIndexE(e) >= 0) { bekannt++; continue; }
+        if (istGeloeschtE(e)) {
+            logZeile(String("[geist] ") + e.name + " ist die Wiederkehr einer weggeraeumten Datei - wartet aufs Aufraeumen");
+            geister++;
+            continue;
         }
-
-        // SCHRITT 3: jetzt sind wir allein auf der Karte
-        g_fundAnzahl = 0;
-        sammleDateien("/", 0);
-        bool wifi = wifiVerbinden();
-        sendeGefundene(wifi, hoch, fehler);
-
-        // SCHRITT 4: Cache schreiben, dem Drucker eine frische Sicht geben
-        SD_MMC.end();
-        delay(80);
-        SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0, SD_D1, SD_D2, SD_D3);
-        SD_MMC.begin();
-        MSC.mediaPresent(true);
-        logZeile("[usb] Stick neu angemeldet");
-    } else {
-        logZeile("[scan] roh nachgesehen: nichts zu holen");
+        if (e.start < 2 || fatNaechster(e.start, fatBuf) == 0) {
+            logZeile(String("[geist] ") + e.name + " zeigt auf freie Bloecke - wartet aufs Aufraeumen");
+            geister++;
+            continue;
+        }
+        bool geteilt = false;
+        for (int k = 0; k < n; k++) if (k != i && liste[k].start == e.start) geteilt = true;
+        if (geteilt) {
+            logZeile(String("[geist] ") + e.name + " teilt Bloecke mit einem anderen Eintrag - wartet aufs Aufraeumen");
+            geister++;
+            continue;
+        }
+        if (!rohVollstaendig(e)) {
+            logZeile(String("[warte] ") + e.name + " (" + (e.groesse / 1024) + " kB) hat noch keine Endmarke - der Drucker schreibt noch");
+            fehler++;
+            continue;
+        }
+        if (!wifiGeprueft) { wifi = wifiVerbinden(); wifiGeprueft = true; logFlushNetz(); }
+        uint32_t kennzahl = rohKennzahl(e);
+        String sendeName = neuerName(String(e.name));
+        char idText[32];
+        snprintf(idText, sizeof idText, "%08x-%08x", (unsigned)e.groesse, (unsigned)kennzahl);
+        logZeile(String("[roh] ") + e.name + " (" + (e.groesse / 1024) + " kB) -> " + sendeName);
+        RohLeser rl;
+        int erg = UP_FEHLER;
+        if (wifi && rl.beginnen(e.start, e.groesse))
+            erg = ladeHochQuelle(sendeName, String(idText), e.groesse, [&](uint8_t *b, size_t k) { return rl.lesen(b, k); });
+        rl.ende();
+        if (erg == UP_OK || erg == UP_DUPLIKAT) { fertigMerken(e, kennzahl, sendeName); hoch++; }
+        else fehler++;
     }
-    logZeile(String("[scan] fertig: ") + hoch + " hochgeladen, " + fehler + " Fehler, " +
-             "vom Host geschrieben: " + (g_bytesGeschrieben / 1024) + " kB");
+    if (fatBuf) free(fatBuf);
+
+    // Reste aus v25 in /senden - der Mount vom Start kennt sie
+    if (!sendenLeer()) sendenAusSenden(hoch, fehler);
+
+    logZeile(String("[scan] fertig: ") + hoch + " hochgeladen, " + bekannt + " schon bekannt, " + fehler +
+             " Fehler, vom Host geschrieben: " + (g_bytesGeschrieben / 1024) + " kB");
+    if (hoch == 0) {
+        // Der Drucker hat geschrieben, aber keine neue Datei liegt da - was genau
+        // hat er geschrieben? (Sektor+Anzahl, F=FAT W=Wurzel D=Daten B=Boot)
+        String spur = spurText(false);
+        if (spur.length()) logZeile("[spur] " + spur);
+    }
     if (hoch > 0) g_bytesGeschrieben = 0;
 
-    // Hat der Drucker waehrend unserer Arbeit geschrieben? Ein Upload kann eine
-    // Minute dauern - ohne diese Pruefung faellt ein in der Zeit entstandener
-    // Scan hinten runter, weil g_dirty blind geloescht wuerde.
     if ((int32_t)(g_lastWrite - begonnen) > 0) {
         logZeile("[scan] neuer Schreibzugriff waehrend der Verarbeitung - bleibe dran");
         g_versuche = 0;
@@ -1447,26 +2627,29 @@ static void verarbeiteScans(bool manuell)
     }
 
     g_versuche++;
+    if (hoch == 0 && fehler == 0 && geister > 0) {
+        // Nur Geister: da kommt nichts mehr, das Aufraeumfenster erledigt sie.
+        // Ein Wiederholzyklus wuerde nur alle 30 s dieselbe Zeile schreiben.
+        logZeile(String("[scan] nur ") + geister + " Geist(er) - wartet aufs Aufraeumen");
+        g_versuche = MAX_VERSUCHE;
+    }
     if (hoch == 0 && fehler == 0) {
         if (manuell) {
-            // Von Hand ausgeloest und nichts gefunden: keinen Wartezyklus starten
-            logZeile("[scan] nichts gefunden");
+            logZeile("[scan] nichts Neues");
             g_versuche = 0;
             logFlushNetz();
             return;
         }
-        // Nichts da. Der Drucker hat den Scan vermutlich noch nicht committet:
-        // dranbleiben statt aufgeben, g_dirty bleibt stehen.
         if (g_versuche < MAX_VERSUCHE) {
             g_naechsterVersuch = millis() + RETRY_MS;
-            g_dirty = true;                 // dranbleiben
-            logZeile(String("[warte] nichts gefunden (Versuch ") + g_versuche + "/" + MAX_VERSUCHE +
+            g_dirty = true;
+            logZeile(String("[warte] nichts Neues (Versuch ") + g_versuche + "/" + MAX_VERSUCHE +
                   "), neuer Blick in " + (RETRY_MS / 1000) + "s");
             zeigeWarte(g_versuche, MAX_VERSUCHE);
             logFlushNetz();
             return;
         }
-        logZeile(String("[warte] nach ") + g_versuche + " Versuchen nichts gefunden - aufgegeben");
+        logZeile(String("[warte] nach ") + g_versuche + " Versuchen nichts Neues - aufgegeben");
     }
     g_dirty = false;
     g_versuche = 0;
@@ -1474,7 +2657,126 @@ static void verarbeiteScans(bool manuell)
     g_rohStabil = 0;
     g_rohAnzahl = 0;
     g_rohSumme = 0;
-    logFlushNetz();   // Anzeige macht wieder loop(): BEREIT oder OK
+    logFlushNetz();
+}
+
+// ---- Aufraeumen: das einzige Fenster, in dem die Karte veraendert wird ----
+static bool aufraeumenNoetig()
+{
+    return g_fertigAnzahl > 0 || g_erledigtAnzahl > 0 || g_geisterAnzahl > 0;
+}
+
+static void aufraeumFenster(const String &grund)
+{
+    uint32_t t0 = millis();
+    logZeile("[aufraeumen] " + grund);
+    zeigeScreen(Z_SUCHT);
+    if (!karteUebernehmen()) { logZeile("[aufraeumen] Karte nicht bekommen, spaeter"); return; }
+
+    // roh, vor dem Mount
+    int geister = geisterJagen();
+    uint32_t cs = rohOrdnerCluster("SENDEN     ");
+    for (int i = 0; i < g_geisterAnzahl; i++) {
+        bool ok = cs && rohEintragLoeschenIn(cs, g_geisterName[i], g_geisterGroesse[i], 0);
+        logZeile(String("[geist] /senden/") + g_geisterName[i] + (ok ? " ausgetragen" : " NICHT gefunden"));
+    }
+    g_geisterAnzahl = 0;
+
+    // Selbstpruefung: was der Drucker an Schaeden hinterlassen hat, jetzt beheben -
+    // hier sieht er die Karte nicht. Ist das Dateisystem zum zweiten Mal in Folge
+    // unlesbar, gibt es nichts mehr zu retten: neu anlegen.
+    kartePruefen(true, "im Aufraeumfenster");
+    if (g_befund.heillos && g_heillosFolge >= 2) {
+        karteFormatieren("Dateisystem zweimal in Folge unlesbar");
+        remount();
+        karteZurueckgeben();
+        g_letztesAufraeumen = millis();
+        logFlushNetz();
+        return;
+    }
+
+    RohEintrag liste[MAX_FUND];
+    int n = rohListe(0, liste, MAX_FUND, true);
+
+    if (!remount()) { logZeile("[aufraeumen] Mount fehlgeschlagen"); karteZurueckgeben(); return; }
+
+    int weg = 0;
+    // Eintraege der Merkliste, zu denen keine Datei mehr liegt: der Drucker hat die
+    // Datei ueberschrieben ("Ersetzen") oder geloescht. Sie muessen raus - sonst
+    // bleibt aufraeumenNoetig() fuer immer wahr und das Fenster lief im Kreis, alle
+    // 300 ms mit Medium weg und wieder da (am 20.09.2026 ueber eine halbe Stunde,
+    // der 780 brach den naechsten Scan dann mit "Error writing multi-page image file" ab).
+    for (int fi = g_fertigAnzahl - 1; fi >= 0; fi--) {
+        bool da = false;
+        for (int i = 0; i < n && !da; i++)
+            da = liste[i].start == g_fertig[fi].start && liste[i].groesse == g_fertig[fi].groesse;
+        if (da) continue;
+        logZeile(String("[aufraeumen] Merkliste: ") + g_fertig[fi].name + " (" + (g_fertig[fi].groesse / 1024) +
+                 " kB) liegt nicht mehr auf der Karte - Eintrag ausgetragen");
+        geloeschtMerken(g_fertig[fi]);
+        memmove(g_fertig + fi, g_fertig + fi + 1, (g_fertigAnzahl - fi - 1) * sizeof(Fertig));
+        g_fertigAnzahl--;
+    }
+    for (int i = 0; i < n; i++) {
+        int fi = fertigIndexE(liste[i]);
+        if (fi < 0) {
+            // Nicht gesendet und keine Endmarke: ein abgebrochener Scan (Stromschnitt,
+            // Schreibfehler des Druckers). Der Drucker fragt beim naechsten Job sonst
+            // "Datei bereits vorhanden" - und nach der Ruhefrist schreibt er da sicher
+            // nicht mehr weiter.
+            if (!istGeloeschtE(liste[i]) && !rohVollstaendig(liste[i])) {
+                String pfad = "/" + String(liste[i].name);
+                bool ok = SD_MMC.remove(pfad);
+                logZeile(String("[aufraeumen] unfertige Datei ") + liste[i].name + " (" + (liste[i].groesse / 1024) +
+                         " kB, keine Endmarke) " + (ok ? "verworfen" : "liess sich nicht loeschen"));
+                if (ok) weg++;
+            }
+            continue;
+        }
+        String pfad = "/" + String(liste[i].name);
+        bool ok;
+        if (g_loeschen) {
+            ok = SD_MMC.remove(pfad);
+        } else {
+            if (!SD_MMC.exists("/gesendet")) SD_MMC.mkdir("/gesendet");
+            String basis = g_fertig[fi].name[0] ? String(g_fertig[fi].name) : String(liste[i].name);
+            String ziel = "/gesendet/" + basis;
+            for (int k = 1; SD_MMC.exists(ziel) && k < 100; k++) {
+                int punkt = basis.lastIndexOf('.');
+                ziel = "/gesendet/" + (punkt > 0 ? basis.substring(0, punkt) : basis) + "_" + k +
+                       (punkt > 0 ? basis.substring(punkt) : String(""));
+            }
+            ok = SD_MMC.rename(pfad, ziel);
+            if (!ok) { logZeile("[aufraeumen] Verschieben fehlgeschlagen, loesche " + pfad); ok = SD_MMC.remove(pfad); }
+        }
+        if (ok) {
+            geloeschtMerken(g_fertig[fi]);
+            memmove(g_fertig + fi, g_fertig + fi + 1, (g_fertigAnzahl - fi - 1) * sizeof(Fertig));
+            g_fertigAnzahl--;
+            weg++;
+        } else {
+            logZeile("[aufraeumen] " + pfad + " liess sich nicht wegraeumen");
+        }
+    }
+    // Reste aus v25
+    for (int i = 0; i < g_erledigtAnzahl; i++) {
+        if (g_loeschen) SD_MMC.remove(g_erledigtPfad[i]);
+        else {
+            String basis = g_erledigtPfad[i].substring(g_erledigtPfad[i].lastIndexOf('/') + 1);
+            if (!SD_MMC.exists("/gesendet")) SD_MMC.mkdir("/gesendet");
+            if (!SD_MMC.rename(g_erledigtPfad[i], "/gesendet/" + basis)) SD_MMC.remove(g_erledigtPfad[i]);
+        }
+        weg++;
+    }
+    g_erledigtAnzahl = 0;
+
+    remount();
+    karteZurueckgeben();
+    fertigSpeichern();
+    g_letztesAufraeumen = millis();
+    logZeile(String("[aufraeumen] ") + (millis() - t0) + " ms: " + weg + " weggeraeumt, " + geister +
+             " Geister, " + g_fertigAnzahl + " gesendete liegen noch");
+    logFlushNetz();
 }
 
 void setup()
@@ -1482,6 +2784,8 @@ void setup()
     Serial.begin(115200);
     delay(300);
     Serial.println("\n=== Scan-Stick " FW_VERSION " ===");
+    g_startGrund = resetGrund();
+    logZeile(String("[boot] " FW_VERSION ", Grund: ") + g_startGrund);
 
     ledInit();
     ledColor(60, 60, 60);   // WEISS = Strom da, bootet
@@ -1492,21 +2796,20 @@ void setup()
     // auch hoch, wenn die Karte fehlt oder nicht mountet - dann kann der Stick
     // selbst melden, was ihm fehlt, statt stumm zu bleiben.
     cfgAusNvs();
-    wlanStarten();
+    fertigLaden();
 
     SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0, SD_D1, SD_D2, SD_D3);
     bool sdOk = SD_MMC.begin("/sdcard", false, false);
     if (!sdOk) { logZeile("[sd] Mount fehlgeschlagen"); zeigeScreen(Z_SDFEHL); }
     else fixMbrTyp();   // MBR nur bei gemounteter Karte anfassen
 
-    if (sdOk) {
-        String altS = cfgSsid, altP = cfgPass, altE = cfgEndpoint;
-        ladeConfig();                     // /wifi.cfg hat Vorrang
-        if (cfgSsid != altS || cfgPass != altP || cfgEndpoint != altE) {
-            cfgNachNvs();
-            logZeile("[nvs] aus /wifi.cfg aktualisiert");
-            if (WiFi.status() != WL_CONNECTED) wlanStarten();
-        }
+    if (sdOk && ladeConfig()) {          // nur eine GEAENDERTE /wifi.cfg gewinnt
+        cfgNachNvs();
+        logZeile("[nvs] aus /wifi.cfg uebernommen");
+    }
+    if (sdOk) {                          // Karte heilen, solange sie noch niemand sieht
+        kartePruefen(true, "beim Start");
+        if (g_befund.geaendert) sdOk = remount();
     }
 
     MSC.vendorID("DIY");
@@ -1515,7 +2818,10 @@ void setup()
     MSC.onStartStop(onStartStop);
     MSC.onRead(onRead);
     MSC.onWrite(onWrite);
-    MSC.mediaPresent(true);
+    // Ohne Karte "kein Medium" melden statt eines Laufwerks mit 0 Sektoren. So
+    // sieht der Host einen leeren Kartenleser, und von aussen ist der Zustand
+    // vom frueheren Boot-Haenger zu unterscheiden.
+    MSC.mediaPresent(sdOk);
     MSC.isWritable(true);
     uint32_t sec = SD_MMC.sectorSize();
     uint32_t rawSectors = sec ? (uint32_t)(SD_MMC.cardSize() / sec) : 0;
@@ -1523,6 +2829,10 @@ void setup()
     MSC.begin(rawSectors, sec ? sec : 512);
     USB.begin();
     Serial.println("[usb] als USB-Speicher gestartet");
+
+    // WLAN erst jetzt: der Suchlauf blockiert einige Sekunden, und der Drucker
+    // soll den Stick sofort als Laufwerk sehen, nicht erst nach dem WLAN.
+    wlanStarten();
     if (g_screen != Z_SDFEHL) zeigeScreen(Z_BEREIT);
 }
 
@@ -1542,9 +2852,9 @@ void loop()
         g_startGeprueft = true;
         int a = 0;
         uint32_t gr = 0;
-        if (rohVerzeichnis(a, gr) && a > 0) {
-            logZeile(String("[start] ") + a + " Datei(en) mit " + (gr / 1024) +
-                     " kB lagen noch da - nehme sie mit");
+        (void)a; (void)gr;
+        if (rohOffen() || !sendenLeer()) {
+            logZeile("[start] es liegt noch etwas Ungesendetes auf der Karte - nehme es mit");
             g_dirty = true;
             g_lastWrite = millis() - IDLE_MS - 1;   // sofort faellig
             g_versuche = 0;
@@ -1552,13 +2862,83 @@ void loop()
         }
     }
 
+    // Liegt etwas, das nicht wegging - Empfaenger war nicht erreichbar, WLAN
+    // fehlte? Bisher gab es den naechsten Versuch erst mit dem naechsten Scan.
+    // Jetzt alle zehn Minuten roh nachsehen, ohne den Drucker zu stoeren.
+    #define NACHSCHAU_MS 600000
+    static uint32_t nachschau = 0;
+    if (!g_dirty && g_startGeprueft && WiFi.status() == WL_CONNECTED &&
+        millis() - nachschau > NACHSCHAU_MS) {
+        nachschau = millis();
+        int a = 0;
+        uint32_t gr = 0;
+        (void)a; (void)gr;
+        if (rohOffen() || !sendenLeer()) {
+            logZeile("[nachschau] es liegt noch etwas Ungesendetes auf der Karte - neuer Anlauf");
+            g_dirty = true;
+            g_lastWrite = millis() - IDLE_MS - 1;   // sofort faellig
+            g_versuche = 0;
+            g_naechsterVersuch = 0;
+        }
+    }
+
+    // Aufraeumen nur in Ruhe: der Drucker hat lange nichts angefasst, die
+    // Merkliste wird voll, oder jemand hat den Knopf gedrueckt.
+    if (g_aufraeumJetzt && g_startGeprueft && millis() - g_lastHost > 5000) {
+        // Knopfdruck: der Mensch weiss, dass gerade nicht gescannt wird
+        g_aufraeumJetzt = false;
+        aufraeumFenster("auf Knopfdruck");
+        g_dirty = false;
+        g_versuche = 0;
+        g_naechsterVersuch = 0;
+    } else if (!g_dirty && g_startGeprueft && aufraeumenNoetig()) {
+        uint32_t ruhe = millis() - g_lastHost;
+        // Ein Fenster je Ruhephase: bleibt danach etwas liegen, das sich nicht
+        // wegraeumen laesst, darf das Fenster nicht sofort wieder aufgehen -
+        // erst, wenn der Drucker seitdem wieder zugegriffen hat.
+        bool neuSeitdem = g_letztesAufraeumen == 0 || (int32_t)(g_lastHost - g_letztesAufraeumen) > 0;
+        if (neuSeitdem && ruhe > g_aufraeumMin * 60000UL) aufraeumFenster(String("Drucker seit ") + dauer(ruhe) + " ohne Zugriff");
+        else if (neuSeitdem && g_fertigAnzahl >= MAX_FERTIG - 8 && ruhe > 60000) aufraeumFenster("Merkliste fast voll");
+    }
+
     if (g_stopNeu) {
         g_stopNeu = false;
         logZeile(String("[scsi] START STOP UNIT: start=") + (g_stopStart ? "ja" : "nein") +
                  " eject=" + (g_stopEject ? "ja" : "nein") + " pc=" + g_stopPc);
     }
+    // Netz weg? Der Auto-Reconnect haengt an der festen Kennung des einen
+    // Zugangspunkts. Nach zwei Minuten ohne Netz neu suchen, ueber alle Netze.
+    if (WiFi.status() != WL_CONNECTED && cfgNetze) {
+        if (!g_wlanVerloren) g_wlanVerloren = millis() ? millis() : 1;
+        else if (millis() - g_wlanVerloren > WLAN_NEUSUCHE) {
+            logZeile("[wifi] zwei Minuten ohne Netz - suche neu");
+            // Erst die alte Verbindung aufgeben: solange der Treiber noch am
+            // verschwundenen Zugangspunkt haengt und wiederverbinden will, kommt
+            // der Suchlauf gar nicht zustande (im Test: "kein Netz" nach 3 ms,
+            // erst der zweite Anlauf zwei Minuten spaeter fand das Heimnetz).
+            WiFi.disconnect(false, false);
+            delay(200);
+            g_wlanVerloren = 0;
+            wlanStarten();
+            if (WiFi.status() != WL_CONNECTED) {
+                // Fehlschlag: nicht wieder zwei Minuten warten, in 30 s nochmal
+                uint32_t jetzt = millis() ? millis() : 1;
+                g_wlanVerloren = jetzt - (WLAN_NEUSUCHE - 30000);
+            }
+        }
+    }
     if (WiFi.status() == WL_CONNECTED && !g_webAn) { webStarten(); zeitHolen(); }
     if (g_webAn) g_web.handleClient();
+
+    {
+        uint32_t f = g_usbFehlerLesen + g_usbFehlerSchreiben;
+        if (f != g_usbFehlerGemeldet && millis() - g_usbFehlerZeit > 2000) {
+            g_usbFehlerGemeldet = f;
+            logZeile(String("[usb] abgewiesene Host-Zugriffe: ") + (uint32_t)g_usbFehlerLesen + " lesen, " +
+                     (uint32_t)g_usbFehlerSchreiben + " schreiben, zuletzt Sektor " + (uint32_t)g_usbFehlerLba);
+            logFlushNetz();
+        }
+    }
 
     uint32_t nun = millis();
 
@@ -1569,20 +2949,39 @@ void loop()
     // Groesse schon vor dem Schreiben ein. Wuerden wir darauf vertrauen, benennen
     // wir mitten im laufenden Scan um - der Drucker schreibt dann seine alte
     // Verzeichnissicht zurueck und die Umbenennung ist weg. Also zusaetzlich Ruhe abwarten.
-    if (g_dirty && !g_warteAnzeige && nun - g_lastWrite > ROH_RUHE &&
-        nun - g_rohLetzt > ROH_INTERVALL) {
+    // Ruhe heisst: weder Schreiben NOCH Lesen. Ein Host, der nach dem Schreiben
+    // noch liest (Linux beim Aushaengen, ein Drucker beim Nachpruefen), ist nicht
+    // fertig - ihm jetzt das Medium zu entziehen bringt nur Fehler auf seiner Seite.
+    // ... aber nicht schneller als der Wartezyklus erlaubt: liegt nur Bekanntes
+    // in der Wurzel, lief das sonst alle vier Sekunden im Kreis.
+    if (g_dirty && !g_warteAnzeige && nun - g_lastHost > ROH_RUHE &&
+        nun - g_rohLetzt > ROH_INTERVALL &&
+        (g_naechsterVersuch == 0 || (int32_t)(nun - g_naechsterVersuch) >= 0)) {
         g_rohLetzt = nun;
         int anz = 0;
         uint32_t summe = 0;
         if (rohVerzeichnis(anz, summe) && anz > 0) {
+            rohOffenSumme(g_zeigAnzahl, g_zeigSumme);
+            g_rohGeprueft = nun;
             if (anz == g_rohAnzahl && summe == g_rohSumme) {
                 if (++g_rohStabil >= ROH_STABIL) {
-                    logZeile(String("[roh] ") + anz + " Datei(en), " + (summe / 1024) +
-                             " kB, Groesse stabil - verarbeite sofort");
                     g_rohStabil = 0;
                     g_rohAnzahl = 0;
                     g_rohSumme = 0;
-                    verarbeiteScans(false);
+                    if (!rohOffen()) {
+                        // Der Drucker hat geschrieben, aber es liegt nichts Neues -
+                        // etwa seine Verzeichnisdaten. Vorher lief das alle vier
+                        // Sekunden im Kreis, mit einem Protokoll-Upload pro Runde.
+                        logZeile(String("[roh] ") + anz + " Datei(en) stabil, alle schon gesendet - nichts zu tun");
+                        g_dirty = false;
+                        g_versuche = 0;
+                        g_naechsterVersuch = 0;
+                        logFlushNetz();
+                        return;
+                    }
+                    logZeile(String("[roh] ") + anz + " Datei(en), " + (summe / 1024) +
+                             " kB, Groesse stabil - verarbeite sofort");
+                    verarbeiteRoh(false);
                     return;
                 }
             } else {
@@ -1595,21 +2994,25 @@ void loop()
 
     if (g_einmalSchauen) {
         g_einmalSchauen = false;
-        verarbeiteScans(true);
+        verarbeiteRoh(true);
     } else if (nun - g_lastWrite < IDLE_MS) {
         // Der Host schreibt noch: Beobachtung von vorn beginnen
         g_versuche = 0;
         g_naechsterVersuch = 0;
         g_warteAnzeige = false;
     } else if (g_dirty && (g_naechsterVersuch == 0 || (int32_t)(nun - g_naechsterVersuch) >= 0)) {
-        verarbeiteScans(false);
+        verarbeiteRoh(false);
     }
     // Nur die WARTE-Anzeige ist geschuetzt. Frueher stand hier !g_dirty - das
     // fror JEDE Anzeige ein, sobald ein Schreibvorgang offen war, also ueber die
     // gesamte Ruhefrist hinweg.
     if (g_screen != Z_SDFEHL && !g_warteAnzeige) {
         uint32_t seitWrite = nun - g_lastWrite;
-        if (g_dirty && seitWrite < IDLE_MS)
+        // Noch nicht roh nachgesehen seit dem letzten Schreibzugriff, oder es
+        // liegt wirklich etwas Ungesendetes: dann "SCAN ERKANNT". Nur die
+        // Verzeichnisdaten des Druckers: bloss "Host aktiv".
+        bool ungeprueft = (int32_t)(g_rohGeprueft - g_lastWrite) < 0;
+        if (g_dirty && seitWrite < IDLE_MS && (ungeprueft || g_zeigAnzahl > 0))
             zeigeFrist((IDLE_MS - seitWrite + 999) / 1000);
         else if (nun - g_lastHost < 3000) zeigeScreen(Z_HOST);
         else zeigeScreen(Z_BEREIT);
