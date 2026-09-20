@@ -38,6 +38,11 @@
 #define SD_CLK 12
 #define SD_CMD 16
 
+// Datentypen, die in Funktionssignaturen vorkommen, stehen hier oben: der Arduino-
+// Builder erzeugt Prototypen vor der ersten Funktion und muss die Typen dort kennen.
+struct RohEintrag { uint32_t start; uint32_t groesse; char name[64]; };
+struct Fertig { uint32_t start, groesse, kennzahl; char name[40]; };
+
 #define IDLE_VORGABE  45000    // Ruhe bis "Scan fertig" - Vorgabe, per Weboberflaeche aenderbar
 static uint32_t g_idleMs   = IDLE_VORGABE;   // Ruhefrist, aus dem Flash
 static bool     g_loeschen = true;           // true = loeschen, false = nach /gesendet verschieben
@@ -878,7 +883,6 @@ static int geisterJagen()
 }
 
 // ---- Rohes Lesen ganzer Dateien und die Merkliste (siehe Ablauf ab v26 unten) ----
-struct RohEintrag { uint32_t start; uint32_t groesse; char name[64]; };
 
 // Verzeichnis roh listen, mit langen Namen. dirCluster 0 = Wurzel.
 static int rohListe(uint32_t dirCluster, RohEintrag *liste, int max, bool nurScans)
@@ -1027,7 +1031,6 @@ struct RohLeser {
 };
 
 // ---- Merkliste: gesendet, liegt noch auf der Karte ----
-struct Fertig { uint32_t start, groesse, kennzahl; char name[40]; };
 #define MAX_FERTIG    64
 #define MAX_GELOESCHT 16
 static Fertig g_fertig[MAX_FERTIG];
