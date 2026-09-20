@@ -377,6 +377,7 @@ static volatile bool g_sdGesperrt  = false;  // Hauptschleife hat die Karte
 static volatile uint32_t g_spurLba[SPUR_ANZAHL], g_spurN[SPUR_ANZAHL], g_spurT[SPUR_ANZAHL];
 static volatile int      g_spurIdx = 0;
 static void logZeile(const String &msg);     // steht weiter unten
+static void logFlushNetz();                  // ebenfalls
 
 static int32_t onWrite(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize)
 {
