@@ -12,6 +12,7 @@
 #
 #   Umgebung: SCAN_WEBPASS=...  Passwort der Weboberflaeche (Benutzer scan)
 #             SCAN_PORT=8090    Port des Test-Empfaengers
+#             SCAN_SZENARIEN=ABCD  welche Szenarien laufen
 #
 # Das Upload-Ziel des Sticks wird fuer die Dauer des Tests auf diesen Rechner
 # umgestellt und am Ende zurueckgesetzt. Die Partition wird nur angefasst, wenn
@@ -22,6 +23,9 @@
 #   B  zwei Dateien in einem Zug (der Drucker legt sie nacheinander ab)
 #   C  zweite Datei, sobald das Medium nach dem ersten Upload wieder da ist -
 #      der engste Zeitpunkt, den ein Drucker real treffen kann
+#   D  fuenf Jobs Schlag auf Schlag, jeder in eigenem Einhaengen und mit den
+#      Namen des Druckers; zaehlt, wie oft das Medium gerade weg war - genau
+#      diese Jobs haette ein Drucker abgewiesen
 #
 # Der Linux-Treiber schreibt Verzeichniseintraege frueher und anders als ein
 # Drucker. Der Pruefstand ersetzt den Drucktest nicht, macht aber Regressionen
@@ -33,6 +37,7 @@ STICK="${1:-http://scanstick.local}"
 DEV="${2:-/dev/sda1}"
 PORT="${SCAN_PORT:-8090}"
 PASS="${SCAN_WEBPASS:-}"
+SZENARIEN="${SCAN_SZENARIEN:-ABCD}"
 HIER="$(cd "$(dirname "$0")/.." && pwd)"
 ARBEIT="$(mktemp -d /tmp/stresstest.XXXX)"
 INBOX="$ARBEIT/inbox"
@@ -159,20 +164,25 @@ warte_ankunft() {   # warte_ankunft Datei Sekunden
 }
 
 # ---- Szenario A: eine Datei ----
+if [[ $SZENARIEN == *A* ]]; then
 log "Szenario A: eine Datei (300 kB)"
 mach_pdf "$ARBEIT/a1.pdf" 300000
 schreibe "$ARBEIT/a1.pdf"
 warte_ankunft "$ARBEIT/a1.pdf" 180
+fi
 
 # ---- Szenario B: zwei Dateien in einem Zug ----
+if [[ $SZENARIEN == *B* ]]; then
 log "Szenario B: zwei Dateien nacheinander im selben Mount (800 kB + 150 kB)"
 mach_pdf "$ARBEIT/b1.pdf" 800000
 mach_pdf "$ARBEIT/b2.pdf" 150000
 schreibe "$ARBEIT/b1.pdf" "$ARBEIT/b2.pdf"
 warte_ankunft "$ARBEIT/b1.pdf" 240
 warte_ankunft "$ARBEIT/b2.pdf" 120
+fi
 
 # ---- Szenario C: zweite Datei, sobald das Medium zurueck ist ----
+if [[ $SZENARIEN == *C* ]]; then
 log "Szenario C: grosse Datei (2 MB), zweite sofort nach Rueckkehr des Mediums"
 mach_pdf "$ARBEIT/c1.pdf" 2000000
 mach_pdf "$ARBEIT/c2.pdf" 250000
@@ -185,12 +195,40 @@ fi
 schreibe "$ARBEIT/c2.pdf"         # wartet selbst, bis das Medium wieder da ist
 warte_ankunft "$ARBEIT/c1.pdf" 300
 warte_ankunft "$ARBEIT/c2.pdf" 300
+fi
+
+
+# ---- Szenario D: fuenf Jobs Schlag auf Schlag ----
+# So arbeitet der Drucker: ein Job = einhaengen, schreiben, auswerfen, und der
+# naechste sofort hinterher. Ist das Medium beim Einhaengen gerade weg, haette
+# der Drucker den Job abgewiesen - wir zaehlen das und lassen den Job ausfallen.
+VERPASST=0
+if [[ $SZENARIEN == *D* ]]; then
+log "Szenario D: fuenf Jobs Schlag auf Schlag, je eigenes Einhaengen, Druckernamen"
+for i in 1 2 3 4 5; do
+    mach_pdf "$ARBEIT/d$i.pdf" $((250000 + i * 50000))
+    name="[Untitled].pdf"; [ $i -gt 1 ] && name="[Untitled]_$(date +%Y%m%d%H%M%S)0$i.pdf"
+    partprobe "$BLOCK" 2>/dev/null
+    if [ -b "$DEV" ] && mount -t vfat "$DEV" "$MNT" 2>/dev/null; then
+        cp "$ARBEIT/d$i.pdf" "$MNT/$name"; sync; umount "$MNT" || fail "umount Job $i"
+        log "  Job $i geschrieben als $name"
+        GESCHRIEBEN=$((GESCHRIEBEN + 1))
+    else
+        VERPASST=$((VERPASST + 1))
+        log "  Job $i: Medium nicht da - der Drucker haette den Job abgewiesen"
+        rm -f "$ARBEIT/d$i.pdf"
+        warte_medium da 60 >/dev/null
+    fi
+done
+for i in 1 2 3 4 5; do [ -f "$ARBEIT/d$i.pdf" ] && warte_ankunft "$ARBEIT/d$i.pdf" 300; done
+log "  Szenario D: $VERPASST von 5 Jobs haette der Drucker abgewiesen"
+fi
 
 # ---- Bilanz ----
 ANGEKOMMEN=$(ls "$INBOX"/*.pdf 2>/dev/null | wc -l)
 ABGELEHNT=$(grep -c ABGELEHNT "$ARBEIT/empfaenger.log" || true)
 DUPLIKATE=$(grep -c "schon empfangen" "$ARBEIT/empfaenger.log" || true)
-log "Bilanz: $GESCHRIEBEN geschrieben, $ANGEKOMMEN angekommen, $DUPLIKATE Duplikate verworfen, $ABGELEHNT abgelehnt"
+log "Bilanz: $GESCHRIEBEN geschrieben, $ANGEKOMMEN angekommen, $DUPLIKATE Duplikate verworfen, $ABGELEHNT abgelehnt, $VERPASST Jobs bei fehlendem Medium"
 [ "$ANGEKOMMEN" -eq "$GESCHRIEBEN" ] || fail "Anzahl stimmt nicht"
 [ "$ABGELEHNT" -eq 0 ] || fail "Empfaenger hat unvollstaendige Uploads abgelehnt"
 
