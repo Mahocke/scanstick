@@ -97,7 +97,16 @@ liegen unter [Releases](../../releases).
 
 ### 3. WLAN-Zugangsdaten eintragen
 
-Dafür ist **kein Kartenleser nötig** — der Stick ist ja selbst ein USB-Laufwerk:
+**Der einfache Weg: über das eigene WLAN des Sticks.** Kennt der Stick kein Netz oder
+erreicht er keins, spannt er ein eigenes WLAN namens `scanstick-XXXX` auf (offen; XXXX steht
+auch im Display). Handy oder Rechner damit verbinden — die Einrichtungsseite öffnet sich von
+selbst, wie bei einem Hotel-WLAN, sonst `http://192.168.4.1/` aufrufen. Dort Netz aus der
+Liste wählen, Passwort, Empfängeradresse, optional Geräteschlüssel und Web-Passwort eintragen,
+speichern. Der Stick startet neu und ist danach im Heimnetz unter `http://scanstick-XXXX.local/`
+erreichbar. Weitere Netze lassen sich später in den Einstellungen hinzufügen oder entfernen.
+
+**Der zweite Weg: eine Datei auf der Karte.** Auch dafür ist **kein Kartenleser nötig** — der
+Stick ist ja selbst ein USB-Laufwerk:
 
 1. Stick in den Computer stecken, es erscheint ein Laufwerk namens **SCANS**
 2. darauf eine Textdatei **`wifi.cfg`** anlegen (Vorlage: `wifi.cfg.beispiel`):
@@ -133,9 +142,6 @@ fehlt oder unlesbar ist — sonst hätte man genau dann keine Diagnose, wenn man
 braucht. Die Datei bleibt liegen. Übernommen wird sie nur, wenn sich ihr Inhalt seit dem
 letzten Mal **geändert** hat; sonst gelten die Werte aus dem Flash, also auch alles, was in
 der Weboberfläche eingestellt wurde. Zum Ändern des Netzes genügt es, sie zu überschreiben.
-
-> Einen Einrichtungsassistenten über ein eigenes WLAN des Sticks gibt es noch nicht,
-> siehe [Offene Punkte](#offene-punkte).
 
 ### 4. In den Drucker
 
@@ -436,9 +442,6 @@ sudo systemctl enable --now scan-receiver
 
 ## Offene Punkte
 
-- **Einrichtungsassistent**: Sind keine Zugangsdaten hinterlegt, soll der Stick ein
-  eigenes WLAN aufspannen, in dem man Netz und Ziel im Browser einträgt — dann braucht
-  es gar keine Datei mehr
 - Selbsttätiger Wechsel des Zugangspunkts, wenn der Empfang längere Zeit schwach bleibt
   (bei komplettem Ausfall sucht er nach zwei Minuten neu; bei nur schwachem Empfang noch nicht)
 - Auch andere Dateitypen als PDF auf Vollständigkeit prüfen

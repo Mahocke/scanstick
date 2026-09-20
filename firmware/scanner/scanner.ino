@@ -31,6 +31,7 @@
 #include <functional>
 #include "mbedtls/md.h"
 #include "tusb.h"
+#include "esp_mac.h"
 
 #define SD_D0  14
 #define SD_D1  17
@@ -377,7 +378,7 @@ static WiFiMulti g_wifiMulti;
 static String geraeteName()
 {
     uint8_t mac[6];
-    WiFi.macAddress(mac);
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);   // aus dem Chip, nicht vom Treiber: der liefert vor dem WLAN-Start nur Nullen
     char t[24];
     snprintf(t, sizeof t, "scanstick-%02x%02x", mac[4], mac[5]);
     return String(t);
@@ -1650,7 +1651,7 @@ static void cfgAusNvs()
     // Netze als Zeilen "ssid<TAB>pass". Aeltere Staende kennen nur ssid/pass.
     String netze = g_nvs.getString("netze", "");
     cfgNetze = 0;
-    if (netze.isEmpty()) {
+    if (netze.isEmpty() && !g_nvs.isKey("netze")) {   // nur wenn es die Liste noch nie gab: alte Einzelwerte
         String s = g_nvs.getString("ssid", "");
         if (s.length()) { cfgNetzSsid[0] = s; cfgNetzPass[0] = g_nvs.getString("pass", ""); cfgNetze = 1; }
     } else {
@@ -1693,6 +1694,7 @@ static void cfgNachNvs()
     String netze;
     for (int i = 0; i < cfgNetze; i++) netze += cfgNetzSsid[i] + "\t" + cfgNetzPass[i] + "\n";
     g_nvs.putString("netze", netze);
+    g_nvs.remove("ssid"); g_nvs.remove("pass");   // alte Einzelwerte: sonst kehrt ein entferntes Netz zurueck
     g_nvs.putString("endpoint", cfgEndpoint);
     g_nvs.putString("webpass", cfgWebPass);
     g_nvs.putString("praefix", cfgPraefix);
@@ -3005,7 +3007,7 @@ void setup()
     delay(300);
     Serial.println("\n=== Scan-Stick " FW_VERSION " ===");
     g_startGrund = resetGrund();
-    logZeile(String("[boot] " FW_VERSION ", Grund: ") + g_startGrund);
+    logZeile(String("[boot] " FW_VERSION ", Grund: ") + g_startGrund + ", Geraet " + geraeteName());
 
     ledInit();
     ledColor(60, 60, 60);   // WEISS = Strom da, bootet
