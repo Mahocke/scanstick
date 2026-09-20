@@ -336,7 +336,7 @@ static volatile uint32_t g_bytesGeschrieben = 0;   // seit dem letzten Verarbeit
 static uint32_t g_naechsterVersuch = 0;   // 0 = sofort faellig
 static int      g_versuche         = 0;
 
-#define FW_VERSION "v21"
+#define FW_VERSION "v22"
 
 String cfgEndpoint;
 // Bekannte WLAN-Netze - mehrere, damit derselbe Stick an verschiedenen Standorten
@@ -1759,9 +1759,19 @@ void loop()
         if (!g_wlanVerloren) g_wlanVerloren = millis() ? millis() : 1;
         else if (millis() - g_wlanVerloren > WLAN_NEUSUCHE) {
             logZeile("[wifi] zwei Minuten ohne Netz - suche neu");
+            // Erst die alte Verbindung aufgeben: solange der Treiber noch am
+            // verschwundenen Zugangspunkt haengt und wiederverbinden will, kommt
+            // der Suchlauf gar nicht zustande (im Test: "kein Netz" nach 3 ms,
+            // erst der zweite Anlauf zwei Minuten spaeter fand das Heimnetz).
+            WiFi.disconnect(false, false);
+            delay(200);
             g_wlanVerloren = 0;
             wlanStarten();
-            if (WiFi.status() != WL_CONNECTED) g_wlanVerloren = millis() ? millis() : 1;
+            if (WiFi.status() != WL_CONNECTED) {
+                // Fehlschlag: nicht wieder zwei Minuten warten, in 30 s nochmal
+                uint32_t jetzt = millis() ? millis() : 1;
+                g_wlanVerloren = jetzt - (WLAN_NEUSUCHE - 30000);
+            }
         }
     }
     if (WiFi.status() == WL_CONNECTED && !g_webAn) { webStarten(); zeitHolen(); }

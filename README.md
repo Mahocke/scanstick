@@ -90,6 +90,11 @@ Mehrere Netze sind erlaubt, bis zu vier: Jede `ssid=`-Zeile beginnt ein neues Ne
 folgende `pass=` gehört dazu. Beim Suchlauf gewinnt über alle bekannten Netze hinweg der
 stärkste Zugangspunkt, so läuft derselbe Stick an mehreren Standorten oder am Hotspot.
 
+**Nur 2,4 GHz.** Der ESP32 sieht keine 5-GHz-Netze. Ein iPhone-Hotspot sendet standardmäßig
+auf 5 GHz und bleibt für den Stick unsichtbar, ohne jede Fehlermeldung; erst mit
+*Kompatibilität maximieren* in den Hotspot-Einstellungen wechselt er auf 2,4 GHz. Bei
+Dual-Band-Routern muss das Netz ebenfalls auf 2,4 GHz sichtbar sein.
+
 ```
 ssid=Buero
 pass=geheim1
