@@ -42,6 +42,7 @@
 // Builder erzeugt Prototypen vor der ersten Funktion und muss die Typen dort kennen.
 struct RohEintrag { uint32_t start; uint32_t groesse; char name[64]; };
 struct Fertig { uint32_t start, groesse, kennzahl; char name[40]; };
+struct KartenBefund { int fatAbweichungen, kreuz, verwaist, gekuerzt; bool schmutzig, heillos, geaendert, zuGross; };
 
 #define IDLE_VORGABE  45000    // Ruhe bis "Scan fertig" - Vorgabe, per Weboberflaeche aenderbar
 static uint32_t g_idleMs   = IDLE_VORGABE;   // Ruhefrist, aus dem Flash
@@ -359,7 +360,7 @@ static volatile uint32_t g_bytesGeschrieben = 0;   // seit dem letzten Verarbeit
 static uint32_t g_naechsterVersuch = 0;   // 0 = sofort faellig
 static int      g_versuche         = 0;
 
-#define FW_VERSION "v31"
+#define FW_VERSION "v32"
 
 String cfgEndpoint;
 // Bekannte WLAN-Netze - mehrere, damit derselbe Stick an verschiedenen Standorten
@@ -403,6 +404,7 @@ static volatile uint32_t g_usbFehlerLesen = 0, g_usbFehlerSchreiben = 0;
 static volatile uint32_t g_usbFehlerLba = 0, g_usbFehlerZeit = 0;
 static uint32_t          g_usbFehlerGemeldet = 0;
 static void logZeile(const String &msg);     // steht weiter unten
+static bool remount();                       // ebenfalls
 static void logFlushNetz();                  // ebenfalls
 
 static int32_t onWrite(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize)
@@ -629,8 +631,14 @@ struct FatLage {
     uint32_t fatStart;
     uint32_t ersterDatenSektor;
     uint32_t rootCluster;
+    uint32_t partStart;        // fuer die Selbstpruefung und das Formatieren
+    uint32_t partSektoren;
+    uint32_t fatSektoren;
+    uint8_t  anzahlFats;
+    uint32_t gesamtCluster;    // Datencluster (Nummern 2 .. gesamt+1)
+    uint16_t fsInfoSektor;
 };
-static FatLage g_fat = { false, 0, 0, 0, 0 };
+static FatLage g_fat = { false, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 
 static uint32_t le32(const uint8_t *d)
 {
@@ -643,24 +651,36 @@ static void fatLageLesen()
     uint8_t *s = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
     if (!s) return;
 
-    uint32_t partStart = 0;
-    if (SD_MMC.readRAW(s, 0) && s[510] == 0x55 && s[511] == 0xAA)
-        partStart = le32(s + 446 + 8);          // Startsektor der ersten Partition
+    uint32_t partStart = 0, partSektoren = 0;
+    if (SD_MMC.readRAW(s, 0) && s[510] == 0x55 && s[511] == 0xAA) {
+        partStart    = le32(s + 446 + 8);       // Startsektor der ersten Partition
+        partSektoren = le32(s + 446 + 12);
+    }
     if (!SD_MMC.readRAW(s, partStart)) { free(s); return; }
 
     uint16_t bytesProSektor = (uint16_t)s[11] | ((uint16_t)s[12] << 8);
     uint8_t  spc            = s[13];
     uint16_t reserviert     = (uint16_t)s[14] | ((uint16_t)s[15] << 8);
     uint8_t  anzahlFats     = s[16];
+    uint32_t sektoren       = le32(s + 32);
     uint32_t fatGroesse     = le32(s + 36);
     uint32_t rootCluster    = le32(s + 44);
+    uint16_t fsInfo         = (uint16_t)s[48] | ((uint16_t)s[49] << 8);
+    bool     signatur       = s[510] == 0x55 && s[511] == 0xAA;
     free(s);
 
-    if (bytesProSektor != 512 || !spc || !fatGroesse || rootCluster < 2) return;
+    if (!signatur || bytesProSektor != 512 || !spc || !fatGroesse || rootCluster < 2 || !anzahlFats) return;
     g_fat.sektorenProCluster = spc;
     g_fat.fatStart           = partStart + reserviert;
     g_fat.ersterDatenSektor  = partStart + reserviert + (uint32_t)anzahlFats * fatGroesse;
     g_fat.rootCluster        = rootCluster;
+    g_fat.partStart          = partStart;
+    g_fat.partSektoren       = partSektoren ? partSektoren : sektoren;
+    g_fat.fatSektoren        = fatGroesse;
+    g_fat.anzahlFats         = anzahlFats;
+    g_fat.fsInfoSektor       = fsInfo;
+    uint32_t daten = sektoren > reserviert + anzahlFats * fatGroesse ? sektoren - reserviert - anzahlFats * fatGroesse : 0;
+    g_fat.gesamtCluster      = daten / spc;
     g_fat.gueltig            = true;
 }
 
@@ -1111,13 +1131,25 @@ static void geloeschtMerken(const Fertig &f)
 }
 
 // Liegt in der Wurzel ein Scan, der weder gesendet noch als Geist bekannt ist?
+// Liegt in der Wurzel etwas, das noch zu senden ist? Geister zaehlen nicht:
+// Eintraege auf freie Bloecke oder auf die Bloecke eines anderen Eintrags sind
+// Sache des Aufraeumfensters - sonst drehte sich der Waechter an ihnen im Kreis.
 static bool rohOffen()
 {
     RohEintrag liste[MAX_FUND];
     int n = rohListe(0, liste, MAX_FUND, true);
-    for (int i = 0; i < n; i++)
-        if (fertigIndex(liste[i].start, liste[i].groesse) < 0 && !istGeloescht(liste[i].start, liste[i].groesse)) return true;
-    return false;
+    uint8_t *fatBuf = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
+    bool offen = false;
+    for (int i = 0; i < n && !offen; i++) {
+        RohEintrag &e = liste[i];
+        if (fertigIndex(e.start, e.groesse) >= 0 || istGeloescht(e.start, e.groesse)) continue;
+        if (e.start < 2 || (fatBuf && fatNaechster(e.start, fatBuf) == 0)) continue;
+        bool geteilt = false;
+        for (int k = 0; k < n; k++) if (k != i && liste[k].start == e.start) geteilt = true;
+        if (!geteilt) offen = true;
+    }
+    if (fatBuf) free(fatBuf);
+    return offen;
 }
 
 // Was in der Wurzel noch NICHT gesendet ist - fuer die Anzeige.
@@ -1131,6 +1163,310 @@ static void rohOffenSumme(int &anzahl, uint32_t &summe)
             anzahl++;
             summe += liste[i].groesse;
         }
+}
+
+
+// ---- Selbstpruefung der Karte: ein kleines fsck auf den rohen Sektoren ----
+// Der 780 schreibt seine alte Verzeichnissicht zurueck und bricht Jobs ab. Was
+// dabei liegen bleibt - doppelt belegte Bloecke, verwaiste Ketten, zu kurze
+// Ketten, die Schmutzmarke - liess ihn am 20.09.2026 die Karte ganz ablehnen
+// ("USB-Stick anschliessen"). Laeuft nur, wenn der Drucker die Karte nicht
+// sieht: beim Start vor dem Anmelden und im Aufraeumfenster.
+static KartenBefund g_befund = {};
+static uint32_t     g_befundZeit = 0;
+static int          g_heillosFolge = 0;
+
+static inline bool bitDa(const uint8_t *bits, uint32_t c) { return bits[c >> 3] & (1 << (c & 7)); }
+static inline void bitSetzen(uint8_t *bits, uint32_t c)   { bits[c >> 3] |= (1 << (c & 7)); }
+static inline void bitLoeschen(uint8_t *bits, uint32_t c) { bits[c >> 3] &= ~(1 << (c & 7)); }
+
+// Einen Tabelleneintrag in beide Tabellen schreiben (obere 4 Bit bleiben)
+static bool fatSetzen(uint32_t c, uint32_t wert, uint8_t *fatBuf)
+{
+    uint32_t versatz = c * 4, sek = versatz / 512, off = versatz % 512;
+    if (!SD_MMC.readRAW(fatBuf, g_fat.fatStart + sek)) return false;
+    fatBuf[off] = wert & 0xFF; fatBuf[off + 1] = (wert >> 8) & 0xFF; fatBuf[off + 2] = (wert >> 16) & 0xFF;
+    fatBuf[off + 3] = (fatBuf[off + 3] & 0xF0) | ((wert >> 24) & 0x0F);
+    bool ok = SD_MMC.writeRAW(fatBuf, g_fat.fatStart + sek);
+    if (ok && g_fat.anzahlFats > 1) ok = SD_MMC.writeRAW(fatBuf, g_fat.fatStart + g_fat.fatSektoren + sek);
+    return ok;
+}
+
+// Kette ab 'start' in der Belegungskarte markieren. sollCluster > 0: so lang darf
+// die Datei hoechstens sein, dahinter wird die Kette abgeschnitten. Liefert die
+// Anzahl markierter Cluster. kreuz: ein Cluster gehoerte schon jemand anderem.
+// kaputt: die Kette lief ins Leere oder war zu lang (bei 'heilen' repariert).
+static uint32_t ketteMarkieren(uint32_t start, uint32_t sollCluster, uint8_t *bits, uint8_t *fatBuf,
+                               bool heilen, bool &kreuz, bool &kaputt)
+{
+    kreuz = false; kaputt = false;
+    uint32_t n = 0, c = start, vorher = 0;
+    while (c >= 2 && c < g_fat.gesamtCluster + 2) {
+        if (bitDa(bits, c)) { kreuz = true; return n; }
+        bitSetzen(bits, c);
+        n++;
+        vorher = c;
+        uint32_t next = fatNaechster(c, fatBuf);
+        if (sollCluster && n == sollCluster) {
+            if (next < 0x0FFFFFF8) { kaputt = true; if (heilen) fatSetzen(c, 0x0FFFFFFF, fatBuf); }
+            return n;
+        }
+        if (n > g_fat.gesamtCluster) { kaputt = true; break; }
+        c = next;
+    }
+    if (c >= 0x0FFFFFF8) return n;                 // sauberes Ende
+    kaputt = true;                                  // 0, reserviert oder ausserhalb
+    if (heilen && vorher) fatSetzen(vorher, 0x0FFFFFFF, fatBuf);
+    return n;
+}
+
+static void ketteEntmarkieren(uint32_t start, uint32_t n, uint8_t *bits, uint8_t *fatBuf)
+{
+    uint32_t c = start;
+    for (uint32_t i = 0; i < n && c >= 2 && c < g_fat.gesamtCluster + 2; i++) {
+        bitLoeschen(bits, c);
+        c = fatNaechster(c, fatBuf);
+    }
+}
+
+// Ein Verzeichnis ablaufen: jede Datei und jeden Unterordner markieren, Schaeden
+// zaehlen und bei 'heilen' beheben. Bei Doppelbelegung gewinnt der zuerst
+// gefundene Eintrag - die Wurzel, also die Datei des Druckers, kommt zuerst.
+static bool pruefeVerzeichnis(uint32_t dirCluster, int tiefe, uint8_t *bits, uint8_t *sek, uint8_t *fatBuf,
+                              bool heilen, KartenBefund &b)
+{
+    if (tiefe > 3) return true;
+    uint32_t clusterBytes = (uint32_t)g_fat.sektorenProCluster * 512;
+    uint32_t lfnSektor[20]; int lfnOffset[20]; int lfnN = 0;
+    uint32_t cl = dirCluster;
+    for (int schutz = 0; cl >= 2 && cl < 0x0FFFFFF8 && schutz < 1024; schutz++) {
+        for (uint8_t i = 0; i < g_fat.sektorenProCluster; i++) {
+            uint32_t sektor = clusterSektor(cl) + i;
+            if (!SD_MMC.readRAW(sek, sektor)) return false;
+            bool geaendert = false;
+            for (int e = 0; e < 512; e += 32) {
+                uint8_t *d = sek + e;
+                if (d[0] == 0x00) { if (geaendert) SD_MMC.writeRAW(sek, sektor); return true; }
+                if (d[0] == 0xE5) { lfnN = 0; continue; }
+                if (d[11] == 0x0F) { if (lfnN < 20) { lfnSektor[lfnN] = sektor; lfnOffset[lfnN] = e; lfnN++; } continue; }
+                if ((d[11] & 0x08) || d[0] == '.') { lfnN = 0; continue; }   // Datentraegername, . und ..
+                uint32_t start = eintragCluster(d), groesse = le32(d + 28);
+                bool istOrdner = d[11] & 0x10;
+                if (start < 2) { lfnN = 0; continue; }                        // leere Datei
+                bool kreuz, kaputt;
+                uint32_t soll = istOrdner ? 0 : (groesse + clusterBytes - 1) / clusterBytes;
+                uint32_t n = ketteMarkieren(start, soll, bits, fatBuf, heilen, kreuz, kaputt);
+                if (kreuz) {
+                    b.kreuz++;
+                    if (heilen) {
+                        ketteEntmarkieren(start, n, bits, fatBuf);   // was frei bleibt, raeumt der Waisenlauf
+                        d[0] = 0xE5;
+                        for (int k = 0; k < lfnN; k++) {
+                            if (lfnSektor[k] == sektor) { sek[lfnOffset[k]] = 0xE5; continue; }
+                            bool schon = false;
+                            for (int m = 0; m < k; m++) if (lfnSektor[m] == lfnSektor[k]) schon = true;
+                            if (schon || !SD_MMC.readRAW(fatBuf, lfnSektor[k])) continue;
+                            for (int m = 0; m < lfnN; m++) if (lfnSektor[m] == lfnSektor[k]) fatBuf[lfnOffset[m]] = 0xE5;
+                            SD_MMC.writeRAW(fatBuf, lfnSektor[k]);
+                        }
+                        geaendert = true;
+                        b.geaendert = true;
+                    }
+                } else {
+                    if (kaputt) { b.gekuerzt++; if (heilen) b.geaendert = true; }
+                    if (!istOrdner && n < soll) {                                // Kette kuerzer als die Groesse
+                        if (!kaputt) b.gekuerzt++;
+                        if (heilen) {
+                            uint32_t neu = n * clusterBytes;
+                            d[28] = neu & 0xFF; d[29] = (neu >> 8) & 0xFF; d[30] = (neu >> 16) & 0xFF; d[31] = (neu >> 24) & 0xFF;
+                            geaendert = true;
+                            b.geaendert = true;
+                        }
+                    }
+                    if (istOrdner) {
+                        if (geaendert) { SD_MMC.writeRAW(sek, sektor); geaendert = false; }
+                        if (!pruefeVerzeichnis(start, tiefe + 1, bits, sek, fatBuf, heilen, b)) return false;
+                        if (!SD_MMC.readRAW(sek, sektor)) return false;
+                    }
+                }
+                lfnN = 0;
+            }
+            if (geaendert) SD_MMC.writeRAW(sek, sektor);
+        }
+        cl = fatNaechster(cl, fatBuf);
+    }
+    return true;
+}
+
+static String befundText(const KartenBefund &b)
+{
+    if (b.zuGross) return "Partition zu gross fuer die Pruefung";
+    if (b.heillos) return "Dateisystem nicht lesbar";
+    String t;
+    if (b.fatAbweichungen) t += String(b.fatAbweichungen) + " Tabellensektor(en) abweichend, ";
+    if (b.kreuz)           t += String(b.kreuz) + " Kreuzverkettung(en), ";
+    if (b.verwaist)        t += String(b.verwaist) + " verwaiste Cluster, ";
+    if (b.gekuerzt)        t += String(b.gekuerzt) + " Kette(n) gekuerzt, ";
+    if (b.schmutzig)       t += "Schmutzmarke, ";
+    if (t.isEmpty()) return "in Ordnung";
+    t.remove(t.length() - 2);
+    return t + (b.geaendert ? " - behoben" : "");
+}
+
+// Die eigentliche Pruefung. Nur aufrufen, wenn der Host die Karte nicht sieht.
+static void kartePruefen(bool heilen, const char *anlass)
+{
+    uint32_t t0 = millis();
+    KartenBefund b = {};
+    g_fat.gueltig = false;
+    fatLageLesen();
+    if (!g_fat.gueltig || g_fat.gesamtCluster < 16) {
+        b.heillos = true;
+        g_heillosFolge++;
+        g_befund = b; g_befundZeit = millis();
+        logZeile(String("[karte] ") + anlass + ": Dateisystem nicht lesbar (" + g_heillosFolge + ". Mal in Folge)");
+        return;
+    }
+    uint32_t bytes = (g_fat.gesamtCluster + 2 + 7) / 8;
+    if (bytes > 65536) {
+        b.zuGross = true;
+        g_befund = b; g_befundZeit = millis();
+        logZeile(String("[karte] ") + anlass + ": " + g_fat.gesamtCluster + " Cluster - zu gross fuer die Pruefung, Partition kleiner machen");
+        return;
+    }
+    uint8_t *bits   = (uint8_t *)calloc(bytes, 1);
+    uint8_t *sek    = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
+    uint8_t *fatBuf = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
+    if (!bits || !sek || !fatBuf) {
+        if (bits) free(bits); if (sek) free(sek); if (fatBuf) free(fatBuf);
+        logZeile("[karte] kein Speicher fuer die Pruefung");
+        return;
+    }
+
+    // 1. Beide Tabellen vergleichen - die erste gilt
+    if (g_fat.anzahlFats > 1) {
+        for (uint32_t x = 0; x < g_fat.fatSektoren; x++) {
+            if (!SD_MMC.readRAW(sek, g_fat.fatStart + x) || !SD_MMC.readRAW(fatBuf, g_fat.fatStart + g_fat.fatSektoren + x)) break;
+            if (memcmp(sek, fatBuf, 512)) {
+                b.fatAbweichungen++;
+                if (heilen && SD_MMC.writeRAW(sek, g_fat.fatStart + g_fat.fatSektoren + x)) b.geaendert = true;
+            }
+        }
+    }
+
+    // 2. Wurzel und alles darunter ablaufen
+    bool kreuz, kaputt;
+    ketteMarkieren(g_fat.rootCluster, 0, bits, fatBuf, heilen, kreuz, kaputt);
+    if (kaputt) { b.gekuerzt++; if (heilen) b.geaendert = true; }
+    if (!pruefeVerzeichnis(g_fat.rootCluster, 0, bits, sek, fatBuf, heilen, b)) b.heillos = true;
+
+    // 3. Verwaiste Cluster: belegt, aber von niemandem erreicht
+    if (!b.heillos) {
+        for (uint32_t x = 0; x < g_fat.fatSektoren; x++) {
+            if (!SD_MMC.readRAW(sek, g_fat.fatStart + x)) break;
+            bool geaendert = false;
+            for (int j = 0; j < 128; j++) {
+                uint32_t c = x * 128 + j;
+                if (c < 2 || c >= g_fat.gesamtCluster + 2) continue;
+                if ((le32(sek + j * 4) & 0x0FFFFFFF) == 0 || bitDa(bits, c)) continue;
+                b.verwaist++;
+                if (heilen) { sek[j * 4] = 0; sek[j * 4 + 1] = 0; sek[j * 4 + 2] = 0; sek[j * 4 + 3] &= 0xF0; geaendert = true; }
+            }
+            if (geaendert) {
+                if (SD_MMC.writeRAW(sek, g_fat.fatStart + x)) b.geaendert = true;
+                if (g_fat.anzahlFats > 1) SD_MMC.writeRAW(sek, g_fat.fatStart + g_fat.fatSektoren + x);
+            }
+        }
+        // Freizaehler im FSInfo-Sektor stimmt dann nicht mehr: als "unbekannt" markieren
+        if (b.verwaist && heilen && g_fat.fsInfoSektor && SD_MMC.readRAW(sek, g_fat.partStart + g_fat.fsInfoSektor) &&
+            le32(sek) == 0x41615252) {
+            memset(sek + 488, 0xFF, 8);
+            SD_MMC.writeRAW(sek, g_fat.partStart + g_fat.fsInfoSektor);
+        }
+    }
+
+    // 4. Schmutzmarke: Bit 27 "sauber ausgehaengt", Bit 26 "keine Fehler" im zweiten Eintrag
+    if (!b.heillos && SD_MMC.readRAW(sek, g_fat.fatStart)) {
+        uint32_t v = le32(sek + 4);
+        if ((v & 0x0C000000) != 0x0C000000) {
+            b.schmutzig = true;
+            if (heilen) {
+                v |= 0x0C000000;
+                sek[4] = v & 0xFF; sek[5] = (v >> 8) & 0xFF; sek[6] = (v >> 16) & 0xFF; sek[7] = (v >> 24) & 0xFF;
+                if (SD_MMC.writeRAW(sek, g_fat.fatStart)) b.geaendert = true;
+                if (g_fat.anzahlFats > 1) SD_MMC.writeRAW(sek, g_fat.fatStart + g_fat.fatSektoren);
+            }
+        }
+    }
+
+    g_heillosFolge = b.heillos ? g_heillosFolge + 1 : 0;
+    g_befund = b; g_befundZeit = millis();
+    logZeile(String("[karte] ") + anlass + ", " + (millis() - t0) + " ms: " + befundText(b));
+    free(bits); free(sek); free(fatBuf);
+}
+
+// Letzte Stufe: die Partition frisch als FAT32 anlegen (32-kB-Cluster wie
+// mkfs.vfat -s 64). Nur, wenn nichts Ungesendetes mehr drauf ist - die
+// Einstellungen liegen im Flash, auf der Karte geht nichts verloren, was nicht
+// schon beim Empfaenger waere.
+static bool karteFormatieren(const char *anlass)
+{
+    uint8_t *s = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
+    if (!s) return false;
+    uint32_t partStart = 0, partSektoren = 0;
+    if (SD_MMC.readRAW(s, 0) && s[510] == 0x55 && s[511] == 0xAA) {
+        partStart = le32(s + 446 + 8); partSektoren = le32(s + 446 + 12);
+    }
+    uint32_t karte = SD_MMC.sectorSize() ? (uint32_t)(SD_MMC.cardSize() / SD_MMC.sectorSize()) : 0;
+    if (!partStart || !partSektoren || partStart + partSektoren > karte) { free(s); logZeile("[karte] Formatieren: keine brauchbare Partition"); return false; }
+    const uint8_t spc = 64; const uint16_t rsv = 32; const uint8_t nfat = 2;
+    uint32_t fatSek = 0;
+    for (int i = 0; i < 4; i++) {                     // Tabellengroesse einpendeln
+        uint32_t cl = (partSektoren - rsv - nfat * fatSek) / spc;
+        fatSek = ((cl + 2) * 4 + 511) / 512;
+    }
+    uint32_t cluster = (partSektoren - rsv - nfat * fatSek) / spc;
+    if (cluster < 65525) { free(s); logZeile("[karte] Formatieren: Partition zu klein fuer FAT32"); return false; }
+    logZeile(String("[karte] formatiere (") + anlass + "): " + (partSektoren / 2048) + " MB, " + cluster + " Cluster");
+    uint32_t t0 = millis();
+    bool ok = true;
+    // Tabellen leeren
+    memset(s, 0, 512);
+    for (uint32_t x = 0; x < nfat * fatSek && ok; x++) ok = SD_MMC.writeRAW(s, partStart + rsv + x);
+    // Wurzel leeren (ein Cluster)
+    for (uint32_t x = 0; x < spc && ok; x++) ok = SD_MMC.writeRAW(s, partStart + rsv + nfat * fatSek + x);
+    // Ersten Tabellensektor: Medienbyte, sauber-Marken, Wurzel-Ende
+    const uint8_t kopf[12] = { 0xF8, 0xFF, 0xFF, 0x0F, 0xFF, 0xFF, 0xFF, 0x0F, 0xFF, 0xFF, 0xFF, 0x0F };
+    memset(s, 0, 512); memcpy(s, kopf, 12);
+    for (int f = 0; f < nfat && ok; f++) ok = SD_MMC.writeRAW(s, partStart + rsv + f * fatSek);
+    // Bootsektor
+    memset(s, 0, 512);
+    const uint8_t bs[] = { 0xEB, 0x58, 0x90, 'M','S','W','I','N','4','.','1' };
+    memcpy(s, bs, sizeof(bs));
+    s[11] = 0x00; s[12] = 0x02; s[13] = spc; s[14] = rsv & 0xFF; s[15] = rsv >> 8; s[16] = nfat;
+    s[21] = 0xF8; s[24] = 32; s[26] = 64;
+    uint32_t v = partStart;    memcpy(s + 28, &v, 4);
+    v = partSektoren;          memcpy(s + 32, &v, 4);
+    v = fatSek;                memcpy(s + 36, &v, 4);
+    v = 2;                     memcpy(s + 44, &v, 4);
+    s[48] = 1; s[50] = 6; s[64] = 0x80; s[66] = 0x29;
+    v = esp_random();          memcpy(s + 67, &v, 4);
+    memcpy(s + 71, "SCANS      ", 11); memcpy(s + 82, "FAT32   ", 8);
+    s[510] = 0x55; s[511] = 0xAA;
+    if (ok) ok = SD_MMC.writeRAW(s, partStart) && SD_MMC.writeRAW(s, partStart + 6);
+    // FSInfo
+    memset(s, 0, 512);
+    v = 0x41615252; memcpy(s, &v, 4);
+    v = 0x61417272; memcpy(s + 484, &v, 4);
+    v = cluster - 1; memcpy(s + 488, &v, 4);
+    v = 3;           memcpy(s + 492, &v, 4);
+    s[510] = 0x55; s[511] = 0xAA;
+    if (ok) ok = SD_MMC.writeRAW(s, partStart + 1) && SD_MMC.writeRAW(s, partStart + 7);
+    free(s);
+    g_fat.gueltig = false;
+    g_fertigAnzahl = 0; g_geloeschtAnzahl = 0; fertigSpeichern();
+    logZeile(String("[karte] formatiert in ") + (millis() - t0) + " ms" + (ok ? "" : " - MIT FEHLERN"));
+    return ok;
 }
 
 #define AUFRAEUM_VORGABE 3           // Minuten ohne Zugriff des Druckers (der 780 fasst den Stick zwischen Jobs gar nicht an)
@@ -1698,6 +2034,12 @@ static void webStatus()
         String fehler = String((uint32_t)g_usbFehlerLesen) + " lesen, " + String((uint32_t)g_usbFehlerSchreiben) + " schreiben";
         if (g_usbFehlerZeit) fehler += " <small>(zuletzt vor " + dauer(millis() - g_usbFehlerZeit) + ", Sektor " + String((uint32_t)g_usbFehlerLba) + ")</small>";
         h += zl("Abgewiesene Host-Zugriffe", (g_usbFehlerLesen || g_usbFehlerSchreiben) ? "<span class=warn>" + fehler + "</span>" : "keine");
+        if (g_befundZeit) {
+            String t = befundText(g_befund);
+            bool schlecht = g_befund.heillos || g_befund.zuGross || (t != "in Ordnung" && !g_befund.geaendert);
+            h += zl("Kartenpruefung", String(schlecht ? "<span class=bad>" : "") + t + (schlecht ? "</span>" : "") +
+                    " <small>(vor " + dauer(millis() - g_befundZeit) + ")</small>");
+        }
     }
     h += zl("Laufzeit", dauer(millis()));
     h += zl("Letzter Startgrund", g_startGrund);
@@ -2021,6 +2363,17 @@ static void webStarten()
     // als Bild-Adresse unterschieben, ein POST nicht ohne Origin-Kopfzeile.
     g_web.on("/jetzt-schauen", HTTP_POST, webJetztSchauen);
     g_web.on("/neustart", HTTP_POST, webNeustart);
+    g_web.on("/formatieren", HTTP_POST, []() {
+        if (!webAuth() || !herkunftPruefen()) return;
+        if (g_dirty || rohOffen()) { g_web.send(409, "text/plain", "Es liegt noch etwas Ungesendetes auf der Karte"); return; }
+        if (!karteUebernehmen()) { g_web.send(503, "text/plain", "Der Host laesst die Karte nicht los"); return; }
+        bool ok = karteFormatieren("auf Knopfdruck");
+        remount();
+        karteZurueckgeben();
+        logFlushNetz();
+        g_web.sendHeader("Location", "/");
+        g_web.send(303, "text/plain", ok ? "formatiert" : "fehlgeschlagen");
+    });
     g_web.on("/aufraeumen", HTTP_POST, []() {
         if (!webAuth() || !herkunftPruefen()) return;
         g_aufraeumJetzt = true;
@@ -2182,7 +2535,7 @@ static void verarbeiteRoh(bool manuell)
 
     RohEintrag liste[MAX_FUND];
     int n = rohListe(0, liste, MAX_FUND, true);
-    int hoch = 0, fehler = 0, bekannt = 0;
+    int hoch = 0, fehler = 0, bekannt = 0, geister = 0;
     bool wifiGeprueft = false, wifi = false;
     uint8_t *fatBuf = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
 
@@ -2191,16 +2544,19 @@ static void verarbeiteRoh(bool manuell)
         if (fertigIndex(e.start, e.groesse) >= 0) { bekannt++; continue; }
         if (istGeloescht(e.start, e.groesse)) {
             logZeile(String("[geist] ") + e.name + " ist die Wiederkehr einer weggeraeumten Datei - wartet aufs Aufraeumen");
+            geister++;
             continue;
         }
         if (e.start < 2 || fatNaechster(e.start, fatBuf) == 0) {
             logZeile(String("[geist] ") + e.name + " zeigt auf freie Bloecke - wartet aufs Aufraeumen");
+            geister++;
             continue;
         }
         bool geteilt = false;
         for (int k = 0; k < n; k++) if (k != i && liste[k].start == e.start) geteilt = true;
         if (geteilt) {
             logZeile(String("[geist] ") + e.name + " teilt Bloecke mit einem anderen Eintrag - wartet aufs Aufraeumen");
+            geister++;
             continue;
         }
         if (!rohVollstaendig(e)) {
@@ -2246,6 +2602,12 @@ static void verarbeiteRoh(bool manuell)
     }
 
     g_versuche++;
+    if (hoch == 0 && fehler == 0 && geister > 0) {
+        // Nur Geister: da kommt nichts mehr, das Aufraeumfenster erledigt sie.
+        // Ein Wiederholzyklus wuerde nur alle 30 s dieselbe Zeile schreiben.
+        logZeile(String("[scan] nur ") + geister + " Geist(er) - wartet aufs Aufraeumen");
+        g_versuche = MAX_VERSUCHE;
+    }
     if (hoch == 0 && fehler == 0) {
         if (manuell) {
             logZeile("[scan] nichts Neues");
@@ -2294,6 +2656,20 @@ static void aufraeumFenster(const String &grund)
         logZeile(String("[geist] /senden/") + g_geisterName[i] + (ok ? " ausgetragen" : " NICHT gefunden"));
     }
     g_geisterAnzahl = 0;
+
+    // Selbstpruefung: was der Drucker an Schaeden hinterlassen hat, jetzt beheben -
+    // hier sieht er die Karte nicht. Ist das Dateisystem zum zweiten Mal in Folge
+    // unlesbar, gibt es nichts mehr zu retten: neu anlegen.
+    kartePruefen(true, "im Aufraeumfenster");
+    if (g_befund.heillos && g_heillosFolge >= 2) {
+        karteFormatieren("Dateisystem zweimal in Folge unlesbar");
+        remount();
+        karteZurueckgeben();
+        g_letztesAufraeumen = millis();
+        logFlushNetz();
+        return;
+    }
+
     RohEintrag liste[MAX_FUND];
     int n = rohListe(0, liste, MAX_FUND, true);
 
@@ -2406,6 +2782,10 @@ void setup()
         cfgNachNvs();
         logZeile("[nvs] aus /wifi.cfg uebernommen");
     }
+    if (sdOk) {                          // Karte heilen, solange sie noch niemand sieht
+        kartePruefen(true, "beim Start");
+        if (g_befund.geaendert) sdOk = remount();
+    }
 
     MSC.vendorID("DIY");
     MSC.productID("ScanStick");
@@ -2479,14 +2859,20 @@ void loop()
 
     // Aufraeumen nur in Ruhe: der Drucker hat lange nichts angefasst, die
     // Merkliste wird voll, oder jemand hat den Knopf gedrueckt.
-    if (!g_dirty && g_startGeprueft && aufraeumenNoetig()) {
+    if (g_aufraeumJetzt && g_startGeprueft && millis() - g_lastHost > 5000) {
+        // Knopfdruck: der Mensch weiss, dass gerade nicht gescannt wird
+        g_aufraeumJetzt = false;
+        aufraeumFenster("auf Knopfdruck");
+        g_dirty = false;
+        g_versuche = 0;
+        g_naechsterVersuch = 0;
+    } else if (!g_dirty && g_startGeprueft && aufraeumenNoetig()) {
         uint32_t ruhe = millis() - g_lastHost;
         // Ein Fenster je Ruhephase: bleibt danach etwas liegen, das sich nicht
         // wegraeumen laesst, darf das Fenster nicht sofort wieder aufgehen -
         // erst, wenn der Drucker seitdem wieder zugegriffen hat.
         bool neuSeitdem = g_letztesAufraeumen == 0 || (int32_t)(g_lastHost - g_letztesAufraeumen) > 0;
-        if (g_aufraeumJetzt) { g_aufraeumJetzt = false; aufraeumFenster("auf Knopfdruck"); }
-        else if (neuSeitdem && ruhe > g_aufraeumMin * 60000UL) aufraeumFenster(String("Drucker seit ") + dauer(ruhe) + " ohne Zugriff");
+        if (neuSeitdem && ruhe > g_aufraeumMin * 60000UL) aufraeumFenster(String("Drucker seit ") + dauer(ruhe) + " ohne Zugriff");
         else if (neuSeitdem && g_fertigAnzahl >= MAX_FERTIG - 8 && ruhe > 60000) aufraeumFenster("Merkliste fast voll");
     }
 

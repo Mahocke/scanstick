@@ -236,6 +236,22 @@ Startblock, Größe und Kennzahl — die neue Fassung gilt damit als neu und wir
 ein Datenblock, wieder Wurzel und FAT). Die Anzeige zählt deshalb nur, was noch nicht
 gesendet ist; die Statusseite zeigt die letzten Schreibzugriffe des Hosts nach Bereich.
 
+**Der Drucker lehnt eine beschädigte Karte ab.** Nach abgebrochenen Jobs und
+zurückgeschriebenen Verzeichnissen blieben Kreuzverkettungen, verwaiste Blöcke und die
+Schmutzmarke auf der Karte — und der 780 zeigte nur noch „USB-Stick anschließen". Der
+Stick prüft die Karte deshalb selbst, beim Start (bevor der Drucker sie sieht) und im
+Aufräumfenster: beide Zuordnungstabellen abgleichen, jede Kette ablaufen, doppelt belegte
+Blöcke dem zuerst gefundenen Eintrag lassen und den zweiten austragen, Waisen freigeben, zu
+kurze Ketten kürzen, Schmutzmarke setzen. Ist das Dateisystem zweimal in Folge unlesbar,
+legt er die Partition neu an (`POST /formatieren` tut das auch auf Knopfdruck, nur wenn
+nichts Ungesendetes liegt). Das Ergebnis steht auf der Statusseite unter „Kartenprüfung".
+Der Prüfstand hat dafür Szenario E.
+
+**Nach dem Senden löschen, nicht verschieben.** Ein nach `/gesendet` verschobener Eintrag
+behält seine Blöcke. Schreibt der Drucker danach seinen alten Wurzeleintrag zurück und
+ersetzt ihn, gibt er genau diese Blöcke frei — Kreuzverkettung. Gelöschte Blöcke sind
+frei, da kann ein Geist nichts mehr anrichten. Die Kopien liegen ohnehin beim Empfänger.
+
 **Bei mehreren Zugangspunkten mit derselben Kennung** nimmt `WiFi.begin(ssid, pass)`
 den erstbesten, nicht den stärksten. Der Stick sucht deshalb vorher (`WiFiMulti`) und
 verbindet sich gezielt mit der besten Station. Die Kehrseite: Fällt genau diese Station

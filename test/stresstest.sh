@@ -12,13 +12,13 @@
 #
 #   Umgebung: SCAN_WEBPASS=...  Passwort der Weboberflaeche (Benutzer scan)
 #             SCAN_PORT=8090    Port des Test-Empfaengers
-#             SCAN_SZENARIEN=ABCD  welche Szenarien laufen
+#             SCAN_SZENARIEN=ABCD  welche Szenarien laufen (E extra: Karte beschaedigen)
 #
 # Das Upload-Ziel des Sticks wird fuer die Dauer des Tests auf diesen Rechner
 # umgestellt und am Ende zurueckgesetzt. Die Partition wird nur angefasst, wenn
 # sie zu einem Espressif-USB-Geraet gehoert und SCANS heisst.
 #
-# Drei Szenarien:
+# Szenarien:
 #   A  eine Datei
 #   B  zwei Dateien in einem Zug (der Drucker legt sie nacheinander ab)
 #   C  zweite Datei, sobald das Medium nach dem ersten Upload wieder da ist -
@@ -26,6 +26,9 @@
 #   D  fuenf Jobs Schlag auf Schlag, jeder in eigenem Einhaengen und mit den
 #      Namen des Druckers; zaehlt, wie oft das Medium gerade weg war - genau
 #      diese Jobs haette ein Drucker abgewiesen
+#   E  (nur auf Wunsch) Karte absichtlich beschaedigen - Kette laeuft in eine
+#      andere, verwaiste Cluster, Schmutzmarke - und den Stick heilen lassen;
+#      fsck muss danach sauber sein
 #
 # Der Linux-Treiber schreibt Verzeichniseintraege frueher und anders als ein
 # Drucker. Der Pruefstand ersetzt den Drucktest nicht, macht aber Regressionen
@@ -222,6 +225,72 @@ for i in 1 2 3 4 5; do
 done
 for i in 1 2 3 4 5; do [ -f "$ARBEIT/d$i.pdf" ] && warte_ankunft "$ARBEIT/d$i.pdf" 300; done
 log "  Szenario D: $VERPASST von 5 Jobs haette der Drucker abgewiesen"
+fi
+
+# ---- Szenario E: beschaedigte Karte heilen ----
+# Der Drucker hinterlaesst nach abgebrochenen Jobs und zurueckgeschriebenen
+# Verzeichnissen Kreuzverkettungen, verwaiste Cluster und die Schmutzmarke -
+# und lehnt so eine Karte irgendwann ab. Wir richten genau das an, lassen den
+# Stick aufraeumen und pruefen mit fsck, ob die Karte danach sauber ist.
+if [[ $SZENARIEN == *E* ]]; then
+log "Szenario E: Karte beschaedigen (Kreuzverkettung, Waise, Schmutzmarke) und heilen lassen"
+mach_pdf "$ARBEIT/e1.pdf" 120000
+mach_pdf "$ARBEIT/e2.pdf" 90000
+schreibe "$ARBEIT/e1.pdf" "$ARBEIT/e2.pdf"
+warte_ankunft "$ARBEIT/e1.pdf" 180
+warte_ankunft "$ARBEIT/e2.pdf" 180
+warte_medium da 60 >/dev/null
+python3 - "$DEV" <<'PY'
+import sys, struct
+dev = sys.argv[1]
+f = open(dev, "r+b")
+bs = f.read(512)
+bps, spc, rsv, nfat = struct.unpack_from("<HBHB", bs, 11)
+spf = struct.unpack_from("<I", bs, 36)[0]; root = struct.unpack_from("<I", bs, 44)[0]
+data0 = rsv + nfat * spf
+def csec(c): return data0 + (c - 2) * spc
+def fat_get(c):
+    f.seek(rsv * bps + c * 4); return struct.unpack("<I", f.read(4))[0]
+def fat_set(c, v):
+    for k in range(nfat):
+        f.seek((rsv + k * spf) * bps + c * 4); f.write(struct.pack("<I", v))
+f.seek(csec(root) * bps); d = bytearray(f.read(spc * bps))
+starts = {}
+for i in range(0, len(d), 32):
+    e = d[i:i+32]
+    if e[0] == 0: break
+    if e[0] == 0xE5 or e[11] == 0x0F or e[11] & 0x18: continue
+    name = e[:11].decode("latin1")
+    st = (struct.unpack_from("<H", e, 20)[0] << 16) | struct.unpack_from("<H", e, 26)[0]
+    starts[name] = (i, st)
+i1, s1 = starts["E1      PDF"]; i2, s2 = starts["E2      PDF"]
+# 1. Kreuzverkettung mitten in der Kette: e2 laeuft nach dem ersten Cluster in e1 hinein
+#    (die Geisterjagd sieht nur gleiche Startcluster, das hier findet erst die Selbstpruefung)
+fat_set(s2, s1)
+# 2. Waise: eine Kette, die niemandem gehoert
+w = max(s1, s2) + 40
+fat_set(w, 0x0FFFFFFF); fat_set(w + 1, 0x0FFFFFFF)
+# 3. Schmutzmarke
+fat_set(1, fat_get(1) & ~0x08000000)
+f.flush(); f.close()
+print("  angerichtet: Kette von e2 (Cluster %d) laeuft in e1 (Cluster %d), Waisen %d+%d, Schmutzmarke" % (s2, s1, w, w + 1))
+PY
+sync
+fsck.fat -n "$DEV" 2>&1 | grep -qE "share clusters|not marked|dirty" && log "  fsck sieht den Schaden" || fail "Schaden nicht angerichtet?"
+sleep 12                                   # der Stick sieht die Schreibzugriffe, findet nichts Neues
+"${CURL[@]}" -X POST "$STICK/aufraeumen" >/dev/null
+sleep 6
+warte_medium da 60 >/dev/null
+BEFUND=$("${CURL[@]}" "$STICK/log" | sed -e 's/<[^>]*>/\n/g' | grep '\[karte\] im Aufraeumfenster' | tail -1)
+log "  Stick: ${BEFUND#* }"
+printf '%s' "$BEFUND" | grep -q "Kreuzverkettung" || fail "Stick hat die Kreuzverkettung nicht gemeldet"
+printf '%s' "$BEFUND" | grep -q "verwaiste"       || fail "Stick hat die Waisen nicht gemeldet"
+printf '%s' "$BEFUND" | grep -q "Schmutzmarke"    || fail "Stick hat die Schmutzmarke nicht gemeldet"
+if fsck.fat -n "$DEV" >"$ARBEIT/fsck.txt" 2>&1 && ! grep -qE "share clusters|not marked|dirty|Truncat" "$ARBEIT/fsck.txt"; then
+    log "  fsck danach: sauber"
+else
+    fail "fsck findet nach dem Heilen noch Schaeden (siehe $ARBEIT/fsck.txt)"
+fi
 fi
 
 # ---- Bilanz ----
