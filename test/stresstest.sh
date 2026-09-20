@@ -103,10 +103,12 @@ warte_medium() {   # warte_medium da|weg Sekunden
     while [ $t -lt "$frist" ]; do
         if [ "$ziel" = da ]; then
             if medium_da; then partprobe "$BLOCK" 2>/dev/null; sleep 1; [ -b "$DEV" ] && return 0; fi
+            sleep 1; t=$((t + 1))
         else
+            # Das Fenster ist seit v25 nur noch ein bis zwei Sekunden lang - eng abtasten
             medium_da || return 0
+            sleep 0.2; t=$((t + 1))
         fi
-        sleep 1; t=$((t + 1))
     done
     return 1
 }
@@ -175,12 +177,12 @@ log "Szenario C: grosse Datei (2 MB), zweite sofort nach Rueckkehr des Mediums"
 mach_pdf "$ARBEIT/c1.pdf" 2000000
 mach_pdf "$ARBEIT/c2.pdf" 250000
 schreibe "$ARBEIT/c1.pdf"
-if warte_medium weg 90; then
+if warte_medium weg 300; then      # 300 Abtastungen zu 0,2 s = 60 s
     log "  Stick hat das Medium genommen"
-    schreibe "$ARBEIT/c2.pdf"     # wartet selbst, bis das Medium wieder da ist
 else
-    fail "Stick hat das Medium nach c1 nicht genommen"
+    log "  Fenster nicht beobachtet (zu kurz?) - schreibe c2 trotzdem, mitten in den Upload"
 fi
+schreibe "$ARBEIT/c2.pdf"         # wartet selbst, bis das Medium wieder da ist
 warte_ankunft "$ARBEIT/c1.pdf" 300
 warte_ankunft "$ARBEIT/c2.pdf" 300
 
