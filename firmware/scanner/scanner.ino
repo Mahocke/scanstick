@@ -359,7 +359,7 @@ static volatile uint32_t g_bytesGeschrieben = 0;   // seit dem letzten Verarbeit
 static uint32_t g_naechsterVersuch = 0;   // 0 = sofort faellig
 static int      g_versuche         = 0;
 
-#define FW_VERSION "v30"
+#define FW_VERSION "v31"
 
 String cfgEndpoint;
 // Bekannte WLAN-Netze - mehrere, damit derselbe Stick an verschiedenen Standorten
@@ -409,7 +409,7 @@ static int32_t onWrite(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t 
 {
     // Rueckgabe 0 heisst fuer TinyUSB "beschaeftigt, gleich nochmal" - bei einem
     // echten Kartenfehler haengt der Host damit endlos. Negativ = sauberer Fehler.
-    if (g_sdGesperrt) { g_usbFehlerSchreiben++; g_usbFehlerLba = lba; g_usbFehlerZeit = millis(); return -1; }
+    if (g_sdGesperrt) { g_usbFehlerSchreiben++; g_usbFehlerLba = lba; g_usbFehlerZeit = millis(); g_lastHost = millis(); return -1; }
     g_usbZugriffe++;
     int32_t ergebnis = -1;
     uint32_t sec = SD_MMC.sectorSize();
@@ -435,7 +435,7 @@ static int32_t onWrite(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t 
 
 static int32_t onRead(uint32_t lba, uint32_t offset, void *buffer, uint32_t bufsize)
 {
-    if (g_sdGesperrt) { g_usbFehlerLesen++; g_usbFehlerLba = lba; g_usbFehlerZeit = millis(); return -1; }
+    if (g_sdGesperrt) { g_usbFehlerLesen++; g_usbFehlerLba = lba; g_usbFehlerZeit = millis(); g_lastHost = millis(); return -1; }
     g_usbZugriffe++;
     int32_t ergebnis = -1;
     uint32_t sec = SD_MMC.sectorSize();
@@ -1133,7 +1133,7 @@ static void rohOffenSumme(int &anzahl, uint32_t &summe)
         }
 }
 
-#define AUFRAEUM_VORGABE 15          // Minuten ohne Zugriff des Druckers
+#define AUFRAEUM_VORGABE 3           // Minuten ohne Zugriff des Druckers (der 780 fasst den Stick zwischen Jobs gar nicht an)
 static uint32_t g_aufraeumMin      = AUFRAEUM_VORGABE;
 static bool     g_aufraeumJetzt    = false;
 static uint32_t g_letztesAufraeumen = 0;
@@ -2300,9 +2300,38 @@ static void aufraeumFenster(const String &grund)
     if (!remount()) { logZeile("[aufraeumen] Mount fehlgeschlagen"); karteZurueckgeben(); return; }
 
     int weg = 0;
+    // Eintraege der Merkliste, zu denen keine Datei mehr liegt: der Drucker hat die
+    // Datei ueberschrieben ("Ersetzen") oder geloescht. Sie muessen raus - sonst
+    // bleibt aufraeumenNoetig() fuer immer wahr und das Fenster lief im Kreis, alle
+    // 300 ms mit Medium weg und wieder da (am 20.09.2026 ueber eine halbe Stunde,
+    // der 780 brach den naechsten Scan dann mit "Error writing multi-page image file" ab).
+    for (int fi = g_fertigAnzahl - 1; fi >= 0; fi--) {
+        bool da = false;
+        for (int i = 0; i < n && !da; i++)
+            da = liste[i].start == g_fertig[fi].start && liste[i].groesse == g_fertig[fi].groesse;
+        if (da) continue;
+        logZeile(String("[aufraeumen] Merkliste: ") + g_fertig[fi].name + " (" + (g_fertig[fi].groesse / 1024) +
+                 " kB) liegt nicht mehr auf der Karte - Eintrag ausgetragen");
+        geloeschtMerken(g_fertig[fi]);
+        memmove(g_fertig + fi, g_fertig + fi + 1, (g_fertigAnzahl - fi - 1) * sizeof(Fertig));
+        g_fertigAnzahl--;
+    }
     for (int i = 0; i < n; i++) {
         int fi = fertigIndex(liste[i].start, liste[i].groesse);
-        if (fi < 0) continue;
+        if (fi < 0) {
+            // Nicht gesendet und keine Endmarke: ein abgebrochener Scan (Stromschnitt,
+            // Schreibfehler des Druckers). Der Drucker fragt beim naechsten Job sonst
+            // "Datei bereits vorhanden" - und nach der Ruhefrist schreibt er da sicher
+            // nicht mehr weiter.
+            if (!istGeloescht(liste[i].start, liste[i].groesse) && !rohVollstaendig(liste[i])) {
+                String pfad = "/" + String(liste[i].name);
+                bool ok = SD_MMC.remove(pfad);
+                logZeile(String("[aufraeumen] unfertige Datei ") + liste[i].name + " (" + (liste[i].groesse / 1024) +
+                         " kB, keine Endmarke) " + (ok ? "verworfen" : "liess sich nicht loeschen"));
+                if (ok) weg++;
+            }
+            continue;
+        }
         String pfad = "/" + String(liste[i].name);
         bool ok;
         if (g_loeschen) {
@@ -2346,6 +2375,7 @@ static void aufraeumFenster(const String &grund)
     g_letztesAufraeumen = millis();
     logZeile(String("[aufraeumen] ") + (millis() - t0) + " ms: " + weg + " weggeraeumt, " + geister +
              " Geister, " + g_fertigAnzahl + " gesendete liegen noch");
+    logFlushNetz();
 }
 
 void setup()
@@ -2451,9 +2481,13 @@ void loop()
     // Merkliste wird voll, oder jemand hat den Knopf gedrueckt.
     if (!g_dirty && g_startGeprueft && aufraeumenNoetig()) {
         uint32_t ruhe = millis() - g_lastHost;
+        // Ein Fenster je Ruhephase: bleibt danach etwas liegen, das sich nicht
+        // wegraeumen laesst, darf das Fenster nicht sofort wieder aufgehen -
+        // erst, wenn der Drucker seitdem wieder zugegriffen hat.
+        bool neuSeitdem = g_letztesAufraeumen == 0 || (int32_t)(g_lastHost - g_letztesAufraeumen) > 0;
         if (g_aufraeumJetzt) { g_aufraeumJetzt = false; aufraeumFenster("auf Knopfdruck"); }
-        else if (ruhe > g_aufraeumMin * 60000UL) aufraeumFenster(String("Drucker seit ") + dauer(ruhe) + " ohne Zugriff");
-        else if (g_fertigAnzahl >= MAX_FERTIG - 8 && ruhe > 60000) aufraeumFenster("Merkliste fast voll");
+        else if (neuSeitdem && ruhe > g_aufraeumMin * 60000UL) aufraeumFenster(String("Drucker seit ") + dauer(ruhe) + " ohne Zugriff");
+        else if (neuSeitdem && g_fertigAnzahl >= MAX_FERTIG - 8 && ruhe > 60000) aufraeumFenster("Merkliste fast voll");
     }
 
     if (g_stopNeu) {
@@ -2491,6 +2525,7 @@ void loop()
             g_usbFehlerGemeldet = f;
             logZeile(String("[usb] abgewiesene Host-Zugriffe: ") + (uint32_t)g_usbFehlerLesen + " lesen, " +
                      (uint32_t)g_usbFehlerSchreiben + " schreiben, zuletzt Sektor " + (uint32_t)g_usbFehlerLba);
+            logFlushNetz();
         }
     }
 
