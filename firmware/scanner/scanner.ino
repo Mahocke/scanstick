@@ -2452,7 +2452,7 @@ static void webEinstellungen()
         // An empty password field means "leave unchanged", not "protection off" -
         // otherwise a careless save switches the protection off.
         if (g_web.hasArg("webpass") && g_web.arg("webpass").length()) cfgWebPass = g_web.arg("webpass");
-        if (g_web.hasArg("passweg") && g_web.arg("passweg") == "ja") cfgWebPass = "";
+        if (g_web.hasArg("passweg") && g_web.arg("passweg") == "ja") { cfgWebPass = ""; logZeile("[web] web password removed via the settings form"); }
         if (g_web.hasArg("schluessel") && g_web.arg("schluessel").length()) cfgSchluessel = g_web.arg("schluessel");
         if (g_web.hasArg("schluesselweg") && g_web.arg("schluesselweg") == "ja") cfgSchluessel = "";
         for (int i = 0; i < Z_ANZAHL; i++) {
