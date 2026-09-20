@@ -337,7 +337,7 @@ static volatile uint32_t g_bytesGeschrieben = 0;   // seit dem letzten Verarbeit
 static uint32_t g_naechsterVersuch = 0;   // 0 = sofort faellig
 static int      g_versuche         = 0;
 
-#define FW_VERSION "v24"
+#define FW_VERSION "v25"
 
 String cfgEndpoint;
 // Bekannte WLAN-Netze - mehrere, damit derselbe Stick an verschiedenen Standorten
@@ -545,6 +545,7 @@ static void fixMbrTyp()
 // daran erkennen wir, dass eine Datei fertig ist.
 
 #define ROH_MIN_GROESSE 2048   // darunter: Hilfsdateien wie wifi.cfg, kein Scan
+#define MAX_FUND 24            // so viele Dateien je Durchlauf
 
 // Was gilt als Scan? EIN Massstab fuer den Rohleser (sieht nur den 8.3-Kurznamen)
 // und den Sammler (sieht den langen Namen). Vorher zaehlte der Rohleser jede
@@ -659,12 +660,19 @@ static bool rohVerzeichnis(int &anzahl, uint32_t &summe)
     return true;
 }
 
-// Einen Eintrag im Wurzelverzeichnis roh als geloescht markieren (erstes Byte
+// Erster Cluster eines Verzeichniseintrags (Bytes 20/21 hoch, 26/27 tief)
+static uint32_t eintragCluster(const uint8_t *d)
+{
+    return ((uint32_t)(d[20] | (d[21] << 8)) << 16) | (uint32_t)(d[26] | (d[27] << 8));
+}
+
+// Einen Eintrag in einem Verzeichnis roh als geloescht markieren (erstes Byte
 // 0xE5), OHNE die Blockzuordnung anzufassen. Lange Namen liegen in Stuecken zu
 // 13 Zeichen VOR dem Kurzeintrag, in umgekehrter Reihenfolge; auch die werden
-// markiert. Nur nach einem frischen Mount aufrufen, sonst schreibt der
-// Dateisystem-Treiber seinen gepufferten Verzeichnissektor wieder darueber.
-static bool rohEintragLoeschen(const String &name, uint32_t groesse)
+// markiert. Gesucht wird per Name (wenn angegeben) oder per Startcluster.
+// Nur bei abgemeldetem Medium und VOR dem naechsten Mount aufrufen, sonst
+// schreibt der Dateisystem-Treiber seinen gepufferten Sektor wieder darueber.
+static bool rohEintragLoeschenIn(uint32_t dirCluster, const String &name, uint32_t groesse, uint32_t startCluster)
 {
     if (!g_fat.gueltig) fatLageLesen();
     if (!g_fat.gueltig) return false;
@@ -681,7 +689,7 @@ static bool rohEintragLoeschen(const String &name, uint32_t groesse)
     bool getroffen = false, fertig = false;
     static const uint8_t pos[13] = { 1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30 };
 
-    uint32_t cl = g_fat.rootCluster;
+    uint32_t cl = dirCluster ? dirCluster : g_fat.rootCluster;
     for (int schutz = 0; !fertig && !getroffen && cl >= 2 && cl < 0x0FFFFFF8 && schutz < 128; schutz++) {
         for (uint8_t i = 0; i < g_fat.sektorenProCluster && !fertig && !getroffen; i++) {
             uint32_t sektor = clusterSektor(cl) + i;
@@ -707,7 +715,8 @@ static bool rohEintragLoeschen(const String &name, uint32_t groesse)
                     if (d[8] != ' ') { kandidat += '.'; for (int k = 8; k < 11 && d[k] != ' '; k++) kandidat += (char)d[k]; }
                 }
                 kandidat.toLowerCase();
-                if (!(d[11] & 0x18) && kandidat == ziel && le32(d + 28) == groesse) {
+                bool trifft = ziel.length() ? (kandidat == ziel) : (eintragCluster(d) == startCluster);
+                if (!(d[11] & 0x18) && trifft && le32(d + 28) == groesse) {
                     d[0] = 0xE5;
                     for (int k = 0; k < lfnAnzahl; k++) if (lfnSektor[k] == sektor) sek[lfnOffset[k]] = 0xE5;
                     getroffen = SD_MMC.writeRAW(sek, sektor);
@@ -729,6 +738,116 @@ static bool rohEintragLoeschen(const String &name, uint32_t groesse)
     free(sek);
     free(fatBuf);
     return getroffen;
+}
+
+// Cluster eines Unterordners der Wurzel, per 8.3-Name (11 Zeichen, gross,
+// mit Leerzeichen aufgefuellt). 0 = nicht vorhanden.
+static uint32_t rohOrdnerCluster(const char *name83)
+{
+    if (!g_fat.gueltig) fatLageLesen();
+    if (!g_fat.gueltig) return 0;
+    uint8_t *sek    = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
+    uint8_t *fatBuf = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
+    if (!sek || !fatBuf) { if (sek) free(sek); if (fatBuf) free(fatBuf); return 0; }
+    uint32_t ergebnis = 0;
+    bool fertig = false;
+    uint32_t cl = g_fat.rootCluster;
+    for (int schutz = 0; !fertig && !ergebnis && cl >= 2 && cl < 0x0FFFFFF8 && schutz < 128; schutz++) {
+        for (uint8_t i = 0; i < g_fat.sektorenProCluster && !fertig && !ergebnis; i++) {
+            if (!SD_MMC.readRAW(sek, clusterSektor(cl) + i)) { fertig = true; break; }
+            for (int e = 0; e < 512; e += 32) {
+                uint8_t *d = sek + e;
+                if (d[0] == 0x00) { fertig = true; break; }
+                if (d[0] == 0xE5 || d[11] == 0x0F || !(d[11] & 0x10)) continue;
+                if (!memcmp(d, name83, 11)) { ergebnis = eintragCluster(d); break; }
+            }
+        }
+        if (!fertig && !ergebnis) cl = fatNaechster(cl, fatBuf);
+    }
+    free(sek);
+    free(fatBuf);
+    return ergebnis;
+}
+
+// Startcluster und Groessen aller Dateien eines Verzeichnisses roh einsammeln.
+// Liefert die Anzahl. dirCluster 0 = Wurzel.
+static int rohEintraege(uint32_t dirCluster, uint32_t *starts, uint32_t *groessen, int max, bool nurScans)
+{
+    if (!g_fat.gueltig) fatLageLesen();
+    if (!g_fat.gueltig) return 0;
+    uint8_t *sek    = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
+    uint8_t *fatBuf = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
+    if (!sek || !fatBuf) { if (sek) free(sek); if (fatBuf) free(fatBuf); return 0; }
+    int n = 0;
+    bool fertig = false;
+    uint32_t cl = dirCluster ? dirCluster : g_fat.rootCluster;
+    for (int schutz = 0; !fertig && n < max && cl >= 2 && cl < 0x0FFFFFF8 && schutz < 128; schutz++) {
+        for (uint8_t i = 0; i < g_fat.sektorenProCluster && !fertig && n < max; i++) {
+            if (!SD_MMC.readRAW(sek, clusterSektor(cl) + i)) { fertig = true; break; }
+            for (int e = 0; e < 512 && n < max; e += 32) {
+                uint8_t *d = sek + e;
+                if (d[0] == 0x00) { fertig = true; break; }
+                if (d[0] == 0xE5 || d[11] == 0x0F || (d[11] & 0x18)) continue;
+                if (nurScans && (!istScanEndung(d + 8) || le32(d + 28) < ROH_MIN_GROESSE)) continue;
+                starts[n] = eintragCluster(d);
+                groessen[n] = le32(d + 28);
+                n++;
+            }
+        }
+        if (!fertig && n < max) cl = fatNaechster(cl, fatBuf);
+    }
+    free(sek);
+    free(fatBuf);
+    return n;
+}
+
+// Geisterjagd in der Wurzel - roh, bei abgemeldetem Medium, VOR dem Mount.
+// Der 780 schreibt nach dem Wiederanmelden seine alte Verzeichnissicht zurueck:
+// der vorige Scan liegt dann erneut als [Untitled].pdf in der Wurzel und zeigt
+// auf Bloecke, die entweder schon einer Datei in /senden oder /gesendet
+// gehoeren oder laengst frei sind. Solche Eintraege werden nur ausgetragen,
+// die Blockzuordnung bleibt unangetastet. Liefert die Zahl der Geister.
+static int geisterJagen()
+{
+    uint32_t fremd[64];
+    uint32_t fremdGr[64];
+    int nFremd = 0;
+    uint32_t cs = rohOrdnerCluster("SENDEN     ");
+    if (cs) nFremd += rohEintraege(cs, fremd + nFremd, fremdGr + nFremd, 64 - nFremd, false);
+    uint32_t cg = rohOrdnerCluster("GESENDET   ");
+    if (cg) nFremd += rohEintraege(cg, fremd + nFremd, fremdGr + nFremd, 64 - nFremd, false);
+
+    uint32_t wurzel[MAX_FUND], wurzelGr[MAX_FUND];
+    int nWurzel = rohEintraege(0, wurzel, wurzelGr, MAX_FUND, true);
+    if (!nWurzel) return 0;
+
+    uint8_t *fatBuf = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
+    if (!fatBuf) return 0;
+    uint32_t clusterBytes = (uint32_t)g_fat.sektorenProCluster * 512;
+    int geister = 0;
+    for (int i = 0; i < nWurzel; i++) {
+        uint32_t st = wurzel[i];
+        const char *grund = nullptr;
+        if (st < 2 || fatNaechster(st, fatBuf) == 0) grund = "zeigt auf freie Bloecke";
+        for (int k = 0; !grund && k < nFremd; k++)
+            if (fremd[k] == st) grund = "zeigt auf Bloecke einer schon weggeraeumten Datei";
+        for (int k = 0; !grund && k < nWurzel; k++) {
+            if (k == i || wurzel[k] != st) continue;
+            // Zwei Wurzeleintraege auf denselben Bloecken: der Geist ist der,
+            // dessen Groesse nicht zur Kettenlaenge passt.
+            uint32_t n = 0, c = st;
+            while (c >= 2 && c < 0x0FFFFFF8 && n < 300000) { n++; c = fatNaechster(c, fatBuf); }
+            uint32_t passt = (wurzelGr[i] + clusterBytes - 1) / clusterBytes;
+            if (passt != n) grund = "teilt Bloecke mit einem anderen Eintrag und passt nicht zur Kette";
+        }
+        if (!grund) continue;
+        bool ok = rohEintragLoeschenIn(0, "", wurzelGr[i], st);
+        logZeile(String("[geist] Wurzeleintrag mit ") + (wurzelGr[i] / 1024) + " kB " + grund +
+                 (ok ? " - ausgetragen" : " - austragen fehlgeschlagen"));
+        if (ok) geister++;
+    }
+    free(fatBuf);
+    return geister;
 }
 
 // ---- Konfiguration von der SD lesen ----
@@ -1587,7 +1706,6 @@ static void webStarten()
 
 // ---- nach Scan-Ende: neue Dateien hochladen ----
 // Ordner rekursiv durchgehen, Dateien hochladen; loggt jeden Eintrag (Diagnose)
-#define MAX_FUND 24
 static String g_fund[MAX_FUND];
 static int    g_fundAnzahl = 0;
 // Geist-Eintraege (siehe sendeGefundene), die nach dem Remount roh ausgetragen werden
@@ -1611,7 +1729,8 @@ static void sammleDateien(const String &pfad, int tiefe)
         if (sl >= 0) basis = basis.substring(sl + 1);
         logZeile(String("[fund] ") + (istDir ? "DIR " : "DAT ") + voll + " " + sz + "B");
         if (istDir) {
-            if (tiefe < 3 && !basis.startsWith(".") && !basis.equalsIgnoreCase("gesendet"))
+            if (tiefe < 3 && !basis.startsWith(".") && !basis.equalsIgnoreCase("gesendet") &&
+                !basis.equalsIgnoreCase("senden"))
                 sammleDateien(voll, tiefe + 1);
             continue;
         }
@@ -1621,97 +1740,158 @@ static void sammleDateien(const String &pfad, int tiefe)
     }
 }
 
-// SCHRITT 2: umbenennen, senden, aufraeumen. Hier wird die FAT veraendert -
-// der Aufrufer MUSS dem Host das Medium vorher entzogen haben, sonst schreibt
-// der Drucker seine alte Sicht darueber und die Aenderungen sind weg.
-static void sendeGefundene(bool wifi, int &hoch, int &fehler)
+// ================= Ablauf ab v25 =================
+// Die Karte gehoert dem Stick nur noch fuer ein kurzes FENSTER von ein bis zwei
+// Sekunden: Geister austragen, Erledigtes wegraeumen, fertige Scans nach
+// /senden umbenennen. Dann bekommt der Drucker das Medium zurueck, und erst
+// jetzt wird hochgeladen - aus /senden, das nur uns gehoert. Vorher war das
+// Medium fuer die ganze Dauer des Uploads weg (5-7 s bei 2 MB, bei schwachem
+// Empfang laenger), und jeder Scan in dieser Zeit scheiterte am Drucker.
+// Karten-AENDERUNGEN passieren ausschliesslich im Fenster.
+
+static String g_erledigtPfad[MAX_FUND];   // in /senden, erfolgreich hochgeladen
+static int    g_erledigtAnzahl = 0;
+
+static bool sendenLeer()
 {
+    File dir = SD_MMC.open("/senden");
+    if (!dir) return true;
+    bool leer = true;
+    for (File e = dir.openNextFile(); e && leer; e = dir.openNextFile())
+        if (!e.isDirectory() && istScanName(String(e.name()))) leer = false;
+    return leer;
+}
+
+static bool remount()
+{
+    SD_MMC.end();
+    delay(80);
+    SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0, SD_D1, SD_D2, SD_D3);
+    return SD_MMC.begin();
+}
+
+// DAS FENSTER. Liefert false, wenn die Karte nicht zu bekommen war.
+// neu = nach /senden verschobene Scans, fehler = noch unfertige.
+static bool kartenFenster(int &neu, int &fehler)
+{
+    neu = 0;
+    uint32_t t0 = millis();
+    if (!karteUebernehmen()) return false;
+
+    // 1. Roh, vor dem Mount: Geister und bereits bestaetigte Duplikate austragen
+    int geister = geisterJagen();
+    uint32_t cs = rohOrdnerCluster("SENDEN     ");
+    for (int i = 0; i < g_geisterAnzahl; i++) {
+        bool ok = cs && rohEintragLoeschenIn(cs, g_geisterName[i], g_geisterGroesse[i], 0);
+        logZeile(String("[geist] /senden/") + g_geisterName[i] + (ok ? " ausgetragen" : " NICHT gefunden"));
+    }
+    g_geisterAnzahl = 0;
+
+    // 2. Frischer Mount, dann per Dateisystem: Erledigtes wegraeumen
+    if (!remount()) {
+        logZeile("[fenster] Mount fehlgeschlagen");
+        karteZurueckgeben();
+        return false;
+    }
+    for (int i = 0; i < g_erledigtAnzahl; i++) {
+        String pfad = g_erledigtPfad[i];
+        String basis = pfad.substring(pfad.lastIndexOf('/') + 1);
+        if (g_loeschen) {
+            SD_MMC.remove(pfad);
+        } else {
+            if (!SD_MMC.exists("/gesendet")) SD_MMC.mkdir("/gesendet");
+            String ziel = "/gesendet/" + basis;
+            for (int n = 1; SD_MMC.exists(ziel) && n < 100; n++) {
+                int punkt = basis.lastIndexOf('.');
+                ziel = "/gesendet/" + (punkt > 0 ? basis.substring(0, punkt) : basis) +
+                       "_" + n + (punkt > 0 ? basis.substring(punkt) : String(""));
+            }
+            if (!SD_MMC.rename(pfad, ziel)) { logZeile("[fenster] Verschieben fehlgeschlagen, loesche " + basis); SD_MMC.remove(pfad); }
+        }
+    }
+    int weggeraeumt = g_erledigtAnzahl;
+    g_erledigtAnzahl = 0;
+
+    // 3. Fertige Scans aus der Wurzel nach /senden
+    g_fundAnzahl = 0;
+    sammleDateien("/", 0);
+    if (g_fundAnzahl && !SD_MMC.exists("/senden")) SD_MMC.mkdir("/senden");
     for (int i = 0; i < g_fundAnzahl; i++) {
         String voll = g_fund[i];
-        String basis = voll;
-        int sl = basis.lastIndexOf('/');
-        if (sl >= 0) basis = basis.substring(sl + 1);
-
-        // Ist das dieselbe Datei, die wir gerade eben gesendet haben?
+        String basis = voll.substring(voll.lastIndexOf('/') + 1);
         uint32_t groesse = 0;
-        {
-            File pf = SD_MMC.open(voll);
-            if (pf) { groesse = pf.size(); pf.close(); }
-        }
+        { File pf = SD_MMC.open(voll); if (pf) { groesse = pf.size(); pf.close(); } }
         if (!dateiVollstaendig(voll, groesse)) {
-            logZeile("[warte] " + basis + " (" + (groesse / 1024) +
-                     " kB) hat noch keine Endmarke - der Drucker schreibt noch");
+            logZeile("[warte] " + basis + " (" + (groesse / 1024) + " kB) hat noch keine Endmarke - der Drucker schreibt noch");
             fehler++;
             continue;
         }
-        // Die Kennzahl geht als Kennung mit; ob es eine Wiederholung ist,
-        // entscheidet der Empfaenger. Frueher verglich der Stick hier selbst
-        // mit der zuletzt gesendeten Datei und LOESCHTE bei Gleichstand ohne
-        // Upload - die Kennzahl deckt aber nur Anfang und Ende ab, zwei echte
-        // Scans desselben Formulars haetten so still verschwinden koennen.
-        uint32_t kennzahl = dateiKennzahl(voll, groesse);
-
-        // Umbenennen, bevor gesendet wird: der Drucker nennt jeden Scan gleich
-        // ("[Untitled].pdf"), der Name muss sofort wieder frei sein.
-        String sendePfad = voll, sendeName = basis;
-        if (basis.startsWith(cfgPraefix + "-")) {
-            // Traegt schon unseren Namen: ein frueherer Upload ist gescheitert,
-            // die Datei liegt noch. Nicht erneut umbenennen.
-            logZeile("[um] " + basis + " hat schon unseren Namen, zweiter Anlauf");
-        } else {
-            String ordner = (sl >= 0) ? voll.substring(0, sl + 1) : String("/");
-            String zielName = neuerName(basis);
-            String zielPfad = ordner + zielName;
-            if (SD_MMC.rename(voll, zielPfad)) {
-                sendePfad = zielPfad;
-                sendeName = zielName;
-                logZeile("[um] " + basis + " -> " + zielName);
-            } else {
-                logZeile("[um] Umbenennen fehlgeschlagen, sende unter " + basis);
-            }
+        String zielName = basis.startsWith(cfgPraefix + "-") ? basis : neuerName(basis);
+        String ziel = "/senden/" + zielName;
+        for (int n = 1; SD_MMC.exists(ziel) && n < 100; n++) {
+            int punkt = zielName.lastIndexOf('.');
+            ziel = "/senden/" + (punkt > 0 ? zielName.substring(0, punkt) : zielName) +
+                   "_" + n + (punkt > 0 ? zielName.substring(punkt) : String(""));
         }
+        if (SD_MMC.rename(voll, ziel)) { logZeile("[um] " + basis + " -> " + ziel); neu++; }
+        else { logZeile("[um] " + basis + " liess sich nicht verschieben"); fehler++; }
+    }
 
+    // 4. Cache raus, frische Sicht fuer den Drucker, Medium zurueck
+    remount();
+    karteZurueckgeben();
+    logZeile(String("[fenster] ") + (millis() - t0) + " ms: " + neu + " neu, " + weggeraeumt +
+             " weggeraeumt, " + geister + " Geister, " + fehler + " unfertig");
+    return true;
+}
+
+// UPLOAD bei angemeldetem Medium, aus /senden. Karte wird nur gelesen.
+static void sendenAusSenden(int &hoch, int &fehler)
+{
+    File dir = SD_MMC.open("/senden");
+    if (!dir) return;
+    String namen[MAX_FUND];
+    int n = 0;
+    for (File e = dir.openNextFile(); e && n < MAX_FUND; e = dir.openNextFile())
+        if (!e.isDirectory() && istScanName(String(e.name())) && e.size()) namen[n++] = String(e.name());
+    dir.close();
+    if (!n) return;
+
+    bool wifi = wifiVerbinden();
+    logFlushNetz();                      // Stand VOR dem Senden sichern
+    for (int i = 0; i < n; i++) {
+        String pfad = "/senden/" + namen[i];
+        bool schonErledigt = false;
+        for (int k = 0; k < g_erledigtAnzahl; k++) if (g_erledigtPfad[k] == pfad) schonErledigt = true;
+        if (schonErledigt) continue;     // wartet nur noch aufs Wegraeumen
+        uint32_t groesse = 0;
+        { File pf = SD_MMC.open(pfad); if (pf) { groesse = pf.size(); pf.close(); } }
+        uint32_t kennzahl = dateiKennzahl(pfad, groesse);
         char idText[32];
         snprintf(idText, sizeof idText, "%08x-%08x", (unsigned)groesse, (unsigned)kennzahl);
-        int erg = wifi ? ladeHoch(SD_MMC, sendePfad, sendeName, String(idText)) : UP_FEHLER;
-        if (erg == UP_DUPLIKAT) {
-            // Ein Geist: der Drucker hat nach dem Wiederanmelden seine alte
-            // Verzeichnissicht zurueckgeschrieben, der Eintrag zeigt auf die
-            // Bloecke einer schon gesendeten Datei. Weder loeschen (gaebe die
-            // Bloecke der anderen Datei frei) noch verschieben (Kreuzverkettung,
-            // so lagen in /gesendet Paare wie 204155/204233). Nur den Eintrag
-            // roh austragen - das passiert nach dem Remount in verarbeiteScans.
-            int sl2 = sendePfad.lastIndexOf('/');
-            if (sl2 == 0 && g_geisterAnzahl < MAX_GEISTER) {
-                g_geisterName[g_geisterAnzahl] = sendePfad.substring(1);
+        int erg = wifi ? ladeHoch(SD_MMC, pfad, namen[i], String(idText)) : UP_FEHLER;
+        if (erg == UP_OK) {
+            if (g_erledigtAnzahl < MAX_FUND) g_erledigtPfad[g_erledigtAnzahl++] = pfad;
+            hoch++;
+        } else if (erg == UP_DUPLIKAT) {
+            // Der Empfaenger kannte die Datei: ein Geist, den die Jagd nicht
+            // erkannt hat. Nicht loeschen, nicht verschieben - roh austragen.
+            if (g_geisterAnzahl < MAX_GEISTER) {
+                g_geisterName[g_geisterAnzahl] = namen[i];
                 g_geisterGroesse[g_geisterAnzahl] = groesse;
                 g_geisterAnzahl++;
-                logZeile("[geist] " + sendeName + " kannte der Empfaenger schon - Eintrag wird roh ausgetragen");
-            } else {
-                logZeile("[geist] " + sendeName + " kannte der Empfaenger schon - bleibt liegen");
             }
-            hoch++;
-        } else if (erg == UP_OK) {
-            if (g_loeschen) {
-                SD_MMC.remove(sendePfad);
-            } else {
-                // Aufheben statt loeschen. Aus der Wurzel raus, sonst findet der
-                // naechste Durchlauf die Datei wieder und schickt sie erneut.
-                if (!SD_MMC.exists("/gesendet")) SD_MMC.mkdir("/gesendet");
-                String ziel = "/gesendet/" + sendeName;
-                for (int n = 1; SD_MMC.exists(ziel) && n < 100; n++) {
-                    int punkt = sendeName.lastIndexOf('.');
-                    ziel = "/gesendet/" + (punkt > 0 ? sendeName.substring(0, punkt) : sendeName) +
-                           "_" + n + (punkt > 0 ? sendeName.substring(punkt) : String(""));
-                }
-                if (SD_MMC.rename(sendePfad, ziel)) logZeile("[up] aufgehoben als " + ziel);
-                else { logZeile("[up] Verschieben fehlgeschlagen, loesche"); SD_MMC.remove(sendePfad); }
-            }
+            logZeile("[geist] " + namen[i] + " kannte der Empfaenger schon - wird im naechsten Fenster ausgetragen");
             hoch++;
         } else {
             fehler++;
         }
     }
+}
+
+static bool aufraeumenOffen()
+{
+    return g_erledigtAnzahl > 0 || g_geisterAnzahl > 0;
 }
 
 static void verarbeiteScans(bool manuell)
@@ -1721,70 +1901,31 @@ static void verarbeiteScans(bool manuell)
     logZeile(manuell ? "[scan] manuelle Suche" : "[scan] Scan fertig, verarbeite");
     zeigeScreen(Z_SUCHT);
 
-    // SCHRITT 1: roh nachsehen. Reines Lesen von Sektoren - das stoert den
-    // Drucker nicht und fasst den Kartentreiber nicht an. Ist nichts da, sparen
-    // wir uns alles Weitere und damit jedes Risiko. (Der Rohleser sieht nur das
-    // Wurzelverzeichnis; genau dort legt der Drucker seine Scans ab.)
+    // Roh nachsehen: liegt in der Wurzel ein fertiger Scan? Reines Lesen.
     int rohAnz = 0;
     uint32_t rohGroesse = 0;
     rohVerzeichnis(rohAnz, rohGroesse);
 
-    int hoch = 0, fehler = 0;
-    if (rohAnz > 0) {
-        // SCHRITT 2: ERST den Host abmelden, DANN die Karte neu anhaengen.
-        // Vorher lief das Ab- und Anhaengen bei angemeldetem Medium. Traf in
-        // dieses Fenster ein Zugriff des Druckers, griff der USB-Teil auf einen
-        // gerade abgeraeumten Kartentreiber zu und der Stick startete neu -
-        // derselbe Fehler, der frueher in der Dateien-Seite steckte. Gefahrlos
-        // ist der Entzug hier, weil roh bereits eine fertige Datei zu sehen war.
-        if (!karteUebernehmen()) {
+    int neu = 0, hoch = 0, fehler = 0;
+    if (rohAnz > 0 || aufraeumenOffen()) {
+        if (!kartenFenster(neu, fehler)) {
             logZeile("[scan] Karte nicht bekommen, naechster Anlauf spaeter");
             g_naechsterVersuch = millis() + 5000;
             return;                          // g_dirty bleibt stehen
         }
-
-        SD_MMC.end();
-        delay(100);
-        SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0, SD_D1, SD_D2, SD_D3);
-        if (!SD_MMC.begin()) {
-            logZeile("[scan] remount fehlgeschlagen");
-            karteZurueckgeben();             // Medium auf keinen Fall verlieren
-            return;
-        }
-
-        // SCHRITT 3: jetzt sind wir allein auf der Karte
-        g_fundAnzahl = 0;
-        g_geisterAnzahl = 0;
-        sammleDateien("/", 0);
-        bool wifi = wifiVerbinden();
-        logFlushNetz();                      // Stand VOR dem Senden sichern - stuerzt es ab, wissen wir wo
-        sendeGefundene(wifi, hoch, fehler);
-
-        // SCHRITT 4: Cache schreiben, dem Drucker eine frische Sicht geben
-        SD_MMC.end();
-        delay(80);
-        SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0, SD_D1, SD_D2, SD_D3);
-        SD_MMC.begin();
-        // Geister erst jetzt austragen: der Treiber ist frisch und hat keinen
-        // gepufferten Verzeichnissektor mehr, den er zurueckschreiben koennte.
-        for (int i = 0; i < g_geisterAnzahl; i++) {
-            bool ok = rohEintragLoeschen(g_geisterName[i], g_geisterGroesse[i]);
-            logZeile(String("[geist] ") + g_geisterName[i] + (ok ? " ausgetragen, Bloecke unangetastet"
-                                                                  : " NICHT gefunden - bleibt liegen"));
-        }
-        g_geisterAnzahl = 0;
-        karteZurueckgeben();
-        logZeile("[usb] Stick neu angemeldet");
     } else {
         logZeile("[scan] roh nachgesehen: nichts zu holen");
     }
+
+    // Hochladen, waehrend der Drucker den Stick schon wieder hat
+    sendenAusSenden(hoch, fehler);
+    if (neu && !hoch) hoch = neu;            // verschoben, Upload spaeter (kein WLAN o.ae.)
+
     logZeile(String("[scan] fertig: ") + hoch + " hochgeladen, " + fehler + " Fehler, " +
              "vom Host geschrieben: " + (g_bytesGeschrieben / 1024) + " kB");
     if (hoch > 0) g_bytesGeschrieben = 0;
 
-    // Hat der Drucker waehrend unserer Arbeit geschrieben? Ein Upload kann eine
-    // Minute dauern - ohne diese Pruefung faellt ein in der Zeit entstandener
-    // Scan hinten runter, weil g_dirty blind geloescht wuerde.
+    // Hat der Drucker waehrend unserer Arbeit geschrieben? Dann dranbleiben.
     if ((int32_t)(g_lastWrite - begonnen) > 0) {
         logZeile("[scan] neuer Schreibzugriff waehrend der Verarbeitung - bleibe dran");
         g_versuche = 0;
@@ -1796,7 +1937,6 @@ static void verarbeiteScans(bool manuell)
     g_versuche++;
     if (hoch == 0 && fehler == 0) {
         if (manuell) {
-            // Von Hand ausgeloest und nichts gefunden: keinen Wartezyklus starten
             logZeile("[scan] nichts gefunden");
             g_versuche = 0;
             logFlushNetz();
@@ -1806,7 +1946,7 @@ static void verarbeiteScans(bool manuell)
         // dranbleiben statt aufgeben, g_dirty bleibt stehen.
         if (g_versuche < MAX_VERSUCHE) {
             g_naechsterVersuch = millis() + RETRY_MS;
-            g_dirty = true;                 // dranbleiben
+            g_dirty = true;
             logZeile(String("[warte] nichts gefunden (Versuch ") + g_versuche + "/" + MAX_VERSUCHE +
                   "), neuer Blick in " + (RETRY_MS / 1000) + "s");
             zeigeWarte(g_versuche, MAX_VERSUCHE);
@@ -1892,9 +2032,9 @@ void loop()
         g_startGeprueft = true;
         int a = 0;
         uint32_t gr = 0;
-        if (rohVerzeichnis(a, gr) && a > 0) {
-            logZeile(String("[start] ") + a + " Datei(en) mit " + (gr / 1024) +
-                     " kB lagen noch da - nehme sie mit");
+        if ((rohVerzeichnis(a, gr) && a > 0) || !sendenLeer()) {
+            logZeile(String("[start] ") + a + " Datei(en) in der Wurzel, /senden " +
+                     (sendenLeer() ? "leer" : "nicht leer") + " - nehme sie mit");
             g_dirty = true;
             g_lastWrite = millis() - IDLE_MS - 1;   // sofort faellig
             g_versuche = 0;
@@ -1912,9 +2052,11 @@ void loop()
         nachschau = millis();
         int a = 0;
         uint32_t gr = 0;
-        if (rohVerzeichnis(a, gr) && a > 0) {
-            logZeile(String("[nachschau] ") + a + " Datei(en) mit " + (gr / 1024) +
-                     " kB liegen noch - neuer Anlauf");
+        bool offen = (rohVerzeichnis(a, gr) && a > 0) || aufraeumenOffen() || !sendenLeer();
+        if (offen) {
+            logZeile(String("[nachschau] ") + a + " Datei(en) in der Wurzel, " +
+                     (aufraeumenOffen() ? "Aufraeumen offen" : "nichts aufzuraeumen") + ", /senden " +
+                     (sendenLeer() ? "leer" : "nicht leer") + " - neuer Anlauf");
             g_dirty = true;
             g_lastWrite = millis() - IDLE_MS - 1;   // sofort faellig
             g_versuche = 0;
