@@ -6,7 +6,7 @@ im Betrieb tritt hier die eigentliche Ablage an diese Stelle.
 Port und Ablageordner lassen sich ueber die Umgebung setzen:
     SCAN_PORT=8080 SCAN_INBOX=~/scan-inbox python3 scan-receiver.py
 """
-import os, time, hmac, hashlib, http.server, socketserver, urllib.parse
+import os, time, hmac, hashlib, threading, http.server, socketserver, urllib.parse
 
 PORT = int(os.environ.get("SCAN_PORT", "8080"))
 INBOX = os.path.expanduser(os.environ.get("SCAN_INBOX", "~/scan-inbox"))
@@ -43,6 +43,55 @@ def id_merken(scan_id):
         return
     with open(IDLISTE, "a") as f:
         f.write(scan_id + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def ordner_sichern(pfad):
+    """Verzeichniseintrag auf die Platte zwingen (POSIX); anderswo egal."""
+    try:
+        fd = os.open(pfad, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def ablegen(ordner, name, daten):
+    """Datei absturzsicher ablegen: erst in eine temporaere Datei schreiben,
+    auf die Platte zwingen, dann unter dem endgueltigen Namen einhaengen.
+    Stirbt der Rechner mittendrin, bleibt hoechstens eine .teil-Datei uebrig,
+    nie eine halbe PDF unter richtigem Namen. Erst danach wird die Kennung
+    gemerkt - eine gemerkte Kennung ohne sicher liegende Datei waere die
+    einzige Kombination, die einen Scan wirklich verlieren kann.
+    Liefert den endgueltigen Pfad."""
+    tmp = os.path.join(ordner, "." + name + ".teil")
+    with open(tmp, "wb") as f:
+        f.write(daten)
+        f.flush()
+        os.fsync(f.fileno())
+    basis, ext = os.path.splitext(os.path.join(ordner, name))
+    ziel, n = basis + ext, 1
+    while True:
+        try:
+            os.link(tmp, ziel)          # atomar und exklusiv: scheitert, wenn es den Namen gibt
+            break
+        except FileExistsError:
+            ziel = "%s_%d%s" % (basis, n, ext); n += 1
+        except OSError:
+            os.replace(tmp, ziel)       # Dateisystem ohne harte Verweise
+            ordner_sichern(ordner)
+            return ziel
+    os.unlink(tmp)
+    ordner_sichern(ordner)
+    return ziel
+
+
+# Zwei gleichzeitige Uploads derselben Kennung (Wiederholung des Sticks waehrend
+# der erste noch laeuft) duerfen nicht beide durchkommen.
+SPERRE = threading.Lock()
 
 
 def vollstaendig(name, daten, angekuendigt):
@@ -100,22 +149,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._antwort(400, "abgelehnt: " + fehler)
             return
 
-        if id_bekannt(scan_id):
-            print("[%s] schon empfangen (%s), verworfen: %s (%d Bytes)" % (
-                stempel, scan_id, name, len(daten)))
-            self._antwort(200, "OK (Duplikat, nicht erneut abgelegt)", duplikat=True)
-            return
-
         ordner = PROTOKOLL if name.startswith("scanlog-") else INBOX
-        ziel = os.path.join(ordner, name)
-        # Kollision vermeiden
-        basis, ext = os.path.splitext(ziel)
-        n = 1
-        while os.path.exists(ziel):
-            ziel = "%s_%d%s" % (basis, n, ext); n += 1
-        with open(ziel, "wb") as f:
-            f.write(daten)
-        id_merken(scan_id)
+        with SPERRE:
+            if id_bekannt(scan_id):
+                print("[%s] schon empfangen (%s), verworfen: %s (%d Bytes)" % (
+                    stempel, scan_id, name, len(daten)))
+                self._antwort(200, "OK (Duplikat, nicht erneut abgelegt)", duplikat=True)
+                return
+            ziel = ablegen(ordner, name, daten)   # Datei sicher, dann erst die Kennung
+            id_merken(scan_id)
         print("[%s] empfangen: %s (%d Bytes, id %s) von %s" % (
             stempel, os.path.basename(ziel), len(daten),
             scan_id or "ohne", self.client_address[0]))

@@ -429,7 +429,6 @@ sudo systemctl enable --now scan-receiver
   es gar keine Datei mehr
 - Selbsttätiger Wechsel des Zugangspunkts, wenn der Empfang längere Zeit schwach bleibt
   (bei komplettem Ausfall sucht er nach zwei Minuten neu; bei nur schwachem Empfang noch nicht)
-- Beim Start einmal nachsehen, ob eine Datei liegengeblieben ist
 - Auch andere Dateitypen als PDF auf Vollständigkeit prüfen
 - Weitere Boards, insbesondere solche ohne Kartensteckplatz (dort müsste der interne
   Flash als Speicher dienen)
