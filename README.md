@@ -227,6 +227,15 @@ Bootloader fiel zweimal auf die alte zurück. Der Stick meldet deshalb erst das 
 trennt USB, wartet den Stromschnitt ab und startet erst dann neu (`sanftNeustarten`).
 Auf der Statusseite steht danach „Strom eingeschaltet" als Startgrund — das ist normal.
 
+**Den Dialog „Einstellungen für den nächsten Job beibehalten?" erst beantworten, wenn der
+Stick fertig ist.** Der 780 schreibt große Scans noch lange, nachdem das Papier durch ist,
+und zeigt dabei schon diesen Dialog. Wer ihn mit Löschen oder Abbrechen beantwortet, während
+der Drucker noch schreibt, bricht den eigenen Job ab: Ereignis 44.12.05 „Error writing
+multi-page image file". Danach nimmt der 780 dem USB-Port kurz den Strom, und sein USB-Host
+liest **gar nichts mehr** — auch keinen gewöhnlichen USB-Stick — bis der Drucker neu
+gestartet wird. Umstecken hilft nicht. Solange das Display des Sticks „SCAN ERKANNT" oder
+den Countdown zeigt, schreibt der Drucker noch; erst bei „SENDET" oder „BEREIT" ist er durch.
+
 **Der 780 überschreibt eine gleichnamige Datei.** Bleibt `[Untitled].pdf` nach dem Senden
 auf der Karte liegen, hängt er beim nächsten Scan keinen Zeitstempel an, sondern schreibt
 dieselbe Datei neu. Der Stick erkennt eine Datei deshalb nicht am Namen, sondern an
