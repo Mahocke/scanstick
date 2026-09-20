@@ -337,7 +337,7 @@ static volatile uint32_t g_bytesGeschrieben = 0;   // seit dem letzten Verarbeit
 static uint32_t g_naechsterVersuch = 0;   // 0 = sofort faellig
 static int      g_versuche         = 0;
 
-#define FW_VERSION "v23"
+#define FW_VERSION "v24"
 
 String cfgEndpoint;
 // Bekannte WLAN-Netze - mehrere, damit derselbe Stick an verschiedenen Standorten
@@ -659,6 +659,78 @@ static bool rohVerzeichnis(int &anzahl, uint32_t &summe)
     return true;
 }
 
+// Einen Eintrag im Wurzelverzeichnis roh als geloescht markieren (erstes Byte
+// 0xE5), OHNE die Blockzuordnung anzufassen. Lange Namen liegen in Stuecken zu
+// 13 Zeichen VOR dem Kurzeintrag, in umgekehrter Reihenfolge; auch die werden
+// markiert. Nur nach einem frischen Mount aufrufen, sonst schreibt der
+// Dateisystem-Treiber seinen gepufferten Verzeichnissektor wieder darueber.
+static bool rohEintragLoeschen(const String &name, uint32_t groesse)
+{
+    if (!g_fat.gueltig) fatLageLesen();
+    if (!g_fat.gueltig) return false;
+    uint8_t *sek    = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
+    uint8_t *fatBuf = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
+    if (!sek || !fatBuf) { if (sek) free(sek); if (fatBuf) free(fatBuf); return false; }
+
+    String ziel = name;
+    ziel.toLowerCase();
+    String lang;
+    uint32_t lfnSektor[20];
+    int      lfnOffset[20];
+    int      lfnAnzahl = 0;
+    bool getroffen = false, fertig = false;
+    static const uint8_t pos[13] = { 1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30 };
+
+    uint32_t cl = g_fat.rootCluster;
+    for (int schutz = 0; !fertig && !getroffen && cl >= 2 && cl < 0x0FFFFFF8 && schutz < 128; schutz++) {
+        for (uint8_t i = 0; i < g_fat.sektorenProCluster && !fertig && !getroffen; i++) {
+            uint32_t sektor = clusterSektor(cl) + i;
+            if (!SD_MMC.readRAW(sek, sektor)) { fertig = true; break; }
+            for (int e = 0; e < 512 && !getroffen; e += 32) {
+                uint8_t *d = sek + e;
+                if (d[0] == 0x00) { fertig = true; break; }
+                if (d[0] == 0xE5) { lang = ""; lfnAnzahl = 0; continue; }
+                if (d[11] == 0x0F) {
+                    String stueck;
+                    for (int k = 0; k < 13; k++) {
+                        uint16_t ch = d[pos[k]] | ((uint16_t)d[pos[k] + 1] << 8);
+                        if (ch == 0 || ch == 0xFFFF) break;
+                        stueck += (ch < 128) ? (char)ch : '?';
+                    }
+                    lang = stueck + lang;
+                    if (lfnAnzahl < 20) { lfnSektor[lfnAnzahl] = sektor; lfnOffset[lfnAnzahl] = e; lfnAnzahl++; }
+                    continue;
+                }
+                String kandidat = lang;
+                if (kandidat.isEmpty()) {                       // nur Kurzname: "NAME    EXT"
+                    for (int k = 0; k < 8 && d[k] != ' '; k++) kandidat += (char)d[k];
+                    if (d[8] != ' ') { kandidat += '.'; for (int k = 8; k < 11 && d[k] != ' '; k++) kandidat += (char)d[k]; }
+                }
+                kandidat.toLowerCase();
+                if (!(d[11] & 0x18) && kandidat == ziel && le32(d + 28) == groesse) {
+                    d[0] = 0xE5;
+                    for (int k = 0; k < lfnAnzahl; k++) if (lfnSektor[k] == sektor) sek[lfnOffset[k]] = 0xE5;
+                    getroffen = SD_MMC.writeRAW(sek, sektor);
+                    for (int k = 0; k < lfnAnzahl && getroffen; k++) {   // Stuecke in frueheren Sektoren
+                        if (lfnSektor[k] == sektor) continue;
+                        if (!SD_MMC.readRAW(sek, lfnSektor[k])) { getroffen = false; break; }
+                        for (int m = 0; m < lfnAnzahl; m++) if (lfnSektor[m] == lfnSektor[k]) sek[lfnOffset[m]] = 0xE5;
+                        if (!SD_MMC.writeRAW(sek, lfnSektor[k])) getroffen = false;
+                        sektor = lfnSektor[k];   // diese Gruppe ist erledigt
+                    }
+                    break;
+                }
+                lang = "";
+                lfnAnzahl = 0;
+            }
+        }
+        if (!fertig && !getroffen) cl = fatNaechster(cl, fatBuf);
+    }
+    free(sek);
+    free(fatBuf);
+    return getroffen;
+}
+
 // ---- Konfiguration von der SD lesen ----
 // Die Datei gilt nur, wenn sie sich seit dem letzten Uebernehmen GEAENDERT hat.
 // Vorher gewann sie bei jedem Start - wer das Upload-Ziel in der Weboberflaeche
@@ -961,19 +1033,22 @@ static uint32_t dateiKennzahl(const String &pfad, uint32_t groesse)
     return summe;
 }
 
-static bool ladeHoch(fs::FS &fs, const String &pfad, const String &name, const String &id)
+#define UP_FEHLER   0
+#define UP_OK       1
+#define UP_DUPLIKAT 2   // angenommen, aber der Empfaenger kannte die Datei schon
+static int ladeHoch(fs::FS &fs, const String &pfad, const String &name, const String &id)
 {
     File f = fs.open(pfad);
-    if (!f) { logZeile("[up] " + pfad + " nicht oeffenbar"); return false; }
+    if (!f) { logZeile("[up] " + pfad + " nicht oeffenbar"); return UP_FEHLER; }
     uint32_t len = f.size();
-    if (!len) { f.close(); logZeile("[up] " + name + " ist leer, uebersprungen"); return false; }
+    if (!len) { f.close(); logZeile("[up] " + name + " ist leer, uebersprungen"); return UP_FEHLER; }
 
     String host, ziel;
     uint16_t port;
     if (!urlTeile(cfgEndpoint, host, port, ziel)) {
         logZeile("[up] Ziel-Adresse unbrauchbar: " + cfgEndpoint);
         f.close();
-        return false;
+        return UP_FEHLER;
     }
     ziel += (ziel.indexOf('?') < 0) ? "?name=" : "&name=";
     ziel += name;
@@ -996,7 +1071,7 @@ static bool ladeHoch(fs::FS &fs, const String &pfad, const String &name, const S
             delay(1500);
         }
     }
-    if (!verbunden) { f.close(); return false; }
+    if (!verbunden) { f.close(); return UP_FEHLER; }
     String sig = uploadSignatur(name, id, len);
     c.print(String("POST ") + ziel + " HTTP/1.1\r\n" +
             "Host: " + host + ":" + port + "\r\n" +
@@ -1019,22 +1094,31 @@ static bool ladeHoch(fs::FS &fs, const String &pfad, const String &name, const S
     }
     f.close();
 
-    if (geschickt != len) { c.stop(); return false; }
+    if (geschickt != len) { c.stop(); return UP_FEHLER; }
 
     int code = 0;
+    bool duplikat = false;
     uint32_t tw = millis();
     while (c.connected() && !c.available() && millis() - tw < 15000) delay(10);
     if (c.available()) {
         String zeile = c.readStringUntil('\n');          // "HTTP/1.1 200 OK"
         int sp = zeile.indexOf(' ');
         if (sp > 0) code = zeile.substring(sp + 1, sp + 4).toInt();
+        // Rest der Antwort: sagt der Empfaenger "Duplikat", kannte er die Datei
+        // schon - dann ist unser Eintrag ein Geist (siehe sendeGefundene).
+        uint32_t tr = millis();
+        while ((c.connected() || c.available()) && millis() - tr < 3000) {
+            if (!c.available()) { delay(10); continue; }
+            String z = c.readStringUntil('\n');
+            if (z.indexOf("Duplikat") >= 0) duplikat = true;
+        }
     }
     c.stop();
     if (WiFi.status() == WL_CONNECTED) { g_rssiLetztLast = WiFi.RSSI(); rssiErfassen(g_rssiLetztLast); }
     logZeile(String("[up] ") + name + " " + (geschickt / 1024) + " kB HTTP " + code +
-             " in " + ((millis() - t0) / 1000) + " s");
-    if (code >= 200 && code < 300) { zeigeFertig(geschickt); delay(1200); return true; }
-    return false;
+             (duplikat ? " (Duplikat)" : "") + " in " + ((millis() - t0) / 1000) + " s");
+    if (code >= 200 && code < 300) { zeigeFertig(geschickt); delay(1200); return duplikat ? UP_DUPLIKAT : UP_OK; }
+    return UP_FEHLER;
 }
 
 // ================= Weboberflaeche =================
@@ -1506,6 +1590,11 @@ static void webStarten()
 #define MAX_FUND 24
 static String g_fund[MAX_FUND];
 static int    g_fundAnzahl = 0;
+// Geist-Eintraege (siehe sendeGefundene), die nach dem Remount roh ausgetragen werden
+#define MAX_GEISTER 8
+static String   g_geisterName[MAX_GEISTER];
+static uint32_t g_geisterGroesse[MAX_GEISTER];
+static int      g_geisterAnzahl = 0;
 
 // SCHRITT 1: nur suchen. Reines Lesen - das darf gefahrlos passieren,
 // waehrend der Drucker das Medium noch hat.
@@ -1584,7 +1673,25 @@ static void sendeGefundene(bool wifi, int &hoch, int &fehler)
 
         char idText[32];
         snprintf(idText, sizeof idText, "%08x-%08x", (unsigned)groesse, (unsigned)kennzahl);
-        if (wifi && ladeHoch(SD_MMC, sendePfad, sendeName, String(idText))) {
+        int erg = wifi ? ladeHoch(SD_MMC, sendePfad, sendeName, String(idText)) : UP_FEHLER;
+        if (erg == UP_DUPLIKAT) {
+            // Ein Geist: der Drucker hat nach dem Wiederanmelden seine alte
+            // Verzeichnissicht zurueckgeschrieben, der Eintrag zeigt auf die
+            // Bloecke einer schon gesendeten Datei. Weder loeschen (gaebe die
+            // Bloecke der anderen Datei frei) noch verschieben (Kreuzverkettung,
+            // so lagen in /gesendet Paare wie 204155/204233). Nur den Eintrag
+            // roh austragen - das passiert nach dem Remount in verarbeiteScans.
+            int sl2 = sendePfad.lastIndexOf('/');
+            if (sl2 == 0 && g_geisterAnzahl < MAX_GEISTER) {
+                g_geisterName[g_geisterAnzahl] = sendePfad.substring(1);
+                g_geisterGroesse[g_geisterAnzahl] = groesse;
+                g_geisterAnzahl++;
+                logZeile("[geist] " + sendeName + " kannte der Empfaenger schon - Eintrag wird roh ausgetragen");
+            } else {
+                logZeile("[geist] " + sendeName + " kannte der Empfaenger schon - bleibt liegen");
+            }
+            hoch++;
+        } else if (erg == UP_OK) {
             if (g_loeschen) {
                 SD_MMC.remove(sendePfad);
             } else {
@@ -1647,6 +1754,7 @@ static void verarbeiteScans(bool manuell)
 
         // SCHRITT 3: jetzt sind wir allein auf der Karte
         g_fundAnzahl = 0;
+        g_geisterAnzahl = 0;
         sammleDateien("/", 0);
         bool wifi = wifiVerbinden();
         logFlushNetz();                      // Stand VOR dem Senden sichern - stuerzt es ab, wissen wir wo
@@ -1657,6 +1765,14 @@ static void verarbeiteScans(bool manuell)
         delay(80);
         SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0, SD_D1, SD_D2, SD_D3);
         SD_MMC.begin();
+        // Geister erst jetzt austragen: der Treiber ist frisch und hat keinen
+        // gepufferten Verzeichnissektor mehr, den er zurueckschreiben koennte.
+        for (int i = 0; i < g_geisterAnzahl; i++) {
+            bool ok = rohEintragLoeschen(g_geisterName[i], g_geisterGroesse[i]);
+            logZeile(String("[geist] ") + g_geisterName[i] + (ok ? " ausgetragen, Bloecke unangetastet"
+                                                                  : " NICHT gefunden - bleibt liegen"));
+        }
+        g_geisterAnzahl = 0;
         karteZurueckgeben();
         logZeile("[usb] Stick neu angemeldet");
     } else {

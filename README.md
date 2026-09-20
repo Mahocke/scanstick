@@ -170,6 +170,15 @@ Erst **nachdem** eine fertige Datei gefunden wurde, ist das Abmelden gefahrlos.
 Er hält eine eigene, gepufferte Sicht auf das Verzeichnis und schreibt sie später
 zurück — Umbenennungen und ganze Ordner verschwinden dadurch wieder.
 
+**Der Drucker schreibt seine alte Sicht sogar nach dem Wiederanmelden zurück.** Beim
+nächsten Scan taucht der vorige Scan als „Geist" erneut in der Wurzel auf: ein
+Verzeichniseintrag, der auf die Blöcke der schon gesendeten Datei zeigt. Ihn per
+Dateisystem zu löschen gäbe diese Blöcke frei, also die Daten der anderen Datei; ihn zu
+verschieben hinterließe zwei Einträge auf denselben Blöcken (Kreuzverkettung). Der Stick
+lädt ihn deshalb hoch, der Empfänger erkennt ihn an der Kennung als Duplikat, und der
+Stick trägt daraufhin nur den Verzeichniseintrag roh aus, ohne die Blockzuordnung
+anzufassen. Ein eigener Empfänger muss das Wort `Duplikat` in seiner Antwort tragen.
+
 **Die Dateigröße ist kein Zeichen für „fertig".** Der 780 trägt die endgültige Größe
 ein, *bevor* er schreibt, und reserviert den Platz. Wer darauf vertraut, lädt eine
 halb beschriebene Datei hoch, deren hinterer Teil aus Leerbytes besteht. Deshalb prüft

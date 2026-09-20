@@ -63,9 +63,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         roh = "".join(c for c in roh if c.isalnum() or c in "._- ")
         return roh or ("scan_%d.bin" % int(time.time()))
 
-    def _antwort(self, code, text):
+    def _antwort(self, code, text, duplikat=False):
         self.send_response(code)
         self.send_header("Content-Type", "text/plain")
+        if duplikat:
+            # Der Stick liest das Wort "Duplikat" aus der Antwort und traegt
+            # seinen Geist-Eintrag dann roh aus, statt ihn zu verschieben.
+            self.send_header("X-Scan-Duplikat", "ja")
         self.end_headers()
         self.wfile.write(text.encode() + b"\n")
 
@@ -99,7 +103,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if id_bekannt(scan_id):
             print("[%s] schon empfangen (%s), verworfen: %s (%d Bytes)" % (
                 stempel, scan_id, name, len(daten)))
-            self._antwort(200, "OK (Duplikat, nicht erneut abgelegt)")
+            self._antwort(200, "OK (Duplikat, nicht erneut abgelegt)", duplikat=True)
             return
 
         ordner = PROTOKOLL if name.startswith("scanlog-") else INBOX
