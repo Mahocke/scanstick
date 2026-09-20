@@ -86,6 +86,18 @@ pass=MeinPasswort
 endpoint=http://192.168.1.50:8080/scan
 ```
 
+Mehrere Netze sind erlaubt, bis zu vier: Jede `ssid=`-Zeile beginnt ein neues Netz, das
+folgende `pass=` gehört dazu. Beim Suchlauf gewinnt über alle bekannten Netze hinweg der
+stärkste Zugangspunkt, so läuft derselbe Stick an mehreren Standorten oder am Hotspot.
+
+```
+ssid=Buero
+pass=geheim1
+ssid=Zuhause
+pass=geheim2
+endpoint=http://192.168.1.50:8080/scan
+```
+
 3. Laufwerk auswerfen, Stick abziehen
 
 Beim nächsten Start liest er die Datei und **spiegelt die Zugangsdaten in seinen
@@ -173,8 +185,10 @@ wenn keiner mehr offen ist. Aus demselben Grund gilt als „Ruhe" erst, wenn der
 schreibt **noch liest**.
 
 **Bei mehreren Zugangspunkten mit derselben Kennung** nimmt `WiFi.begin(ssid, pass)`
-den erstbesten, nicht den stärksten. Der Stick sucht deshalb vorher und verbindet sich
-gezielt mit der besten Station.
+den erstbesten, nicht den stärksten. Der Stick sucht deshalb vorher (`WiFiMulti`) und
+verbindet sich gezielt mit der besten Station. Die Kehrseite: Fällt genau diese Station
+aus, versucht der automatische Wiederverbinder nur sie. Nach zwei Minuten ohne Netz sucht
+der Stick deshalb von vorn, über alle bekannten Netze.
 
 ## Weboberfläche
 
@@ -328,9 +342,8 @@ sudo systemctl enable --now scan-receiver
 - **Einrichtungsassistent**: Sind keine Zugangsdaten hinterlegt, soll der Stick ein
   eigenes WLAN aufspannen, in dem man Netz und Ziel im Browser einträgt — dann braucht
   es gar keine Datei mehr
-- **Mehrere WLAN-Netze** hinterlegen und beim Suchlauf über alle bekannten hinweg das
-  stärkste wählen — damit derselbe Stick an verschiedenen Standorten läuft
 - Selbsttätiger Wechsel des Zugangspunkts, wenn der Empfang längere Zeit schwach bleibt
+  (bei komplettem Ausfall sucht er nach zwei Minuten neu; bei nur schwachem Empfang noch nicht)
 - Beim Start einmal nachsehen, ob eine Datei liegengeblieben ist
 - Auch andere Dateitypen als PDF auf Vollständigkeit prüfen
 - Weitere Boards, insbesondere solche ohne Kartensteckplatz (dort müsste der interne

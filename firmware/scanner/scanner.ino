@@ -20,6 +20,7 @@
 #include "FS.h"
 #include "SD_MMC.h"
 #include <WiFi.h>
+#include <WiFiMulti.h>
 #include <HTTPClient.h>
 #include <Arduino_GFX_Library.h>
 #include <WebServer.h>
@@ -335,9 +336,16 @@ static volatile uint32_t g_bytesGeschrieben = 0;   // seit dem letzten Verarbeit
 static uint32_t g_naechsterVersuch = 0;   // 0 = sofort faellig
 static int      g_versuche         = 0;
 
-#define FW_VERSION "v20"
+#define FW_VERSION "v21"
 
-String cfgSsid, cfgPass, cfgEndpoint;
+String cfgEndpoint;
+// Bekannte WLAN-Netze - mehrere, damit derselbe Stick an verschiedenen Standorten
+// laeuft. Beim Suchlauf gewinnt ueber ALLE bekannten Netze hinweg der staerkste
+// Zugangspunkt; WiFiMulti verbindet gezielt mit dessen Kennung und Kanal.
+#define MAX_NETZE 4
+static String    cfgNetzSsid[MAX_NETZE], cfgNetzPass[MAX_NETZE];
+static int       cfgNetze = 0;
+static WiFiMulti g_wifiMulti;
 String cfgWebPass;   // Schutz der Weboberflaeche; leer = offen
 String cfgPraefix = "scan";   // Namensanfang der Dateien, z.B. "buero-774"
 static bool g_zeitOk        = false;   // NTP-Zeit vorhanden?
@@ -650,6 +658,9 @@ static bool ladeConfig()
         return false;
     }
 
+    // Jede ssid=-Zeile beginnt ein neues Netz, pass= gehoert zur letzten ssid.
+    String neuSsid[MAX_NETZE], neuPass[MAX_NETZE];
+    int neu = 0;
     int von = 0;
     while (von < (int)inhalt.length()) {
         int bis = inhalt.indexOf('\n', von);
@@ -661,14 +672,20 @@ static bool ladeConfig()
         if (eq < 1) continue;
         String k = line.substring(0, eq); k.trim();
         String v = line.substring(eq + 1); v.trim();
-        if (k == "ssid") cfgSsid = v;
-        else if (k == "pass") cfgPass = v;
+        if (k == "ssid") { if (neu < MAX_NETZE) { neuSsid[neu] = v; neuPass[neu] = ""; neu++; } }
+        else if (k == "pass") { if (neu) neuPass[neu - 1] = v; }
         else if (k == "endpoint") cfgEndpoint = v;
+    }
+    if (neu) {
+        cfgNetze = neu;
+        for (int i = 0; i < neu; i++) { cfgNetzSsid[i] = neuSsid[i]; cfgNetzPass[i] = neuPass[i]; }
     }
     g_nvs.begin("scanstick", false);
     g_nvs.putUInt("cfgstand", stand);
     g_nvs.end();
-    logZeile(String("[cfg] /wifi.cfg neu uebernommen: ssid=") + cfgSsid + " endpoint=" + cfgEndpoint);
+    String liste;
+    for (int i = 0; i < cfgNetze; i++) liste += (i ? ", " : "") + cfgNetzSsid[i];
+    logZeile(String("[cfg] /wifi.cfg neu uebernommen: Netze=") + liste + " endpoint=" + cfgEndpoint);
     return true;
 }
 
@@ -700,8 +717,26 @@ static const char *resetGrund()
 static void cfgAusNvs()
 {
     g_nvs.begin("scanstick", true);
-    cfgSsid     = g_nvs.getString("ssid", "");
-    cfgPass     = g_nvs.getString("pass", "");
+    // Netze als Zeilen "ssid<TAB>pass". Aeltere Staende kennen nur ssid/pass.
+    String netze = g_nvs.getString("netze", "");
+    cfgNetze = 0;
+    if (netze.isEmpty()) {
+        String s = g_nvs.getString("ssid", "");
+        if (s.length()) { cfgNetzSsid[0] = s; cfgNetzPass[0] = g_nvs.getString("pass", ""); cfgNetze = 1; }
+    } else {
+        int von = 0;
+        while (von < (int)netze.length() && cfgNetze < MAX_NETZE) {
+            int bis = netze.indexOf('\n', von);
+            if (bis < 0) bis = netze.length();
+            String zeile = netze.substring(von, bis);
+            von = bis + 1;
+            int tab = zeile.indexOf('\t');
+            if (tab < 1) continue;
+            cfgNetzSsid[cfgNetze] = zeile.substring(0, tab);
+            cfgNetzPass[cfgNetze] = zeile.substring(tab + 1);
+            cfgNetze++;
+        }
+    }
     cfgEndpoint = g_nvs.getString("endpoint", "");
     cfgWebPass  = g_nvs.getString("webpass", "");
     cfgPraefix  = g_nvs.getString("praefix", "scan");
@@ -717,14 +752,15 @@ static void cfgAusNvs()
     g_farbeSendet = g_nvs.getUInt("fsendet", g_farbeSendet);
     g_farbeFertig = g_nvs.getUInt("ffertig", g_farbeFertig);
     g_nvs.end();
-    if (cfgSsid.length()) logZeile(String("[nvs] Zugangsdaten aus Flash: ssid=") + cfgSsid);
+    if (cfgNetze) logZeile(String("[nvs] ") + cfgNetze + " Netz(e) aus dem Flash, erstes: " + cfgNetzSsid[0]);
 }
 
 static void cfgNachNvs()
 {
     g_nvs.begin("scanstick", false);
-    g_nvs.putString("ssid", cfgSsid);
-    g_nvs.putString("pass", cfgPass);
+    String netze;
+    for (int i = 0; i < cfgNetze; i++) netze += cfgNetzSsid[i] + "\t" + cfgNetzPass[i] + "\n";
+    g_nvs.putString("netze", netze);
     g_nvs.putString("endpoint", cfgEndpoint);
     g_nvs.putString("webpass", cfgWebPass);
     g_nvs.putString("praefix", cfgPraefix);
@@ -747,57 +783,44 @@ static void cfgNachNvs()
 static String  g_apKennung;      // Kennung des gewaehlten Zugangspunkts
 static int     g_apKanal  = 0;
 static long    g_apRssi   = 0;
-static int     g_apAnzahl = 0;   // wie viele tragen dieselbe SSID
+static uint32_t g_wlanVerloren = 0;   // seit wann ohne Netz (0 = verbunden)
+#define WLAN_NEUSUCHE 120000          // so lange ohne Netz, dann neu suchen
 
-// Mehrere Zugangspunkte koennen dieselbe SSID tragen (einzelne APs, kein Mesh).
-// WiFi.begin(ssid, pass) nimmt dann den erstbesten - nicht den staerksten.
-// Deshalb vorher suchen und gezielt zur besten Kennung verbinden.
+// Mehrere Zugangspunkte koennen dieselbe SSID tragen (einzelne APs, kein Mesh),
+// und der Stick kennt mehrere Netze. WiFiMulti sucht ueber alle bekannten Netze
+// hinweg, nimmt den staerksten Zugangspunkt und verbindet gezielt mit dessen
+// Kennung und Kanal. Blockiert bis zur Verbindung oder WIFI_TIMEOUT - deshalb
+// laeuft das erst, wenn der Drucker den Stick schon als Laufwerk sieht.
+//
+// Die feste Kennung hat eine Kehrseite: faellt genau dieser Zugangspunkt aus,
+// versucht der Auto-Reconnect nur ihn. Darum sucht loop() nach zwei Minuten
+// ohne Netz von vorn - dann darf es auch ein anderer Zugangspunkt sein.
 static void wlanStarten()
 {
-    if (cfgSsid.isEmpty()) { logZeile("[wifi] keine SSID bekannt"); return; }
+    if (!cfgNetze) { logZeile("[wifi] kein Netz bekannt"); return; }
     WiFi.mode(WIFI_STA);
     WiFi.setHostname("scanstick");
+    g_wifiMulti.APlistClean();
+    for (int i = 0; i < cfgNetze; i++) g_wifiMulti.addAP(cfgNetzSsid[i].c_str(), cfgNetzPass[i].c_str());
 
-    int gefunden = WiFi.scanNetworks(false, false);
-    int besterIndex = -1;
-    long bestesRssi = -1000;
-    g_apAnzahl = 0;
-    for (int i = 0; i < gefunden; i++) {
-        if (WiFi.SSID(i) != cfgSsid) continue;
-        g_apAnzahl++;
-        if (WiFi.RSSI(i) > bestesRssi) { bestesRssi = WiFi.RSSI(i); besterIndex = i; }
-    }
-
-    if (besterIndex >= 0) {
-        g_apKennung = WiFi.BSSIDstr(besterIndex);
-        g_apKanal   = WiFi.channel(besterIndex);
-        g_apRssi    = bestesRssi;
-        logZeile(String("[wifi] ") + g_apAnzahl + " Zugangspunkt(e) mit dieser SSID, nehme " +
-                 g_apKennung + " auf Kanal " + g_apKanal + " mit " + g_apRssi + " dBm");
-        WiFi.begin(cfgSsid.c_str(), cfgPass.c_str(), g_apKanal, WiFi.BSSID(besterIndex));
+    if (g_wifiMulti.run(WIFI_TIMEOUT) == WL_CONNECTED) {
+        g_apKennung = WiFi.BSSIDstr();
+        g_apKanal   = WiFi.channel();
+        g_apRssi    = WiFi.RSSI();
+        g_wlanVerloren = 0;
+        logZeile(String("[wifi] ") + WiFi.SSID() + " ueber " + g_apKennung + " auf Kanal " +
+                 g_apKanal + " mit " + g_apRssi + " dBm, IP " + WiFi.localIP().toString());
     } else {
-        logZeile(String("[wifi] ") + cfgSsid + " nicht gefunden, versuche es trotzdem");
         g_apKennung = "";
-        WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
+        logZeile("[wifi] kein bekanntes Netz erreichbar");
     }
-    WiFi.scanDelete();
 }
 
 static bool wifiVerbinden()
 {
     if (WiFi.status() == WL_CONNECTED) return true;
-    if (cfgSsid.isEmpty()) { Serial.println("[wifi] keine SSID"); return false; }
-    Serial.printf("[wifi] verbinde mit %s ...\n", cfgSsid.c_str());
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
-    uint32_t t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_TIMEOUT) delay(200);
-    if (WiFi.status() == WL_CONNECTED) {
-        logZeile(String("[wifi] verbunden, IP=") + WiFi.localIP().toString());
-        return true;
-    }
-    logZeile("[wifi] Zeitueberschreitung");
-    return false;
+    wlanStarten();
+    return WiFi.status() == WL_CONNECTED;
 }
 
 // http://host[:port]/pfad zerlegen
@@ -1091,8 +1114,13 @@ static void webStatus()
               : "<span class=\"bad\">nicht verbunden</span>");
     if (g_apKennung.length())
         h += zl("Zugangspunkt", g_apKennung + ", Kanal " + String(g_apKanal) +
-                ", bei der Wahl " + String(g_apRssi) + " dBm <small>(" + String(g_apAnzahl) +
-                " mit dieser SSID gefunden, staerkster genommen)</small>");
+                ", bei der Wahl " + String(g_apRssi) + " dBm <small>(staerkster ueber alle "
+                "bekannten Netze)</small>");
+    {
+        String liste;
+        for (int i = 0; i < cfgNetze; i++) liste += (i ? ", " : "") + cfgNetzSsid[i];
+        h += zl("Bekannte Netze", cfgNetze ? liste : "<span class=\"bad\">keine</span>");
+    }
     h += zl("Ziel fuer Uploads", cfgEndpoint.length() ? cfgEndpoint : "<span class=\"bad\">nicht gesetzt</span>");
     h += zl("Ruhefrist bis \"fertig\"", dauer(g_idleMs));
     h += zl("Nach dem Senden", g_loeschen ? "loeschen" : "nach /gesendet verschieben");
@@ -1659,7 +1687,6 @@ void setup()
     // auch hoch, wenn die Karte fehlt oder nicht mountet - dann kann der Stick
     // selbst melden, was ihm fehlt, statt stumm zu bleiben.
     cfgAusNvs();
-    wlanStarten();
 
     SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0, SD_D1, SD_D2, SD_D3);
     bool sdOk = SD_MMC.begin("/sdcard", false, false);
@@ -1669,7 +1696,6 @@ void setup()
     if (sdOk && ladeConfig()) {          // nur eine GEAENDERTE /wifi.cfg gewinnt
         cfgNachNvs();
         logZeile("[nvs] aus /wifi.cfg uebernommen");
-        if (WiFi.status() != WL_CONNECTED) wlanStarten();
     }
 
     MSC.vendorID("DIY");
@@ -1689,6 +1715,10 @@ void setup()
     MSC.begin(rawSectors, sec ? sec : 512);
     USB.begin();
     Serial.println("[usb] als USB-Speicher gestartet");
+
+    // WLAN erst jetzt: der Suchlauf blockiert einige Sekunden, und der Drucker
+    // soll den Stick sofort als Laufwerk sehen, nicht erst nach dem WLAN.
+    wlanStarten();
     if (g_screen != Z_SDFEHL) zeigeScreen(Z_BEREIT);
 }
 
@@ -1722,6 +1752,17 @@ void loop()
         g_stopNeu = false;
         logZeile(String("[scsi] START STOP UNIT: start=") + (g_stopStart ? "ja" : "nein") +
                  " eject=" + (g_stopEject ? "ja" : "nein") + " pc=" + g_stopPc);
+    }
+    // Netz weg? Der Auto-Reconnect haengt an der festen Kennung des einen
+    // Zugangspunkts. Nach zwei Minuten ohne Netz neu suchen, ueber alle Netze.
+    if (WiFi.status() != WL_CONNECTED && cfgNetze) {
+        if (!g_wlanVerloren) g_wlanVerloren = millis() ? millis() : 1;
+        else if (millis() - g_wlanVerloren > WLAN_NEUSUCHE) {
+            logZeile("[wifi] zwei Minuten ohne Netz - suche neu");
+            g_wlanVerloren = 0;
+            wlanStarten();
+            if (WiFi.status() != WL_CONNECTED) g_wlanVerloren = millis() ? millis() : 1;
+        }
     }
     if (WiFi.status() == WL_CONNECTED && !g_webAn) { webStarten(); zeitHolen(); }
     if (g_webAn) g_web.handleClient();
