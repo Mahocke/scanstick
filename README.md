@@ -444,6 +444,26 @@ sudo systemctl enable --now scan-receiver
 - Further boards, in particular ones without a card slot (there the internal flash would
   have to serve as storage)
 
+## Contributing
+
+The stick has been developed on a single printer, a single receiver and a single board.
+Three areas are waiting for experience from other setups - please open an issue, the
+templates ask for what is needed:
+
+- **Other printers.** Every printer talks to a USB stick a little differently (see
+  "Pitfalls"). If yours behaves differently, the stick log (`/log`) during a scan and the
+  printer model and firmware version are the most valuable input.
+- **Other destinations.** The stick only knows a URL; `empfaenger/scan-receiver.py` is a
+  minimal example. Receivers for cloud storage, mail, DMS or a NAS are welcome - as a
+  separate script or as a pointer to your own repository.
+- **Other boards.** Requirements: an ESP32-S3 (native USB for the mass-storage role),
+  a card slot on SD_MMC and ideally a USB-A plug so it fits a printer directly. Pin
+  tables and build settings (FQBN) for further boards are welcome.
+
+Pull requests are welcome too. Please keep them small and describe how you tested; the
+CI build runs automatically. Do not put private IPs, hostnames or credentials into the
+code or the pull request text.
+
 ## License
 
 MIT, see `LICENSE`.
