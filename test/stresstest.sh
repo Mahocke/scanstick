@@ -26,6 +26,8 @@
 #   D  fuenf Jobs Schlag auf Schlag, jeder in eigenem Einhaengen und mit den
 #      Namen des Druckers; zaehlt, wie oft das Medium gerade weg war - genau
 #      diese Jobs haette ein Drucker abgewiesen
+#   W  (nur auf Wunsch) zweimal dieselbe Groesse nacheinander, dazwischen
+#      aufgeraeumt: gleicher Startblock, neuer Inhalt - muss ankommen
 #   E  (nur auf Wunsch) Karte absichtlich beschaedigen - Kette laeuft in eine
 #      andere, verwaiste Cluster, Schmutzmarke - und den Stick heilen lassen;
 #      fsck muss danach sauber sein
@@ -225,6 +227,23 @@ for i in 1 2 3 4 5; do
 done
 for i in 1 2 3 4 5; do [ -f "$ARBEIT/d$i.pdf" ] && warte_ankunft "$ARBEIT/d$i.pdf" 300; done
 log "  Szenario D: $VERPASST von 5 Jobs haette der Drucker abgewiesen"
+fi
+
+# ---- Szenario W: gleiche Groesse, gleicher Startblock, neuer Inhalt ----
+# Nach dem Aufraeumen ist die Karte leer, der naechste Scan landet auf demselben
+# Startblock wie der vorige - und zweimal dasselbe Blatt hat dieselbe Groesse.
+# Der Stick darf das nicht fuer die Wiederkehr der alten Datei halten.
+if [[ $SZENARIEN == *W* ]]; then
+log "Szenario W: zweimal 300 kB nacheinander, dazwischen aufgeraeumt"
+mach_pdf "$ARBEIT/w1.pdf" 300000
+schreibe "$ARBEIT/w1.pdf"
+warte_ankunft "$ARBEIT/w1.pdf" 180
+sleep 8
+"${CURL[@]}" -X POST "$STICK/aufraeumen" >/dev/null
+sleep 6
+mach_pdf "$ARBEIT/w2.pdf" 300000                # gleiche Groesse, anderer Inhalt
+schreibe "$ARBEIT/w2.pdf"
+warte_ankunft "$ARBEIT/w2.pdf" 180
 fi
 
 # ---- Szenario E: beschaedigte Karte heilen ----

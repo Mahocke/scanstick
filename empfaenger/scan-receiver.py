@@ -128,7 +128,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         name_roh = params.get("name", [""])[0]
         id_roh = params.get("id", [""])[0]
         name = self._sicherer_name(name_roh)
-        scan_id = self._sicherer_name(id_roh)
+        scan_id = self._sicherer_name(id_roh) if id_roh else ""   # ohne Kennung nichts merken
         laenge = int(self.headers.get("Content-Length", 0))
         daten = self.rfile.read(laenge) if laenge else b""
         stempel = time.strftime("%H:%M:%S")

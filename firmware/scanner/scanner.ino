@@ -360,7 +360,7 @@ static volatile uint32_t g_bytesGeschrieben = 0;   // seit dem letzten Verarbeit
 static uint32_t g_naechsterVersuch = 0;   // 0 = sofort faellig
 static int      g_versuche         = 0;
 
-#define FW_VERSION "v32"
+#define FW_VERSION "v33"
 
 String cfgEndpoint;
 // Bekannte WLAN-Netze - mehrere, damit derselbe Stick an verschiedenen Standorten
@@ -1039,6 +1039,11 @@ static uint32_t rohKennzahl(const RohEintrag &e)
             for (uint32_t i = im > 256 ? im - 256 : 0; i < im; i++) summe = summe * 31u + sek[i];
         }
     }
+    if (e.groesse > 2048) {                         // und ein Stueck aus der Mitte (Bilddaten)
+        sk = rohSektor(e.start, e.groesse / 1024, fatBuf);
+        if (sk && SD_MMC.readRAW(sek, sk))
+            for (uint32_t i = 0; i < 256; i++) summe = summe * 31u + sek[i];
+    }
     free(sek);
     free(fatBuf);
     return summe;
@@ -1114,6 +1119,26 @@ static bool istGeloescht(uint32_t start, uint32_t groesse)
     return false;
 }
 
+// Startblock und Groesse allein reichen NICHT: nach dem Aufraeumen ist die Karte
+// leer, der naechste Scan landet auf demselben Startblock, und zweimal dasselbe
+// Blatt hat dieselbe Groesse. Am 20.09.2026 galt so eine neue Datei als Geist
+// und wurde nie gesendet. Erst die Kennzahl aus dem Inhalt unterscheidet die
+// Wiederkehr einer alten Datei von einer neuen an derselben Stelle.
+static int fertigIndexE(const RohEintrag &e)
+{
+    int i = fertigIndex(e.start, e.groesse);
+    if (i >= 0 && g_fertig[i].kennzahl && rohKennzahl(e) != g_fertig[i].kennzahl) return -1;
+    return i;
+}
+
+static bool istGeloeschtE(const RohEintrag &e)
+{
+    for (int i = 0; i < g_geloeschtAnzahl; i++)
+        if (g_geloescht[i].start == e.start && g_geloescht[i].groesse == e.groesse)
+            return !g_geloescht[i].kennzahl || rohKennzahl(e) == g_geloescht[i].kennzahl;
+    return false;
+}
+
 static void fertigMerken(const RohEintrag &e, uint32_t kennzahl, const String &sendeName)
 {
     if (fertigIndex(e.start, e.groesse) >= 0) return;
@@ -1142,7 +1167,7 @@ static bool rohOffen()
     bool offen = false;
     for (int i = 0; i < n && !offen; i++) {
         RohEintrag &e = liste[i];
-        if (fertigIndex(e.start, e.groesse) >= 0 || istGeloescht(e.start, e.groesse)) continue;
+        if (fertigIndexE(e) >= 0 || istGeloeschtE(e)) continue;
         if (e.start < 2 || (fatBuf && fatNaechster(e.start, fatBuf) == 0)) continue;
         bool geteilt = false;
         for (int k = 0; k < n; k++) if (k != i && liste[k].start == e.start) geteilt = true;
@@ -1159,7 +1184,7 @@ static void rohOffenSumme(int &anzahl, uint32_t &summe)
     RohEintrag liste[MAX_FUND];
     int n = rohListe(0, liste, MAX_FUND, true);
     for (int i = 0; i < n; i++)
-        if (fertigIndex(liste[i].start, liste[i].groesse) < 0 && !istGeloescht(liste[i].start, liste[i].groesse)) {
+        if (fertigIndexE(liste[i]) < 0 && !istGeloeschtE(liste[i])) {
             anzahl++;
             summe += liste[i].groesse;
         }
@@ -2101,8 +2126,8 @@ static void webDateien()
         h += "<table><tr><th>Wurzel (roh)</th><th>Groesse</th><th>Stand</th></tr>";
         for (int i = 0; i < n; i++) {
             String nm = liste[i].name;
-            String stand = fertigIndex(liste[i].start, liste[i].groesse) >= 0 ? "<span class=\"ok\">gesendet</span>"
-                         : istGeloescht(liste[i].start, liste[i].groesse) ? "<span class=\"warn\">Geist</span>"
+            String stand = fertigIndexE(liste[i]) >= 0 ? "<span class=\"ok\">gesendet</span>"
+                         : istGeloeschtE(liste[i]) ? "<span class=\"warn\">Geist</span>"
                          : istScanName(nm) && liste[i].groesse >= ROH_MIN_GROESSE ? "<span class=\"warn\">offen</span>" : "";
             h += "<tr><td><a href=\"/holen?p=" + urlKodiert("/" + nm) + "\">" + nm + "</a></td><td>" +
                  menschlich(liste[i].groesse) + "</td><td>" + stand + "</td></tr>";
@@ -2541,8 +2566,8 @@ static void verarbeiteRoh(bool manuell)
 
     for (int i = 0; i < n && fatBuf; i++) {
         RohEintrag &e = liste[i];
-        if (fertigIndex(e.start, e.groesse) >= 0) { bekannt++; continue; }
-        if (istGeloescht(e.start, e.groesse)) {
+        if (fertigIndexE(e) >= 0) { bekannt++; continue; }
+        if (istGeloeschtE(e)) {
             logZeile(String("[geist] ") + e.name + " ist die Wiederkehr einer weggeraeumten Datei - wartet aufs Aufraeumen");
             geister++;
             continue;
@@ -2693,13 +2718,13 @@ static void aufraeumFenster(const String &grund)
         g_fertigAnzahl--;
     }
     for (int i = 0; i < n; i++) {
-        int fi = fertigIndex(liste[i].start, liste[i].groesse);
+        int fi = fertigIndexE(liste[i]);
         if (fi < 0) {
             // Nicht gesendet und keine Endmarke: ein abgebrochener Scan (Stromschnitt,
             // Schreibfehler des Druckers). Der Drucker fragt beim naechsten Job sonst
             // "Datei bereits vorhanden" - und nach der Ruhefrist schreibt er da sicher
             // nicht mehr weiter.
-            if (!istGeloescht(liste[i].start, liste[i].groesse) && !rohVollstaendig(liste[i])) {
+            if (!istGeloeschtE(liste[i]) && !rohVollstaendig(liste[i])) {
                 String pfad = "/" + String(liste[i].name);
                 bool ok = SD_MMC.remove(pfad);
                 logZeile(String("[aufraeumen] unfertige Datei ") + liste[i].name + " (" + (liste[i].groesse / 1024) +
