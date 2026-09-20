@@ -41,12 +41,13 @@ Drucker schreibt Sektoren   →   Stick erkennt Schreibzugriffe
 
 **Im Betrieb wird das Medium nie abgemeldet.** Der Stick fasst weder den Dateisystem-Treiber
 noch die Karte an, solange gescannt wird: Er liest Verzeichnis, Belegungstabelle und
-Datenblöcke direkt aus den Sektoren. Umbenennen ist unnötig, der Drucker nennt den nächsten
-Scan von selbst `[Untitled]_<Zeit>.pdf`. Was gesendet ist, steht in einer Merkliste im
-Flash und wird nicht erneut gesendet.
+Datenblöcke direkt aus den Sektoren. Umbenennen ist unnötig. Was gesendet ist, steht in einer
+Merkliste im Flash (Startblock, Größe, Kennzahl) und wird nicht erneut gesendet. Liegt die
+gesendete Datei noch da, fragt der 780 beim nächsten Scan „Datei bereits vorhanden" —
+„Ersetzen" ist richtig, die neue Fassung gilt als neu.
 
 Aufgeräumt wird nur in einer Ruhephase: nach einer einstellbaren Zeit ohne jeden Zugriff des
-Druckers (Vorgabe 15 Minuten), wenn die Merkliste voll wird, oder auf Knopfdruck in der
+Druckers (Vorgabe 3 Minuten — der 780 fasst den Stick zwischen Jobs nicht an), wenn die Merkliste voll wird, oder auf Knopfdruck in der
 Weboberfläche. Das ist der einzige Moment, in dem das Medium kurz weg ist, und dann steht
 niemand am Gerät. Frühere Fassungen nahmen dem Drucker das Medium bei jedem Scan weg, zuerst
 für die Dauer des Uploads, zuletzt für eine halbe Sekunde; jeder Job, der genau dann startete
