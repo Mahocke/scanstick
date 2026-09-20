@@ -274,12 +274,21 @@ static uint32_t g_rohLetzt  = 0;
 static uint32_t g_rohSumme  = 0;
 static int      g_rohAnzahl = 0;
 static int      g_rohStabil = 0;
+// Fuer die Anzeige zaehlt nur, was noch nicht gesendet ist - sonst stand nach
+// jedem Schreibzugriff des Druckers "SCAN ERKANNT" mit der Groesse laengst
+// gesendeter Dateien auf dem Display.
+static int      g_zeigAnzahl  = 0;
+static uint32_t g_zeigSumme   = 0;
+static uint32_t g_rohGeprueft = 0;   // millis() der letzten rohen Nachschau
+static int      g_fristModus  = -1;
 
 static void zeigeFrist(uint32_t restSek)
 {
+    int modus = g_zeigAnzahl ? 1 : 0;
     if (g_screen != Z_FRIST) {
         g_screen = Z_FRIST;
         g_fristLetzt = -1;
+        g_fristModus = -1;
         uint32_t rgb = g_farbe[Z_FRIST];
         ledColor(rgb >> 16, (rgb >> 8) & 0xFF, rgb & 0xFF);
         g_gfx->fillScreen(rgb565(rgb));
@@ -287,21 +296,27 @@ static void zeigeFrist(uint32_t restSek)
         g_gfx->setTextSize(2);
         g_gfx->setCursor(5, 4);
         g_gfx->print("SCAN ERKANNT");
+    }
+    if (modus != g_fristModus) {
+        g_fristModus = modus;
+        g_fristLetzt = -1;
+        g_gfx->fillRect(5, 66, 150, 12, rgb565(g_farbe[Z_FRIST]));
+        g_gfx->setTextColor(COL_BLACK);
         g_gfx->setTextSize(1);
         g_gfx->setCursor(5, 68);
-        g_gfx->print(g_rohAnzahl ? "pruefe ob fertig" : "warte auf Ruhe");
+        g_gfx->print(modus ? "pruefe ob fertig" : "warte auf Ruhe");
     }
-    // Sobald wir die Datei roh sehen, ist ihre Groesse die ehrlichere Angabe
+    // Sobald wir die neue Datei roh sehen, ist ihre Groesse die ehrlichere Angabe
     // als ein Countdown, der ohnehin vorzeitig endet.
-    int wert = g_rohAnzahl ? (int)(g_rohSumme / 1024) : (int)restSek;
+    int wert = modus ? (int)(g_zeigSumme / 1024) : (int)restSek;
     if (wert != g_fristLetzt) {
         g_fristLetzt = wert;
         g_gfx->fillRect(5, 26, 150, 36, rgb565(g_farbe[Z_FRIST]));
         g_gfx->setTextColor(COL_BLACK);
-        g_gfx->setTextSize(g_rohAnzahl ? 3 : 4);
+        g_gfx->setTextSize(modus ? 3 : 4);
         g_gfx->setCursor(5, 30);
-        if (g_rohAnzahl) g_gfx->printf("%d kB", wert);
-        else             g_gfx->printf("%ds", wert);
+        if (modus) g_gfx->printf("%d kB", wert);
+        else       g_gfx->printf("%ds", wert);
     }
 }
 
@@ -344,7 +359,7 @@ static volatile uint32_t g_bytesGeschrieben = 0;   // seit dem letzten Verarbeit
 static uint32_t g_naechsterVersuch = 0;   // 0 = sofort faellig
 static int      g_versuche         = 0;
 
-#define FW_VERSION "v29"
+#define FW_VERSION "v30"
 
 String cfgEndpoint;
 // Bekannte WLAN-Netze - mehrere, damit derselbe Stick an verschiedenen Standorten
@@ -381,6 +396,12 @@ static volatile bool g_sdGesperrt  = false;  // Hauptschleife hat die Karte
 #define SPUR_ANZAHL 32
 static volatile uint32_t g_spurLba[SPUR_ANZAHL], g_spurN[SPUR_ANZAHL], g_spurT[SPUR_ANZAHL];
 static volatile int      g_spurIdx = 0;
+// Abgewiesene Host-Zugriffe: Antwort -1 heisst fuer den Drucker "Medienfehler".
+// Passiert das mitten in einem Scan, bricht er still ab - deshalb zaehlen und
+// im Protokoll und auf der Statusseite zeigen.
+static volatile uint32_t g_usbFehlerLesen = 0, g_usbFehlerSchreiben = 0;
+static volatile uint32_t g_usbFehlerLba = 0, g_usbFehlerZeit = 0;
+static uint32_t          g_usbFehlerGemeldet = 0;
 static void logZeile(const String &msg);     // steht weiter unten
 static void logFlushNetz();                  // ebenfalls
 
@@ -388,7 +409,7 @@ static int32_t onWrite(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t 
 {
     // Rueckgabe 0 heisst fuer TinyUSB "beschaeftigt, gleich nochmal" - bei einem
     // echten Kartenfehler haengt der Host damit endlos. Negativ = sauberer Fehler.
-    if (g_sdGesperrt) return -1;
+    if (g_sdGesperrt) { g_usbFehlerSchreiben++; g_usbFehlerLba = lba; g_usbFehlerZeit = millis(); return -1; }
     g_usbZugriffe++;
     int32_t ergebnis = -1;
     uint32_t sec = SD_MMC.sectorSize();
@@ -406,6 +427,7 @@ static int32_t onWrite(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t 
         g_spurLba[i] = lba; g_spurN[i] = bufsize / (sec ? sec : 512); g_spurT[i] = millis();
         g_spurIdx = (i + 1) % SPUR_ANZAHL;
     }
+    if (ergebnis < 0) { g_usbFehlerSchreiben++; g_usbFehlerLba = lba; g_usbFehlerZeit = millis(); }
     g_lastHost = millis();
     g_usbZugriffe--;
     return ergebnis;
@@ -413,7 +435,7 @@ static int32_t onWrite(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t 
 
 static int32_t onRead(uint32_t lba, uint32_t offset, void *buffer, uint32_t bufsize)
 {
-    if (g_sdGesperrt) return -1;
+    if (g_sdGesperrt) { g_usbFehlerLesen++; g_usbFehlerLba = lba; g_usbFehlerZeit = millis(); return -1; }
     g_usbZugriffe++;
     int32_t ergebnis = -1;
     uint32_t sec = SD_MMC.sectorSize();
@@ -423,6 +445,7 @@ static int32_t onRead(uint32_t lba, uint32_t offset, void *buffer, uint32_t bufs
             if (g_sdGesperrt || !SD_MMC.readRAW((uint8_t *)buffer + x * sec, lba + x)) { ergebnis = -1; break; }
         }
     }
+    if (ergebnis < 0) { g_usbFehlerLesen++; g_usbFehlerLba = lba; g_usbFehlerZeit = millis(); }
     g_lastHost = millis();
     g_usbZugriffe--;
     return ergebnis;
@@ -1097,6 +1120,19 @@ static bool rohOffen()
     return false;
 }
 
+// Was in der Wurzel noch NICHT gesendet ist - fuer die Anzeige.
+static void rohOffenSumme(int &anzahl, uint32_t &summe)
+{
+    anzahl = 0; summe = 0;
+    RohEintrag liste[MAX_FUND];
+    int n = rohListe(0, liste, MAX_FUND, true);
+    for (int i = 0; i < n; i++)
+        if (fertigIndex(liste[i].start, liste[i].groesse) < 0 && !istGeloescht(liste[i].start, liste[i].groesse)) {
+            anzahl++;
+            summe += liste[i].groesse;
+        }
+}
+
 #define AUFRAEUM_VORGABE 15          // Minuten ohne Zugriff des Druckers
 static uint32_t g_aufraeumMin      = AUFRAEUM_VORGABE;
 static bool     g_aufraeumJetzt    = false;
@@ -1518,6 +1554,8 @@ static String menschlich(uint64_t b)
     return String(t);
 }
 
+static String spurText(bool html);
+
 static String dauer(uint32_t ms)
 {
     char t[32];
@@ -1526,6 +1564,24 @@ static String dauer(uint32_t ms)
     else if (sek < 5400) snprintf(t, sizeof t, "%u min %u s", sek / 60, sek % 60);
     else snprintf(t, sizeof t, "%u h %u min", sek / 3600, (sek % 3600) / 60);
     return String(t);
+}
+
+// Die letzten Schreibzugriffe des Hosts als Text: fuer die Statusseite (html)
+// und fuers Protokoll, wenn ein Zyklus nichts hochgeladen hat.
+static String spurText(bool html)
+{
+    String spur;
+    for (int k = 0; k < SPUR_ANZAHL; k++) {
+        int i = (g_spurIdx + k) % SPUR_ANZAHL;
+        if (!g_spurT[i]) continue;
+        uint32_t lba = g_spurLba[i];
+        const char *wo = !g_fat.gueltig ? "?" : lba < g_fat.fatStart ? "Boot"
+                       : lba < g_fat.ersterDatenSektor ? "FAT"
+                       : lba < clusterSektor(g_fat.rootCluster) + g_fat.sektorenProCluster ? "Wurzel" : "Daten";
+        if (html) spur += String("vor ") + dauer(millis() - g_spurT[i]) + ": " + lba + " +" + g_spurN[i] + " (" + wo + ")<br>";
+        else      spur += String(lba) + "+" + g_spurN[i] + wo[0] + " ";
+    }
+    return spur;
 }
 
 // Die Seite gibt gescannte Post zum Herunterladen frei. Ohne Passwort kann
@@ -1637,17 +1693,11 @@ static void webStatus()
     if (g_rssiLetztLast)
         h += zl("Empfang am Ende des letzten Uploads", String(g_rssiLetztLast) + " dBm");
     {
-        String spur;
-        for (int k = 0; k < SPUR_ANZAHL; k++) {
-            int i = (g_spurIdx + k) % SPUR_ANZAHL;
-            if (!g_spurT[i]) continue;
-            uint32_t lba = g_spurLba[i];
-            const char *wo = !g_fat.gueltig ? "?" : lba < g_fat.fatStart ? "Boot"
-                           : lba < g_fat.ersterDatenSektor ? "FAT"
-                           : lba < clusterSektor(g_fat.rootCluster) + g_fat.sektorenProCluster ? "Wurzel" : "Daten";
-            spur += String("vor ") + dauer(millis() - g_spurT[i]) + ": " + lba + " +" + g_spurN[i] + " (" + wo + ")<br>";
-        }
+        String spur = spurText(true);
         h += zl("Letzte Schreibzugriffe des Hosts", spur.length() ? "<small>" + spur + "</small>" : "keine");
+        String fehler = String((uint32_t)g_usbFehlerLesen) + " lesen, " + String((uint32_t)g_usbFehlerSchreiben) + " schreiben";
+        if (g_usbFehlerZeit) fehler += " <small>(zuletzt vor " + dauer(millis() - g_usbFehlerZeit) + ", Sektor " + String((uint32_t)g_usbFehlerLba) + ")</small>";
+        h += zl("Abgewiesene Host-Zugriffe", (g_usbFehlerLesen || g_usbFehlerSchreiben) ? "<span class=warn>" + fehler + "</span>" : "keine");
     }
     h += zl("Laufzeit", dauer(millis()));
     h += zl("Letzter Startgrund", g_startGrund);
@@ -2179,6 +2229,12 @@ static void verarbeiteRoh(bool manuell)
 
     logZeile(String("[scan] fertig: ") + hoch + " hochgeladen, " + bekannt + " schon bekannt, " + fehler +
              " Fehler, vom Host geschrieben: " + (g_bytesGeschrieben / 1024) + " kB");
+    if (hoch == 0) {
+        // Der Drucker hat geschrieben, aber keine neue Datei liegt da - was genau
+        // hat er geschrieben? (Sektor+Anzahl, F=FAT W=Wurzel D=Daten B=Boot)
+        String spur = spurText(false);
+        if (spur.length()) logZeile("[spur] " + spur);
+    }
     if (hoch > 0) g_bytesGeschrieben = 0;
 
     if ((int32_t)(g_lastWrite - begonnen) > 0) {
@@ -2429,6 +2485,15 @@ void loop()
     if (WiFi.status() == WL_CONNECTED && !g_webAn) { webStarten(); zeitHolen(); }
     if (g_webAn) g_web.handleClient();
 
+    {
+        uint32_t f = g_usbFehlerLesen + g_usbFehlerSchreiben;
+        if (f != g_usbFehlerGemeldet && millis() - g_usbFehlerZeit > 2000) {
+            g_usbFehlerGemeldet = f;
+            logZeile(String("[usb] abgewiesene Host-Zugriffe: ") + (uint32_t)g_usbFehlerLesen + " lesen, " +
+                     (uint32_t)g_usbFehlerSchreiben + " schreiben, zuletzt Sektor " + (uint32_t)g_usbFehlerLba);
+        }
+    }
+
     uint32_t nun = millis();
 
     // Roh nachsehen, solange etwas offen ist. Reines Lesen - der Drucker merkt
@@ -2450,6 +2515,8 @@ void loop()
         int anz = 0;
         uint32_t summe = 0;
         if (rohVerzeichnis(anz, summe) && anz > 0) {
+            rohOffenSumme(g_zeigAnzahl, g_zeigSumme);
+            g_rohGeprueft = nun;
             if (anz == g_rohAnzahl && summe == g_rohSumme) {
                 if (++g_rohStabil >= ROH_STABIL) {
                     g_rohStabil = 0;
@@ -2495,7 +2562,11 @@ void loop()
     // gesamte Ruhefrist hinweg.
     if (g_screen != Z_SDFEHL && !g_warteAnzeige) {
         uint32_t seitWrite = nun - g_lastWrite;
-        if (g_dirty && seitWrite < IDLE_MS)
+        // Noch nicht roh nachgesehen seit dem letzten Schreibzugriff, oder es
+        // liegt wirklich etwas Ungesendetes: dann "SCAN ERKANNT". Nur die
+        // Verzeichnisdaten des Druckers: bloss "Host aktiv".
+        bool ungeprueft = (int32_t)(g_rohGeprueft - g_lastWrite) < 0;
+        if (g_dirty && seitWrite < IDLE_MS && (ungeprueft || g_zeigAnzahl > 0))
             zeigeFrist((IDLE_MS - seitWrite + 999) / 1000);
         else if (nun - g_lastHost < 3000) zeigeScreen(Z_HOST);
         else zeigeScreen(Z_BEREIT);
