@@ -360,7 +360,7 @@ static volatile uint32_t g_bytesGeschrieben = 0;   // seit dem letzten Verarbeit
 static uint32_t g_naechsterVersuch = 0;   // 0 = sofort faellig
 static int      g_versuche         = 0;
 
-#define FW_VERSION "v33"
+#define FW_VERSION "v34"
 
 String cfgEndpoint;
 // Bekannte WLAN-Netze - mehrere, damit derselbe Stick an verschiedenen Standorten
@@ -405,6 +405,7 @@ static volatile uint32_t g_usbFehlerLba = 0, g_usbFehlerZeit = 0;
 static uint32_t          g_usbFehlerGemeldet = 0;
 static void logZeile(const String &msg);     // steht weiter unten
 static bool remount();                       // ebenfalls
+static void geloeschtMerken(const Fertig &f); // ebenfalls
 static void logFlushNetz();                  // ebenfalls
 
 static int32_t onWrite(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize)
@@ -1141,7 +1142,16 @@ static bool istGeloeschtE(const RohEintrag &e)
 
 static void fertigMerken(const RohEintrag &e, uint32_t kennzahl, const String &sendeName)
 {
-    if (fertigIndex(e.start, e.groesse) >= 0) return;
+    int alt = fertigIndex(e.start, e.groesse);
+    if (alt >= 0 && g_fertig[alt].kennzahl == kennzahl) return;
+    if (alt >= 0) {
+        // Gleicher Startblock, gleiche Groesse, anderer Inhalt: der Eintrag gehoert
+        // jetzt der neuen Datei. Bliebe die alte Kennzahl stehen, gaelte die neue
+        // Datei bei jedem Blick wieder als neu und wuerde endlos hochgeladen.
+        geloeschtMerken(g_fertig[alt]);
+        memmove(g_fertig + alt, g_fertig + alt + 1, (g_fertigAnzahl - alt - 1) * sizeof(Fertig));
+        g_fertigAnzahl--;
+    }
     if (g_fertigAnzahl >= MAX_FERTIG) { memmove(g_fertig, g_fertig + 1, (MAX_FERTIG - 1) * sizeof(Fertig)); g_fertigAnzahl = MAX_FERTIG - 1; }
     Fertig &f = g_fertig[g_fertigAnzahl++];
     f.start = e.start; f.groesse = e.groesse; f.kennzahl = kennzahl;
@@ -2709,7 +2719,8 @@ static void aufraeumFenster(const String &grund)
     for (int fi = g_fertigAnzahl - 1; fi >= 0; fi--) {
         bool da = false;
         for (int i = 0; i < n && !da; i++)
-            da = liste[i].start == g_fertig[fi].start && liste[i].groesse == g_fertig[fi].groesse;
+            da = liste[i].start == g_fertig[fi].start && liste[i].groesse == g_fertig[fi].groesse &&
+                 (!g_fertig[fi].kennzahl || rohKennzahl(liste[i]) == g_fertig[fi].kennzahl);
         if (da) continue;
         logZeile(String("[aufraeumen] Merkliste: ") + g_fertig[fi].name + " (" + (g_fertig[fi].groesse / 1024) +
                  " kB) liegt nicht mehr auf der Karte - Eintrag ausgetragen");
