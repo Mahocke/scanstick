@@ -25,6 +25,7 @@
 #include <Arduino_GFX_Library.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
+#include <DNSServer.h>
 #include <Preferences.h>
 #include <Update.h>
 #include <functional>
@@ -360,7 +361,7 @@ static volatile uint32_t g_bytesGeschrieben = 0;   // seit dem letzten Verarbeit
 static uint32_t g_naechsterVersuch = 0;   // 0 = sofort faellig
 static int      g_versuche         = 0;
 
-#define FW_VERSION "v38"
+#define FW_VERSION "v39"
 
 String cfgEndpoint;
 // Bekannte WLAN-Netze - mehrere, damit derselbe Stick an verschiedenen Standorten
@@ -1756,6 +1757,63 @@ static bool wifiVerbinden()
     return WiFi.status() == WL_CONNECTED;
 }
 
+// ---- Einrichtung ohne Karte im Lesegeraet ----
+// Kennt der Stick kein Netz oder erreicht er keins, spannt er ein eigenes WLAN
+// auf (Name = Geraetename, offen) und beantwortet jede Namensanfrage mit sich
+// selbst - Handy oder Rechner oeffnen dann von selbst die Einrichtungsseite,
+// wie im Hotel. Sobald ein bekanntes Netz erreichbar ist, geht das WLAN wieder
+// aus. Der Scanpfad ist davon unberuehrt: USB laeuft, Uploads warten nur.
+static DNSServer g_dns;
+static bool      g_einrichtung = false;
+static bool      g_einrichtungGezeichnet = false;
+
+static void zeigeEinrichtung()
+{
+    if (g_einrichtungGezeichnet) return;
+    g_einrichtungGezeichnet = true;
+    g_screen = -2;
+    uint32_t rgb = 0xFF6600;
+    ledColor(rgb >> 16, (rgb >> 8) & 0xFF, rgb & 0xFF);
+    g_gfx->fillScreen(rgb565(rgb));
+    g_gfx->setTextColor(COL_BLACK);
+    g_gfx->setTextSize(2);
+    g_gfx->setCursor(4, 4);
+    g_gfx->print("WLAN EINRICHTEN");
+    g_gfx->setTextSize(1);
+    g_gfx->setCursor(4, 30);
+    g_gfx->print("Mit diesem Netz verbinden:");
+    g_gfx->setTextSize(2);
+    g_gfx->setCursor(4, 42);
+    g_gfx->print(geraeteName());
+    g_gfx->setTextSize(1);
+    g_gfx->setCursor(4, 66);
+    g_gfx->print("dann http://192.168.4.1/");
+}
+
+static void einrichtungStarten(const char *grund)
+{
+    if (g_einrichtung) return;
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP(geraeteName().c_str());
+    delay(100);
+    g_dns.start(53, "*", WiFi.softAPIP());
+    g_einrichtung = true;
+    g_einrichtungGezeichnet = false;
+    logZeile(String("[einrichtung] ") + grund + " - eigenes WLAN \"" + geraeteName() + "\" offen, Seite http://" +
+             WiFi.softAPIP().toString() + "/");
+}
+
+static void einrichtungBeenden()
+{
+    if (!g_einrichtung) return;
+    g_dns.stop();
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+    g_einrichtung = false;
+    g_screen = -1;
+    logZeile("[einrichtung] Netz gefunden - eigenes WLAN wieder aus");
+}
+
 // http://host[:port]/pfad zerlegen
 static bool urlTeile(const String &url, String &host, uint16_t &port, String &pfad)
 {
@@ -2351,6 +2409,23 @@ static void webEinstellungen()
     if (g_web.method() == HTTP_POST) {
         if (!herkunftPruefen()) return;
         if (g_web.hasArg("endpoint")) cfgEndpoint = g_web.arg("endpoint");
+        // Bekannte Netze: entfernen per Kaestchen, hinzufuegen per Feld. Wirkt beim
+        // naechsten Suchlauf (Neustart oder zwei Minuten ohne Netz).
+        for (int i = MAX_NETZE - 1; i >= 0; i--) {
+            char k[12];
+            snprintf(k, sizeof k, "netzweg%d", i);
+            if (g_web.hasArg(k) && i < cfgNetze) {
+                for (int j = i; j + 1 < cfgNetze; j++) { cfgNetzSsid[j] = cfgNetzSsid[j + 1]; cfgNetzPass[j] = cfgNetzPass[j + 1]; }
+                cfgNetze--;
+            }
+        }
+        if (g_web.hasArg("ssid_neu") && g_web.arg("ssid_neu").length()) {
+            String neuS = g_web.arg("ssid_neu"), neuP = g_web.arg("pass_neu");
+            int vorhanden = -1;
+            for (int i = 0; i < cfgNetze; i++) if (cfgNetzSsid[i] == neuS) vorhanden = i;
+            if (vorhanden >= 0) cfgNetzPass[vorhanden] = neuP;                       // Passwort erneuern
+            else if (cfgNetze < MAX_NETZE) { cfgNetzSsid[cfgNetze] = neuS; cfgNetzPass[cfgNetze] = neuP; cfgNetze++; }
+        }
         if (g_web.hasArg("aufraeum")) {
             uint32_t m = g_web.arg("aufraeum").toInt();
             if (m >= 1 && m <= 1440) g_aufraeumMin = m;
@@ -2406,6 +2481,17 @@ static void webEinstellungen()
          "<label><input type=\"checkbox\" name=\"invers\" value=\"1\"") +
          (g_invertiert ? " checked" : "") + "> umkehren</label></td></tr>";
     h += "<tr><td>Upload-Ziel</td><td><input name=\"endpoint\" size=\"34\" value=\"" + cfgEndpoint + "\"></td></tr>";
+    {
+        String netze;
+        for (int i = 0; i < cfgNetze; i++)
+            netze += String("<label><input type=\"checkbox\" name=\"netzweg") + i + "\" value=\"1\"> " + cfgNetzSsid[i] +
+                     " <small>entfernen</small></label><br>";
+        if (!cfgNetze) netze = "<span class=\"bad\">keins hinterlegt</span><br>";
+        netze += "<small>neu:</small> <input name=\"ssid_neu\" placeholder=\"Netzname\" size=\"14\"> "
+                 "<input name=\"pass_neu\" type=\"password\" placeholder=\"Passwort\" size=\"14\">";
+        h += "<tr><td>Bekannte WLAN-Netze<br><small>bis zu " + String(MAX_NETZE) + "; der staerkste erreichbare "
+             "Zugangspunkt gewinnt. Aenderungen gelten ab dem naechsten Suchlauf (Neustart).</small></td><td>" + netze + "</td></tr>";
+    }
     h += "<tr><td>Namensanfang der Dateien<br><small>ergibt z.B. <code>" + cfgPraefix +
          "-20260919-143205.pdf</code>; bei mehreren Sticks den Standort hier eintragen</small></td>"
          "<td><input name=\"praefix\" size=\"16\" value=\"" + cfgPraefix + "\"></td></tr>";
@@ -2437,6 +2523,67 @@ static void webEinstellungen()
     h += "</table><p><button class=\"btn\" type=\"submit\">Speichern</button></p></form>";
     h += "<p><small>WLAN-Zugangsdaten kommen weiter aus <code>/wifi.cfg</code> auf der Karte und "
          "werden in den Flash gespiegelt.</small></p>";
+    g_web.send(200, "text/html; charset=utf-8", h + htmlFuss());
+}
+
+// Einrichtungsseite: Netz waehlen oder eintragen, Ziel, Schluessel, Passwort.
+// Erreichbar immer, im eigenen WLAN als Startseite. Speichert in den Flash und
+// startet neu - danach sucht der Stick das eingetragene Netz.
+static void webEinrichten()
+{
+    if (!webAuth()) return;
+    if (g_web.method() == HTTP_POST) {
+        if (!herkunftPruefen()) return;
+        String ssid = g_web.arg("ssid"), pass = g_web.arg("pass");
+        if (ssid.isEmpty()) ssid = g_web.arg("ssid_liste");
+        if (ssid.length()) {
+            int vorhanden = -1;
+            for (int i = 0; i < cfgNetze; i++) if (cfgNetzSsid[i] == ssid) vorhanden = i;
+            if (vorhanden >= 0) cfgNetzPass[vorhanden] = pass;
+            else {
+                if (cfgNetze >= MAX_NETZE) cfgNetze = MAX_NETZE - 1;          // aeltestes faellt raus
+                cfgNetzSsid[cfgNetze] = ssid; cfgNetzPass[cfgNetze] = pass; cfgNetze++;
+            }
+        }
+        if (g_web.hasArg("endpoint") && g_web.arg("endpoint").length()) cfgEndpoint = g_web.arg("endpoint");
+        if (g_web.hasArg("schluessel") && g_web.arg("schluessel").length()) cfgSchluessel = g_web.arg("schluessel");
+        if (g_web.hasArg("webpass") && g_web.arg("webpass").length()) cfgWebPass = g_web.arg("webpass");
+        cfgNachNvs();
+        logZeile("[einrichtung] gespeichert: Netz " + ssid + ", Ziel " + cfgEndpoint + " - Neustart");
+        g_web.send(200, "text/html; charset=utf-8", htmlKopf("Gespeichert") +
+                   "<p class=\"ok\">Der Stick startet neu und verbindet sich mit <b>" + ssid + "</b>. "
+                   "Das eigene WLAN verschwindet dabei. Danach ist er im Heimnetz unter <b>http://" + geraeteName() +
+                   ".local/</b> erreichbar; die Adresse steht auch im Display.</p>" + htmlFuss());
+        delay(1500);
+        sanftNeustarten();
+        return;
+    }
+    // Netze in der Naehe anbieten - im eigenen WLAN kann man nicht tippen, was man nicht sieht
+    String liste;
+    int n = WiFi.scanNetworks();
+    for (int i = 0; i < n && i < 15; i++) {
+        String ss = WiFi.SSID(i);
+        if (ss.isEmpty()) continue;
+        liste += "<option value=\"" + ss + "\">" + ss + " (" + WiFi.RSSI(i) + " dBm)</option>";
+    }
+    String h = htmlKopf("Scan-Stick einrichten");
+    h += "<p>Netz waehlen oder eintragen, Ziel angeben, speichern. Der Stick startet dann neu.</p>";
+    h += "<form method=\"post\" action=\"/einrichten\"><table>";
+    h += "<tr><td>Gefundene Netze</td><td><select name=\"ssid_liste\"><option value=\"\">- bitte waehlen -</option>" + liste + "</select></td></tr>";
+    h += "<tr><td>oder Netzname von Hand</td><td><input name=\"ssid\" size=\"24\"></td></tr>";
+    h += "<tr><td>WLAN-Passwort</td><td><input name=\"pass\" type=\"password\" size=\"24\"></td></tr>";
+    h += "<tr><td>Upload-Ziel<br><small>Adresse des Empfaengers</small></td><td><input name=\"endpoint\" size=\"34\" value=\"" +
+         (cfgEndpoint.length() ? cfgEndpoint : String("http://192.168.1.50:8080/scan")) + "\"></td></tr>";
+    h += String("<tr><td>Geraeteschluessel<br><small>optional, wie SCAN_KEY beim Empfaenger</small></td><td><input name=\"schluessel\" type=\"password\" size=\"24\"") +
+         (cfgSchluessel.length() ? " placeholder=\"gesetzt - leer = behalten\"" : "") + "></td></tr>";
+    h += String("<tr><td>Passwort der Weboberflaeche<br><small>Benutzer scan</small></td><td><input name=\"webpass\" type=\"password\" size=\"24\"") +
+         (cfgWebPass.length() ? " placeholder=\"gesetzt - leer = behalten\"" : "") + "></td></tr>";
+    h += "</table><p><button class=\"btn\" type=\"submit\">Speichern und neu starten</button></p></form>";
+    if (cfgNetze) {
+        h += "<p><small>Bekannt: ";
+        for (int i = 0; i < cfgNetze; i++) h += (i ? ", " : "") + cfgNetzSsid[i];
+        h += "</small></p>";
+    }
     g_web.send(200, "text/html; charset=utf-8", h + htmlFuss());
 }
 
@@ -2508,7 +2655,14 @@ static void webStarten()
                 else logZeile("[update] Abschluss fehlgeschlagen");
             }
         });
-    g_web.onNotFound([]() { g_web.sendHeader("Location", "/"); g_web.send(303, "text/plain", ""); });
+    g_web.on("/einrichten", HTTP_GET, webEinrichten);
+    g_web.on("/einrichten", HTTP_POST, webEinrichten);
+    // Im eigenen WLAN landet jede fremde Adresse (Hotspot-Erkennung von iOS,
+    // Android, Windows) auf der Einrichtungsseite; sonst auf dem Status.
+    g_web.onNotFound([]() {
+        g_web.sendHeader("Location", g_einrichtung ? "http://" + WiFi.softAPIP().toString() + "/einrichten" : String("/"));
+        g_web.send(302, "text/plain", "");
+    });
     // Der WebServer behaelt nur angeforderte Kopfzeilen; Host merkt er sich immer.
     const char *kopf[] = { "Origin", "Referer" };
     g_web.collectHeaders(kopf, 2);
@@ -2910,6 +3064,10 @@ void setup()
     // WLAN erst jetzt: der Suchlauf blockiert einige Sekunden, und der Drucker
     // soll den Stick sofort als Laufwerk sehen, nicht erst nach dem WLAN.
     wlanStarten();
+    if (WiFi.status() != WL_CONNECTED) {
+        einrichtungStarten(cfgNetze ? "kein bekanntes Netz erreichbar" : "kein Netz hinterlegt");
+        webStarten();
+    }
     if (g_screen != Z_SDFEHL) zeigeScreen(Z_BEREIT);
 }
 
@@ -3004,7 +3162,9 @@ void loop()
             }
         }
     }
+    if (WiFi.status() == WL_CONNECTED && g_einrichtung) einrichtungBeenden();
     if (WiFi.status() == WL_CONNECTED && !g_webAn) { webStarten(); zeitHolen(); }
+    if (g_einrichtung) g_dns.processNextRequest();
     if (g_webAn) g_web.handleClient();
 
     if (g_usbFehlerNeu) {
@@ -3092,7 +3252,10 @@ void loop()
     // Nur die WARTE-Anzeige ist geschuetzt. Frueher stand hier !g_dirty - das
     // fror JEDE Anzeige ein, sobald ein Schreibvorgang offen war, also ueber die
     // gesamte Ruhefrist hinweg.
-    if (g_screen != Z_SDFEHL && !g_warteAnzeige) {
+    if (g_einrichtung && !g_dirty && g_screen != Z_SDFEHL && !g_warteAnzeige) {
+        zeigeEinrichtung();
+    } else if (g_screen != Z_SDFEHL && !g_warteAnzeige) {
+        if (g_einrichtungGezeichnet) { g_einrichtungGezeichnet = false; g_screen = -1; }
         uint32_t seitWrite = nun - g_lastWrite;
         // Noch nicht roh nachgesehen seit dem letzten Schreibzugriff, oder es
         // liegt wirklich etwas Ungesendetes: dann "SCAN ERKANNT". Nur die
