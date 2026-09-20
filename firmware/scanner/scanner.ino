@@ -1,17 +1,17 @@
 /**
- * Scan-Stick fuer LilyGo T-Dongle-S3
- * Gibt sich am Drucker als USB-Stick (FAT32 "SCANS") aus. Erkennt, wann ein Scan
- * fertig geschrieben ist (Ruhe nach dem letzten Sektor-Write), laedt jede neue
- * Datei per HTTP-POST an einen konfigurierbaren Empfaenger und meldet den Stick
- * danach neu an, damit der Drucker wieder einen leeren Stick sieht.
+ * Scan-Stick for LilyGo T-Dongle-S3
+ * Presents itself to the printer as a USB stick (FAT32 "SCANS"). Detects when a scan
+ * has been written completely (idle after the last sector write), uploads every new
+ * file by HTTP POST to a configurable receiver and re-announces the stick
+ * afterwards, so the printer sees an empty stick again.
  *
- * Diagnose-Log geht per HTTP an denselben Empfaenger (scanlog-<millis>.txt),
- * NICHT auf die Karte - sonst zerstoert der eigene FAT-Write den Commit des Druckers.
+ * The diagnostic log goes by HTTP to the same receiver (scanlog-<millis>.txt),
+ * NOT onto the card - otherwise our own FAT write destroys the printer's commit.
  *
- * Zugangsdaten kommen NICHT in den Code, sondern aus /wifi.cfg auf der SD-Karte:
+ * Credentials do NOT belong in the code, they come from /wifi.cfg on the SD card:
  *   ssid=...
  *   pass=...
- *   endpoint=http://192.168.1.50:8080/scan      (Beispiel - die Adresse des eigenen Empfaengers)
+ *   endpoint=http://192.168.1.50:8080/scan      (example - the address of your own receiver)
  *
  * Board: ESP32S3 Dev Module, USB Mode = USB-OTG (TinyUSB), USB CDC on Boot = Enabled
  */
@@ -40,21 +40,21 @@
 #define SD_CLK 12
 #define SD_CMD 16
 
-// Datentypen, die in Funktionssignaturen vorkommen, stehen hier oben: der Arduino-
-// Builder erzeugt Prototypen vor der ersten Funktion und muss die Typen dort kennen.
+// Data types that appear in function signatures live up here: the Arduino
+// builder creates prototypes before the first function and must know the types there.
 struct RohEintrag { uint32_t start; uint32_t groesse; char name[64]; };
 struct Fertig { uint32_t start, groesse, kennzahl; char name[40]; };
 struct KartenBefund { int fatAbweichungen, kreuz, verwaist, gekuerzt; bool schmutzig, heillos, geaendert, zuGross; };
 
-#define IDLE_VORGABE  45000    // Ruhe bis "Scan fertig" - Vorgabe, per Weboberflaeche aenderbar
-static uint32_t g_idleMs   = IDLE_VORGABE;   // Ruhefrist, aus dem Flash
-static bool     g_loeschen = true;           // true = loeschen, false = nach /gesendet verschieben
+#define IDLE_VORGABE  45000    // idle until "scan done" - default, changeable via the web interface
+static uint32_t g_idleMs   = IDLE_VORGABE;   // idle deadline, from the flash
+static bool     g_loeschen = true;           // true = delete, false = move to /gesendet
 #define IDLE_MS (g_idleMs)
-#define RETRY_MS      30000    // nichts gefunden -> so lange warten, dann nochmal schauen
-#define MAX_VERSUCHE  5        // so oft nachschauen, bevor wir aufgeben
+#define RETRY_MS      30000    // nothing found -> wait this long, then look again
+#define MAX_VERSUCHE  5        // look this many times before we give up
 #define WIFI_TIMEOUT  20000
 
-// ---- APA102 Status-LED (T-Dongle-S3: Daten 40, Takt 39) ----
+// ---- APA102 status LED (T-Dongle-S3: data 40, clock 39) ----
 #define LED_DI 40
 #define LED_CI 39
 static void ledByte(uint8_t b) {
@@ -66,25 +66,25 @@ static void ledByte(uint8_t b) {
     }
 }
 static uint8_t g_ledR = 0, g_ledG = 0, g_ledB = 0;
-// Die APA102 hat ein eigenes Helligkeitsbyte (0..31). Volle Helligkeit ist als
-// Dauerlicht neben einem Drucker schlicht zu grell - einstellbar, 0 = aus.
+// The APA102 has its own brightness byte (0..31). Full brightness as a
+// permanent light next to a printer is simply too glaring - adjustable, 0 = off.
 static uint8_t g_ledHell = 5;
 
 static void ledRaw(uint8_t r, uint8_t g, uint8_t b) {
-    ledByte(0); ledByte(0); ledByte(0); ledByte(0);   // Start-Frame
-    if (!g_ledHell) { r = g = b = 0; }                 // ganz aus
+    ledByte(0); ledByte(0); ledByte(0); ledByte(0);   // start frame
+    if (!g_ledHell) { r = g = b = 0; }                 // fully off
     ledByte(0xE0 | (g_ledHell & 0x1F));
-    ledByte(b); ledByte(g); ledByte(r);               // BGR-Reihenfolge
-    ledByte(0xFF); ledByte(0xFF); ledByte(0xFF); ledByte(0xFF); // End-Frame
+    ledByte(b); ledByte(g); ledByte(r);               // BGR order
+    ledByte(0xFF); ledByte(0xFF); ledByte(0xFF); ledByte(0xFF); // end frame
 }
 static void ledColor(uint8_t r, uint8_t g, uint8_t b) { g_ledR = r; g_ledG = g; g_ledB = b; ledRaw(r, g, b); }
 static void ledHeartbeat() {
-    if (!g_ledHell) return;   // aus bleibt aus, auch beim Lebenszeichen
+    if (!g_ledHell) return;   // off stays off, even for the heartbeat
     ledRaw(0, 0, 0); delay(40); ledRaw(g_ledR, g_ledG, g_ledB);
 }
 static void ledInit() { pinMode(LED_DI, OUTPUT); pinMode(LED_CI, OUTPUT); }
 
-// ---- ST7735-Display (T-Dongle-S3: CS4 SDA3 SCL5 DC2 RST1 Backlight38) ----
+// ---- ST7735 display (T-Dongle-S3: CS4 SDA3 SCL5 DC2 RST1 Backlight38) ----
 #define TFT_CS 4
 #define TFT_SDA 3
 #define TFT_SCL 5
@@ -93,8 +93,8 @@ static void ledInit() { pinMode(LED_DI, OUTPUT); pinMode(LED_CI, OUTPUT); }
 #define TFT_BL 38
 #define COL_BLACK   0x0000
 #define COL_WHITE   0xFFFF
-// Zustaende des Sticks. Display-Hintergrund und Status-LED teilen sich eine
-// Farbe pro Zustand - vorher wurden beide getrennt gesetzt und liefen auseinander.
+// States of the stick. Display background and status LED share one
+// color per state - before, both were set separately and drifted apart.
 #define Z_STROM   0
 #define Z_BEREIT  1
 #define Z_HOST    2
@@ -105,15 +105,15 @@ static void ledInit() { pinMode(LED_DI, OUTPUT); pinMode(LED_CI, OUTPUT); }
 #define Z_ANZAHL  7
 
 static const char *Z_NAME[Z_ANZAHL] = {
-    "Strom da, startet", "Bereit, wartet auf den Drucker", "Drucker greift zu",
-    "Sucht neue Scans", "Karte nicht lesbar", "Wartet auf den Commit",
-    "Scan erkannt, Ruhefrist laeuft"
+    "Power on, starting", "Ready, waiting for the printer", "Printer is accessing",
+    "Looking for new scans", "Card not readable", "Waiting for the commit",
+    "Scan found, idle deadline running"
 };
-static const char *Z_TEXT[Z_ANZAHL] = { "STROM", "BEREIT", "OK", "SUCHE", "SD?!", "WARTE", "SCAN" };
-// Vorgaben als 0xRRGGBB, per Weboberflaeche aenderbar
+static const char *Z_TEXT[Z_ANZAHL] = { "POWER", "READY", "OK", "SEARCH", "SD?!", "WAIT", "SCAN" };
+// Defaults as 0xRRGGBB, changeable via the web interface
 static uint32_t g_farbe[Z_ANZAHL] = { 0xFFC000, 0x0044FF, 0x00C000, 0xCC00CC, 0xFF0000, 0xFFAA00, 0x00AACC };
-static uint32_t g_farbeSendet = 0x00AAFF;   // waehrend der Uebertragung
-static uint32_t g_farbeFertig = 0x00CC44;   // Erfolgsmeldung
+static uint32_t g_farbeSendet = 0x00AAFF;   // during the transfer
+static uint32_t g_farbeFertig = 0x00CC44;   // success message
 
 static uint16_t rgb565(uint32_t rgb)
 {
@@ -121,22 +121,22 @@ static uint16_t rgb565(uint32_t rgb)
     return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
 }
 static Arduino_DataBus *g_bus = new Arduino_ESP32SPI(TFT_DC, TFT_CS, TFT_SCL, TFT_SDA);
-static Arduino_GFX *g_gfx = new Arduino_ST7735(g_bus, TFT_RST, 1 /*Rotation*/, false /*ips*/, 80, 160, 26, 1, 26, 1);
-static int g_screen = -1;   // aktueller Anzeigezustand, nur bei Wechsel neu zeichnen
-static bool g_invertiert = true;    // Display stellt die Farben negativ dar
-static int g_wlanStufeLetzt = -1;   // zuletzt gezeichnete Empfangsstufe
+static Arduino_GFX *g_gfx = new Arduino_ST7735(g_bus, TFT_RST, 1 /*rotation*/, false /*ips*/, 80, 160, 26, 1, 26, 1);
+static int g_screen = -1;   // current display state, redraw only on a change
+static bool g_invertiert = true;    // display shows the colors inverted
+static int g_wlanStufeLetzt = -1;   // last drawn signal level
 static uint32_t g_wlanLetzt = 0;
 static long     g_rssiMin = 0, g_rssiMax = 0, g_rssiLetztLast = 0;
 static long     g_rssiSumme = 0;
 static uint32_t g_rssiAnzahl = 0;
 
-// zeichnet einen einfachen Blitz an Position (x,y)
+// draws a simple lightning bolt at position (x,y)
 static void malBlitz(int x, int y, uint16_t farbe) {
     g_gfx->fillTriangle(x+14, y, x+2, y+20, x+12, y+18, farbe);
     g_gfx->fillTriangle(x+12, y+16, x+22, y+14, x+8, y+36, farbe);
 }
 
-// Ein Zustand setzt Display UND LED - eine Farbe, eine Quelle.
+// One state sets display AND LED - one color, one source.
 static void zeigeScreen(int z)
 {
     if (z == g_screen || z < 0 || z >= Z_ANZAHL) return;
@@ -149,15 +149,15 @@ static void zeigeScreen(int z)
     g_gfx->setTextSize(z == Z_HOST ? 5 : 3);
     g_gfx->setCursor(z == Z_HOST ? 60 : 30, 30);
     g_gfx->print(Z_TEXT[z]);
-    g_wlanStufeLetzt = -1;   // fillScreen hat die Balken geloescht
+    g_wlanStufeLetzt = -1;   // fillScreen has erased the bars
 }
 
-// ---- Empfangsbalken oben rechts ----
-// Der Empfang schwankt am Druckerstandort erheblich (im Metallgehaeuse -93 dBm,
-// aussen -61). Man soll das am Geraet sehen, ohne die Weboberflaeche zu oeffnen.
-// Empfang laufend mitschreiben: heute schwankte er bei gleicher Position
-// zwischen -93 und -61 dBm. Ohne Aufzeichnung ist nicht zu unterscheiden,
-// ob das dauernd passiert oder nur unter Sendelast.
+// ---- signal bars top right ----
+// Reception varies considerably at the printer location (inside the metal case -93 dBm,
+// outside -61). You should see that on the device without opening the web interface.
+// Record reception continuously: today it varied at the same position
+// between -93 and -61 dBm. Without a record there is no telling
+// whether that happens all the time or only under send load.
 static void rssiErfassen(long r)
 {
     if (r >= 0 || r < -110) return;
@@ -188,26 +188,26 @@ static void zeichneWlanBalken()
 
     int z = (g_screen >= 0 && g_screen < Z_ANZAHL) ? g_screen : Z_BEREIT;
     uint16_t hg = rgb565(g_farbe[z]);
-    g_gfx->fillRect(110, 1, 49, 24, hg);          // Bereich freiraeumen
+    g_gfx->fillRect(110, 1, 49, 24, hg);          // clear the area
 
     for (int i = 0; i < 5; i++) {
-        int hoehe = 4 + i * 4;                     // 4, 8, 12, 16, 20 Pixel
+        int hoehe = 4 + i * 4;                     // 4, 8, 12, 16, 20 pixels
         int x = 112 + i * 9;
         int y = 22 - hoehe;
-        if (i < stufe) g_gfx->fillRect(x, y, 7, hoehe, COL_BLACK);   // voll = vorhanden
-        else           g_gfx->drawRect(x, y, 7, hoehe, COL_BLACK);   // nur Umriss
+        if (i < stufe) g_gfx->fillRect(x, y, 7, hoehe, COL_BLACK);   // filled = present
+        else           g_gfx->drawRect(x, y, 7, hoehe, COL_BLACK);   // outline only
     }
-    if (stufe == 0) {                              // kein Netz: Kreuz ueber die Balken
+    if (stufe == 0) {                              // no network: cross over the bars
         g_gfx->drawLine(112, 2, 156, 22, COL_BLACK);
         g_gfx->drawLine(112, 22, 156, 2, COL_BLACK);
     }
 }
 
-// ---- dynamische Anzeigen: gefunden / sendet / fertig ----
-// Das Display ist im Betrieb die einzige Rueckmeldung am Geraet, deshalb soll
-// man sehen, WAS er sendet und dass es vorangeht - nicht nur "irgendwas laeuft".
+// ---- dynamic screens: found / sending / done ----
+// In operation the display is the only feedback on the device, so you should
+// see WHAT it sends and that it makes progress - not just "something is running".
 
-// Dateinamen auf die Displaybreite kuerzen (Textgroesse 1 = 6 px pro Zeichen)
+// shorten file names to the display width (text size 1 = 6 px per character)
 static String kurzName(const String &name, int max_zeichen)
 {
     if ((int)name.length() <= max_zeichen) return name;
@@ -218,7 +218,7 @@ static int g_balkenProzent = -1;
 
 static void zeigeSendenStart(const String &name, uint32_t gesamt)
 {
-    g_screen = -2;               // Sonderzustand: loop() zeichnet neu, wenn es vorbei ist
+    g_screen = -2;               // special state: loop() redraws when it is over
     g_balkenProzent = -1;
     uint32_t rgb = g_farbeSendet;
     ledColor(rgb >> 16, (rgb >> 8) & 0xFF, rgb & 0xFF);
@@ -226,19 +226,19 @@ static void zeigeSendenStart(const String &name, uint32_t gesamt)
     g_gfx->setTextColor(COL_BLACK);
     g_gfx->setTextSize(2);
     g_gfx->setCursor(4, 4);
-    g_gfx->print("SENDET");
+    g_gfx->print("SENDING");
     g_gfx->setTextSize(1);
     g_gfx->setCursor(4, 24);
     g_gfx->print(kurzName(name, 25));
     g_gfx->setCursor(4, 64);
     g_gfx->printf("%u kB", (unsigned)(gesamt / 1024));
-    g_gfx->drawRect(4, 38, 152, 18, COL_BLACK);   // Rahmen des Balkens
+    g_gfx->drawRect(4, 38, 152, 18, COL_BLACK);   // frame of the bar
 }
 
 static void zeigeSendenFortschritt(uint32_t fertig, uint32_t gesamt)
 {
     int proz = gesamt ? (int)((uint64_t)fertig * 100 / gesamt) : 100;
-    if (proz == g_balkenProzent) return;          // nur bei Aenderung zeichnen, sonst flackert es
+    if (proz == g_balkenProzent) return;          // draw only on a change, otherwise it flickers
     g_balkenProzent = proz;
     int breite = (150 * proz) / 100;
     g_gfx->fillRect(5, 39, breite, 16, COL_BLACK);
@@ -261,28 +261,28 @@ static void zeigeFertig(uint32_t bytes)
     g_gfx->print("OK");
     g_gfx->setTextSize(1);
     g_gfx->setCursor(20, 62);
-    g_gfx->printf("%u kB gesendet", (unsigned)(bytes / 1024));
+    g_gfx->printf("%u kB sent", (unsigned)(bytes / 1024));
 }
 
-// Ruhefrist laeuft: gross den Countdown zeigen. Vorher stand hier 45 Sekunden
-// lang ein unveraendertes Bild - man konnte nicht sehen, ob er den Scan hat.
+// Idle deadline running: show the countdown large. Before, an unchanged image
+// stood here for 45 seconds - you could not see whether it had the scan.
 static int  g_fristLetzt   = -1;
-static bool g_warteAnzeige = false;   // WARTE-Bild steht und darf nicht ueberschrieben werden
+static bool g_warteAnzeige = false;   // WAIT screen is up and must not be overwritten
 
-// Ergebnis des rohen Mitlesens - auch die Anzeige greift darauf zu
-#define ROH_INTERVALL   1000    // so oft roh nachsehen (ms)
-#define ROH_RUHE        3000    // so lange kein Schreibzugriff, bevor wir zugreifen
-#define ROH_STABIL         3    // so viele gleiche Messungen = Datei fertig
+// result of the raw reading - the display accesses it too
+#define ROH_INTERVALL   1000    // look raw this often (ms)
+#define ROH_RUHE        3000    // no write access for this long before we access
+#define ROH_STABIL         3    // this many equal readings = file done
 static uint32_t g_rohLetzt  = 0;
 static uint32_t g_rohSumme  = 0;
 static int      g_rohAnzahl = 0;
 static int      g_rohStabil = 0;
-// Fuer die Anzeige zaehlt nur, was noch nicht gesendet ist - sonst stand nach
-// jedem Schreibzugriff des Druckers "SCAN ERKANNT" mit der Groesse laengst
-// gesendeter Dateien auf dem Display.
+// For the display only what is not yet sent counts - otherwise after every
+// write access of the printer "SCAN FOUND" stood on the display with the size
+// of long since sent files.
 static int      g_zeigAnzahl  = 0;
 static uint32_t g_zeigSumme   = 0;
-static uint32_t g_rohGeprueft = 0;   // millis() der letzten rohen Nachschau
+static uint32_t g_rohGeprueft = 0;   // millis() of the last raw look
 static int      g_fristModus  = -1;
 
 static void zeigeFrist(uint32_t restSek)
@@ -298,7 +298,7 @@ static void zeigeFrist(uint32_t restSek)
         g_gfx->setTextColor(COL_BLACK);
         g_gfx->setTextSize(2);
         g_gfx->setCursor(5, 4);
-        g_gfx->print("SCAN ERKANNT");
+        g_gfx->print("SCAN FOUND");
     }
     if (modus != g_fristModus) {
         g_fristModus = modus;
@@ -307,10 +307,10 @@ static void zeigeFrist(uint32_t restSek)
         g_gfx->setTextColor(COL_BLACK);
         g_gfx->setTextSize(1);
         g_gfx->setCursor(5, 68);
-        g_gfx->print(modus ? "pruefe ob fertig" : "warte auf Ruhe");
+        g_gfx->print(modus ? "checking if done" : "waiting for idle");
     }
-    // Sobald wir die neue Datei roh sehen, ist ihre Groesse die ehrlichere Angabe
-    // als ein Countdown, der ohnehin vorzeitig endet.
+    // As soon as we see the new file raw, its size is the more honest figure
+    // than a countdown that ends early anyway.
     int wert = modus ? (int)(g_zeigSumme / 1024) : (int)restSek;
     if (wert != g_fristLetzt) {
         g_fristLetzt = wert;
@@ -333,72 +333,72 @@ static void zeigeWarte(int versuch, int von)
     g_gfx->setTextColor(COL_BLACK);
     g_gfx->setTextSize(3);
     g_gfx->setCursor(12, 14);
-    g_gfx->print("WARTE");
+    g_gfx->print("WAIT");
     g_gfx->setTextSize(1);
     g_gfx->setCursor(12, 50);
-    g_gfx->printf("Versuch %d von %d", versuch, von);
+    g_gfx->printf("Attempt %d of %d", versuch, von);
     g_gfx->setCursor(12, 62);
-    g_gfx->print("Drucker nicht fertig");
+    g_gfx->print("Printer not finished");
 }
 
 static void displayInit() {
     pinMode(TFT_BL, OUTPUT);
     g_gfx->begin();
-    // Dieses Modul zeigt die Farben sonst als Negativ: eingestelltes Blau
-    // erscheint gelb, Schwarz erscheint weiss. Damit waeren alle Farbwaehler
-    // in den Einstellungen wirkungslos bzw. genau verkehrt herum.
+    // Otherwise this module shows the colors as a negative: a configured blue
+    // appears yellow, black appears white. That would leave every color picker
+    // in the settings without effect, or exactly the wrong way round.
     g_gfx->invertDisplay(g_invertiert);
-    digitalWrite(TFT_BL, LOW);   // Backlight an (LILYGO: aktiv-low)
+    digitalWrite(TFT_BL, LOW);   // backlight on (LILYGO: active low)
     g_gfx->fillScreen(COL_BLACK);
 }
 
 USBMSC MSC;
 
 static volatile uint32_t g_lastWrite = 0;
-static volatile uint32_t g_lastHost  = 0;   // wann hat der Host zuletzt gelesen/geschrieben
+static volatile uint32_t g_lastHost  = 0;   // when did the host last read/write
 static volatile bool     g_dirty     = false;
-static volatile uint32_t g_bytesGeschrieben = 0;   // seit dem letzten Verarbeiten
+static volatile uint32_t g_bytesGeschrieben = 0;   // since the last processing
 
-static uint32_t g_naechsterVersuch = 0;   // 0 = sofort faellig
+static uint32_t g_naechsterVersuch = 0;   // 0 = due immediately
 static int      g_versuche         = 0;
 
-#define FW_VERSION "v39"
+#define FW_VERSION "v40"
 
 String cfgEndpoint;
-// Bekannte WLAN-Netze - mehrere, damit derselbe Stick an verschiedenen Standorten
-// laeuft. Beim Suchlauf gewinnt ueber ALLE bekannten Netze hinweg der staerkste
-// Zugangspunkt; WiFiMulti verbindet gezielt mit dessen Kennung und Kanal.
+// Known WiFi networks - several, so the same stick runs at different locations.
+// During the scan the strongest access point across ALL known networks wins;
+// WiFiMulti connects specifically with its identifier and channel.
 #define MAX_NETZE 4
 static String    cfgNetzSsid[MAX_NETZE], cfgNetzPass[MAX_NETZE];
 static int       cfgNetze = 0;
 static WiFiMulti g_wifiMulti;
-// Geraetename mit den letzten vier Stellen der Funkadresse: zwei Sticks im selben
-// Netz hiessen sonst beide scanstick.local, und der Pruefstand sprach am 20.09.2026
-// prompt mit dem falschen. Der Name steht im Protokoll und auf der Statusseite.
+// Device name with the last four digits of the radio address: otherwise two sticks
+// in the same network were both called scanstick.local, and on 20.09.2026 the test
+// rig promptly talked to the wrong one. The name is in the log and on the status page.
 static String geraeteName()
 {
     uint8_t mac[6];
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);   // aus dem Chip, nicht vom Treiber: der liefert vor dem WLAN-Start nur Nullen
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);   // from the chip, not from the driver: that one delivers only zeros before the WiFi start
     char t[24];
     snprintf(t, sizeof t, "scanstick-%02x%02x", mac[4], mac[5]);
     return String(t);
 }
-String cfgWebPass;   // Schutz der Weboberflaeche; leer = offen
-String cfgPraefix = "scan";   // Namensanfang der Dateien, z.B. "buero-774"
-String cfgSchluessel;         // Geraeteschluessel: signiert jeden Upload; leer = ohne
-static bool g_zeitOk        = false;   // NTP-Zeit vorhanden?
-static bool g_einmalSchauen = false;   // Knopf "Jetzt schauen": einmal, ohne Wartezyklus
-static bool g_startGeprueft = false;   // nach dem Hochlaufen einmal nachsehen
+String cfgWebPass;   // protection of the web interface; empty = open
+String cfgPraefix = "scan";   // name prefix of the files, e.g. "buero-774"
+String cfgSchluessel;         // device key: signs every upload; empty = without
+static bool g_zeitOk        = false;   // NTP time available?
+static bool g_einmalSchauen = false;   // button "Look now": once, without a wait cycle
+static bool g_startGeprueft = false;   // look once after start-up
 
 static WebServer  g_web(80);
 static Preferences g_nvs;
 
-// Ein Riegel fuer ALLE rohen Kartenzugriffe, aus dem USB-Task wie aus der
-// Hauptschleife. Der Kartentreiber schuetzt nur einzelne Kommandos; ein
-// Schreibvorgang besteht aber aus Daten UND dem Warten, bis die Karte fertig
-// ist. Schiebt sich dazwischen ein Lesen der Hauptschleife (Verzeichnis,
-// Endmarke, Upload), kann der Zugriff des Hosts scheitern - fuer den 780 ein
-// Medienfehler (44.12.05), worauf er dem Port den Strom nimmt.
+// One lock for ALL raw card accesses, from the USB task as well as from the
+// main loop. The card driver protects only single commands; a write however
+// consists of the data AND the wait until the card is done. If a read of the
+// main loop (directory, end marker, upload) pushes in between, the host's
+// access can fail - for the 780 a media error (44.12.05), whereupon it cuts
+// the power to the port.
 static SemaphoreHandle_t g_sdRiegel = nullptr;
 static bool sdLesen(uint8_t *b, uint32_t sektor)
 {
@@ -415,40 +415,40 @@ static bool sdSchreiben(uint8_t *b, uint32_t sektor)
     return ok;
 }
 static bool       g_webAn = false;
-static bool       g_updateBegonnen = false;   // Update.begin() ist tatsaechlich gelaufen
+static bool       g_updateBegonnen = false;   // Update.begin() has actually run
 
-// ---- MSC: der Host greift auf die SD zu, jeder Sektor laeuft durch uns ----
-// Uebergabe der Karte zwischen USB-Task und Hauptschleife. mediaPresent(false)
-// haelt nur NEUE Kommandos ab - ein Lesevorgang, der gerade laeuft, laeuft weiter.
-// Ein Linux-Host liest beim Aushaengen die FAT in 120-kB-Bloecken, das dauert
-// laenger als die 200 ms, die wir vor SD_MMC.end() gewartet haben. Der USB-Task
-// hing dann auf dem abgebauten Treiber, nach 5 s schlug der Task-Watchdog zu
-// (im Pruefstand zweimal hintereinander, im Kernel-Log "cmd_age=5s").
-// Deshalb: Sperre setzen, warten bis kein Zugriff mehr laeuft, erst dann anfassen.
-static volatile int  g_usbZugriffe = 0;      // gerade laufende onRead/onWrite
-static volatile bool g_sdGesperrt  = false;  // Hauptschleife hat die Karte
-// Diagnose: die letzten Schreibzugriffe des Hosts (Sektor, Anzahl) - daran ist
-// zu sehen, ob er Verzeichnis, Belegungstabelle oder Daten schreibt.
+// ---- MSC: the host accesses the SD, every sector runs through us ----
+// Handover of the card between USB task and main loop. mediaPresent(false)
+// holds off only NEW commands - a read that is already running keeps running.
+// On unmount a Linux host reads the FAT in 120 kB blocks, that takes longer
+// than the 200 ms we waited before SD_MMC.end(). The USB task then hung on the
+// torn-down driver, after 5 s the task watchdog struck (on the test rig twice
+// in a row, in the kernel log "cmd_age=5s").
+// Therefore: set the lock, wait until no access is running, only then touch it.
+static volatile int  g_usbZugriffe = 0;      // onRead/onWrite currently running
+static volatile bool g_sdGesperrt  = false;  // main loop has the card
+// Diagnosis: the last write accesses of the host (sector, count) - they show
+// whether it writes the directory, the allocation table or data.
 #define SPUR_ANZAHL 32
 static volatile uint32_t g_spurLba[SPUR_ANZAHL], g_spurN[SPUR_ANZAHL], g_spurT[SPUR_ANZAHL];
 static volatile int      g_spurIdx = 0;
-// Abgewiesene Host-Zugriffe: Antwort -1 heisst fuer den Drucker "Medienfehler".
-// Passiert das mitten in einem Scan, bricht er still ab - deshalb zaehlen und
-// im Protokoll und auf der Statusseite zeigen.
+// Rejected host accesses: the answer -1 means "media error" to the printer.
+// If that happens in the middle of a scan, it aborts silently - so count them
+// and show them in the log and on the status page.
 static volatile uint32_t g_usbFehlerLesen = 0, g_usbFehlerSchreiben = 0;
 static volatile uint32_t g_usbFehlerLba = 0, g_usbFehlerZeit = 0;
 static uint32_t          g_usbFehlerGemeldet = 0;
 static volatile bool     g_usbFehlerNeu = false;
-static String            g_usbFehlerAlt;   // Befund aus dem Flash: was vor dem letzten Neustart passierte
-static void logZeile(const String &msg);     // steht weiter unten
-static bool remount();                       // ebenfalls
-static void geloeschtMerken(const Fertig &f); // ebenfalls
-static void logFlushNetz();                  // ebenfalls
+static String            g_usbFehlerAlt;   // finding from the flash: what happened before the last restart
+static void logZeile(const String &msg);     // further below
+static bool remount();                       // likewise
+static void geloeschtMerken(const Fertig &f); // likewise
+static void logFlushNetz();                  // likewise
 
 static int32_t onWrite(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize)
 {
-    // Rueckgabe 0 heisst fuer TinyUSB "beschaeftigt, gleich nochmal" - bei einem
-    // echten Kartenfehler haengt der Host damit endlos. Negativ = sauberer Fehler.
+    // A return of 0 means "busy, try again shortly" to TinyUSB - with a real
+    // card error that hangs the host forever. Negative = clean error.
     if (g_sdGesperrt) { g_usbFehlerSchreiben++; g_usbFehlerLba = lba; g_usbFehlerZeit = millis(); g_usbFehlerNeu = true; g_lastHost = millis(); return -1; }
     g_usbZugriffe++;
     int32_t ergebnis = -1;
@@ -462,7 +462,7 @@ static int32_t onWrite(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t 
     if (ergebnis > 0) {
         g_lastWrite = millis();
         g_dirty = true;
-        g_bytesGeschrieben += bufsize;   // Messung: kommen ueberhaupt Scandaten an?
+        g_bytesGeschrieben += bufsize;   // measurement: does any scan data arrive at all?
         int i = g_spurIdx;
         g_spurLba[i] = lba; g_spurN[i] = bufsize / (sec ? sec : 512); g_spurT[i] = millis();
         g_spurIdx = (i + 1) % SPUR_ANZAHL;
@@ -491,9 +491,9 @@ static int32_t onRead(uint32_t lba, uint32_t offset, void *buffer, uint32_t bufs
     return ergebnis;
 }
 
-// Karte dem Host entziehen und warten, bis wirklich niemand mehr darauf zugreift.
-// Liefert false, wenn ein Zugriff nach 5 s immer noch laeuft - dann lieber
-// nicht anfassen und den Host behalten lassen.
+// Take the card away from the host and wait until really nobody accesses it.
+// Returns false if an access is still running after 5 s - then better not
+// touch it and let the host keep it.
 static bool karteUebernehmen()
 {
     MSC.mediaPresent(false);
@@ -503,7 +503,7 @@ static bool karteUebernehmen()
         if (g_usbZugriffe == 0 && millis() - g_lastHost > 300) return true;
         delay(10);
     }
-    logZeile(String("[usb] Host laesst nicht los (") + (int)g_usbZugriffe + " Zugriffe offen)");
+    logZeile(String("[usb] host does not let go (") + (int)g_usbZugriffe + " accesses open)");
     g_sdGesperrt = false;
     MSC.mediaPresent(true);
     return false;
@@ -515,13 +515,13 @@ static void karteZurueckgeben()
     MSC.mediaPresent(true);
 }
 
-// Neustart, der auch am Drucker ueberlebt. Der 780 schaltet dem USB-Port kurz
-// den Strom ab, sobald sich ein Geraet abmeldet. Startet der Stick sofort neu,
-// trifft dieser Stromschnitt die gerade erst gebootete Firmware, bevor sie sich
-// beim Bootloader als gueltig gemeldet hat - und der faellt auf die vorige
-// zurueck (Rollback ist im Core eingeschaltet). Zweimal blieb so v27 stehen,
-// obwohl v28 sauber eingespielt war. Deshalb: erst am USB abmelden, den
-// Stromschnitt in der ALTEN Firmware abwarten, dann neu starten.
+// A restart that survives at the printer too. The 780 briefly cuts the power to
+// the USB port as soon as a device unregisters. If the stick restarts at once,
+// this power cut hits the firmware that has only just booted, before it has
+// reported itself as valid to the bootloader - and that one falls back to the
+// previous one (rollback is switched on in the core). Twice v27 stayed this way
+// although v28 had been installed cleanly. Therefore: unregister from USB first,
+// wait out the power cut in the OLD firmware, then restart.
 static void sanftNeustarten()
 {
     logFlushNetz();
@@ -531,9 +531,9 @@ static void sanftNeustarten()
     ESP.restart();
 }
 
-// SCSI START STOP UNIT. Geraete senden das oft am Jobende ("auswerfen",
-// "Puffer rausschreiben"). Wenn der Drucker das tut, haben wir ein sofortiges
-// Fertig-Signal und muessen nicht 45 s auf Stille warten.
+// SCSI START STOP UNIT. Devices often send this at the end of a job ("eject",
+// "flush the buffer"). If the printer does that, we have an immediate
+// done signal and do not have to wait 45 s for silence.
 static volatile uint32_t g_letztesStop = 0;
 static volatile bool     g_stopNeu      = false;
 static volatile bool     g_stopStart    = false;
@@ -542,8 +542,8 @@ static volatile uint8_t  g_stopPc       = 0;
 
 static bool onStartStop(uint8_t pc, bool start, bool eject)
 {
-    // Bewusst nichts Aufwendiges hier: der Rueckruf laeuft im USB-Zusammenhang,
-    // Zeichenketten und Dateizugriffe haben hier nichts verloren.
+    // Deliberately nothing expensive here: the callback runs in the USB context,
+    // strings and file access have no business in this place.
     g_letztesStop = millis();
     g_stopStart = start;
     g_stopEject = eject;
@@ -552,30 +552,30 @@ static bool onStartStop(uint8_t pc, bool start, bool eject)
     return true;
 }
 
-// ---- Diagnose-Log: sammelt im RAM, geht per WLAN raus ----
-// BEWUSST nicht auf die SD: solange der Drucker das Medium hat, wuerde jeder
-// eigene FAT-Write seinen noch offenen Commit zerstoeren - also genau den
-// Vorgang, den wir beobachten wollen. Der USB-CDC reisst beim WLAN-Start ab,
-// deshalb ist das Netz der einzige verlaessliche Kanal.
+// ---- Diagnostic log: collected in RAM, goes out over WiFi ----
+// DELIBERATELY not onto the SD: as long as the printer holds the medium, any
+// FAT write of our own would destroy its still open commit - that is exactly the
+// operation we want to observe. The USB CDC drops away when WiFi starts,
+// so the network is the only reliable channel.
 static String g_logPuffer;
-static size_t g_logGesendet = 0;   // bis hierhin ist der Puffer schon beim Empfaenger
+static size_t g_logGesendet = 0;   // up to here the buffer has already reached the receiver
 
 static void logZeile(const String &msg)
 {
     Serial.println(msg);
     g_logPuffer += String(millis()) + " " + msg + "\n";
-    if (g_logPuffer.length() > 8000) {                             // Deckel, RAM ist knapp
+    if (g_logPuffer.length() > 8000) {                             // cap, RAM is tight
         g_logPuffer.remove(0, 4000);
         g_logGesendet = g_logGesendet > 4000 ? g_logGesendet - 4000 : 0;
     }
 }
 
-// Geraeteauthentifizierung: HMAC-SHA256 ueber Name, Kennung und Laenge mit dem
-// Geraeteschluessel, als Kopfzeile X-Scan-Auth. Der Empfaenger weist alles ohne
-// gueltige Signatur ab. Einen Zeitstempel braucht es nicht: eine Wiederholung
-// desselben Uploads ist unschaedlich, der Empfaenger dedupliziert per Kennung.
-// Kein TLS - im LAN reicht das, und ein TLS-Kontext kostet auf dem Stick rund
-// 40 kB Arbeitsspeicher und jeden Upload spuerbar Zeit.
+// Device authentication: HMAC-SHA256 over name, id and length with the
+// device key, as header X-Scan-Auth. The receiver rejects everything without
+// a valid signature. A timestamp is not needed: a repeat of the
+// same upload is harmless, the receiver deduplicates by id.
+// No TLS - on the LAN that is enough, and a TLS context costs the stick about
+// 40 kB of memory and every upload a noticeable amount of time.
 static String uploadSignatur(const String &name, const String &id, uint32_t laenge)
 {
     if (cfgSchluessel.isEmpty()) return "";
@@ -589,10 +589,10 @@ static String uploadSignatur(const String &name, const String &id, uint32_t laen
     return hex;
 }
 
-// Nur das Neue seit dem letzten Mal wegschicken. Beruehrt die SD-Karte nicht.
-// Vorher ging jedes Mal der ganze Puffer raus - pro Scan eine Protokolldatei
-// mit der gesamten Vorgeschichte. Der Puffer selbst bleibt stehen, die
-// Weboberflaeche soll den ganzen Verlauf zeigen.
+// Send away only what is new since the last time. Does not touch the SD card.
+// Before, the whole buffer went out every time - one log file per scan
+// with the entire history. The buffer itself stays in place, the
+// web interface is meant to show the full history.
 static void logFlushNetz()
 {
     if (g_logGesendet >= g_logPuffer.length() || cfgEndpoint.isEmpty()) return;
@@ -612,8 +612,8 @@ static void logFlushNetz()
     if (code >= 200 && code < 300) g_logGesendet = g_logPuffer.length();
 }
 
-// ---- MBR-Partitionstyp auf FAT32-LBA (0x0C) setzen ----
-// ESP-Format hinterlaesst manchmal 0x07 (macOS liest das als NTFS und mountet nicht)
+// ---- Set the MBR partition type to FAT32-LBA (0x0C) ----
+// ESP format sometimes leaves 0x07 behind (macOS reads that as NTFS and will not mount)
 static void fixMbrTyp()
 {
     uint8_t *s = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
@@ -621,34 +621,34 @@ static void fixMbrTyp()
     if (sdLesen(s, 0) && s[510] == 0x55 && s[511] == 0xAA) {
         if (s[446 + 4] == 0x07) {
             s[446 + 4] = 0x0C;
-            if (sdSchreiben(s, 0)) Serial.println("[mbr] Typ 0x07 -> 0x0C korrigiert");
+            if (sdSchreiben(s, 0)) Serial.println("[mbr] type 0x07 -> 0x0C corrected");
         }
     }
     free(s);
 }
 
-// ================= Das Verzeichnis roh mitlesen =================
-// Bisher musste der Stick die Karte kurz abhaengen und wieder anhaengen, um zu
-// sehen, was der Drucker geschrieben hat - in diesen Millisekunden ist sie fuer
-// den Drucker weg. Deshalb durfte er nur selten nachsehen und musste auf Stille
-// warten. Liest er die Sektoren dagegen selbst, stoert er niemanden und darf
-// jede Sekunde schauen.
+// ================= Reading along in the directory, raw =================
+// Until now the stick had to unmount the card briefly and mount it again to
+// see what the printer had written - during those milliseconds it is gone for
+// the printer. That is why it was only allowed to look rarely and had to wait
+// for silence. If it reads the sectors itself instead, it disturbs nobody and
+// may look every second.
 //
-// FAT32 kurz: Bootsektor (Layout) -> Zuordnungstabelle (welcher Cluster gehoert
-// zu welcher Datei) -> Verzeichnis (32 Byte je Eintrag mit Name und GROESSE).
-// Die endgueltige Groesse traegt der Schreiber erst beim Schliessen ein - genau
-// daran erkennen wir, dass eine Datei fertig ist.
+// FAT32 in brief: boot sector (layout) -> allocation table (which cluster belongs
+// to which file) -> directory (32 bytes per entry with name and SIZE).
+// The writer only enters the final size on closing - that is exactly
+// how we recognize that a file is done.
 
-#define ROH_MIN_GROESSE 2048   // darunter: Hilfsdateien wie wifi.cfg, kein Scan
-#define MAX_FUND 24            // so viele Dateien je Durchlauf
+#define ROH_MIN_GROESSE 2048   // below that: helper files like wifi.cfg, no scan
+#define MAX_FUND 24            // this many files per pass
 
-// Was gilt als Scan? EIN Massstab fuer den Rohleser (sieht nur den 8.3-Kurznamen)
-// und den Sammler (sieht den langen Namen). Vorher zaehlte der Rohleser jede
-// Datei ab 2 kB, der Sammler uebersprang aber alles mit fuehrendem Punkt. Eine
-// "._wifi.cfg" vom Mac (4 kB, Kurzname "_WIFI~1.CFG") war roh sichtbar, im
-// Sammellauf aber nicht - der Stick meldete das Medium daraufhin fuenfmal in
-// Folge ab und wieder an, nach jedem Start und nach jedem Schreibzugriff.
-static bool istScanEndung(const uint8_t *e)   // 3 Zeichen aus dem Kurznamen, gross
+// What counts as a scan? ONE yardstick for the raw reader (sees only the 8.3 short name)
+// and for the collector (sees the long name). Before, the raw reader counted every
+// file from 2 kB up, but the collector skipped everything with a leading dot. A
+// "._wifi.cfg" from the Mac (4 kB, short name "_WIFI~1.CFG") was visible raw, but
+// not in the collecting pass - upon which the stick unmounted and remounted the
+// medium five times in a row, after every start and after every write.
+static bool istScanEndung(const uint8_t *e)   // 3 characters from the short name, uppercase
 {
     return !memcmp(e, "PDF", 3) || !memcmp(e, "JPG", 3) || !memcmp(e, "JPE", 3) ||
            !memcmp(e, "TIF", 3);
@@ -669,11 +669,11 @@ struct FatLage {
     uint32_t fatStart;
     uint32_t ersterDatenSektor;
     uint32_t rootCluster;
-    uint32_t partStart;        // fuer die Selbstpruefung und das Formatieren
+    uint32_t partStart;        // for the self-check and for formatting
     uint32_t partSektoren;
     uint32_t fatSektoren;
     uint8_t  anzahlFats;
-    uint32_t gesamtCluster;    // Datencluster (Nummern 2 .. gesamt+1)
+    uint32_t gesamtCluster;    // data clusters (numbers 2 .. total+1)
     uint16_t fsInfoSektor;
 };
 static FatLage g_fat = { false, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
@@ -691,7 +691,7 @@ static void fatLageLesen()
 
     uint32_t partStart = 0, partSektoren = 0;
     if (sdLesen(s, 0) && s[510] == 0x55 && s[511] == 0xAA) {
-        partStart    = le32(s + 446 + 8);       // Startsektor der ersten Partition
+        partStart    = le32(s + 446 + 8);       // start sector of the first partition
         partSektoren = le32(s + 446 + 12);
     }
     if (!sdLesen(s, partStart)) { free(s); return; }
@@ -734,8 +734,8 @@ static uint32_t fatNaechster(uint32_t c, uint8_t *puffer)
     return le32(puffer + (versatz % 512)) & 0x0FFFFFFF;
 }
 
-// Zaehlt Dateien im Wurzelverzeichnis und summiert ihre Groessen.
-// Bleiben Anzahl und Summe ueber mehrere Blicke gleich, schreibt niemand mehr.
+// Counts files in the root directory and sums up their sizes.
+// If count and sum stay the same over several looks, nobody is writing any more.
 static bool rohVerzeichnis(int &anzahl, uint32_t &summe)
 {
     anzahl = 0;
@@ -754,14 +754,14 @@ static bool rohVerzeichnis(int &anzahl, uint32_t &summe)
             if (!sdLesen(sek, clusterSektor(cl) + i)) { fertig = true; break; }
             for (int e = 0; e < 512; e += 32) {
                 uint8_t *d = sek + e;
-                if (d[0] == 0x00) { fertig = true; break; }   // Ende des Verzeichnisses
-                if (d[0] == 0xE5) continue;                   // geloeschter Eintrag
+                if (d[0] == 0x00) { fertig = true; break; }   // end of the directory
+                if (d[0] == 0xE5) continue;                   // deleted entry
                 uint8_t attr = d[11];
-                if (attr == 0x0F) continue;                   // Teil eines langen Namens
-                if (attr & 0x18) continue;                    // Ordner oder Datentraegername
-                if (!istScanEndung(d + 8)) continue;          // Endung im Kurznamen: Byte 8-10
+                if (attr == 0x0F) continue;                   // part of a long name
+                if (attr & 0x18) continue;                    // folder or volume label
+                if (!istScanEndung(d + 8)) continue;          // extension in the short name: byte 8-10
                 uint32_t gr = le32(d + 28);
-                if (gr < ROH_MIN_GROESSE) continue;           // Hilfsdatei, kein Scan
+                if (gr < ROH_MIN_GROESSE) continue;           // helper file, no scan
                 anzahl++;
                 summe += gr;
             }
@@ -773,18 +773,18 @@ static bool rohVerzeichnis(int &anzahl, uint32_t &summe)
     return true;
 }
 
-// Erster Cluster eines Verzeichniseintrags (Bytes 20/21 hoch, 26/27 tief)
+// First cluster of a directory entry (bytes 20/21 high, 26/27 low)
 static uint32_t eintragCluster(const uint8_t *d)
 {
     return ((uint32_t)(d[20] | (d[21] << 8)) << 16) | (uint32_t)(d[26] | (d[27] << 8));
 }
 
-// Einen Eintrag in einem Verzeichnis roh als geloescht markieren (erstes Byte
-// 0xE5), OHNE die Blockzuordnung anzufassen. Lange Namen liegen in Stuecken zu
-// 13 Zeichen VOR dem Kurzeintrag, in umgekehrter Reihenfolge; auch die werden
-// markiert. Gesucht wird per Name (wenn angegeben) oder per Startcluster.
-// Nur bei abgemeldetem Medium und VOR dem naechsten Mount aufrufen, sonst
-// schreibt der Dateisystem-Treiber seinen gepufferten Sektor wieder darueber.
+// Mark an entry in a directory as deleted, raw (first byte
+// 0xE5), WITHOUT touching the block allocation. Long names sit in pieces of
+// 13 characters BEFORE the short entry, in reverse order; those are marked
+// as well. The search goes by name (if given) or by start cluster.
+// Only call with the medium unmounted and BEFORE the next mount, otherwise
+// the file system driver writes its buffered sector over it again.
 static bool rohEintragLoeschenIn(uint32_t dirCluster, const String &name, uint32_t groesse, uint32_t startCluster)
 {
     if (!g_fat.gueltig) fatLageLesen();
@@ -823,7 +823,7 @@ static bool rohEintragLoeschenIn(uint32_t dirCluster, const String &name, uint32
                     continue;
                 }
                 String kandidat = lang;
-                if (kandidat.isEmpty()) {                       // nur Kurzname: "NAME    EXT"
+                if (kandidat.isEmpty()) {                       // short name only: "NAME    EXT"
                     for (int k = 0; k < 8 && d[k] != ' '; k++) kandidat += (char)d[k];
                     if (d[8] != ' ') { kandidat += '.'; for (int k = 8; k < 11 && d[k] != ' '; k++) kandidat += (char)d[k]; }
                 }
@@ -833,12 +833,12 @@ static bool rohEintragLoeschenIn(uint32_t dirCluster, const String &name, uint32
                     d[0] = 0xE5;
                     for (int k = 0; k < lfnAnzahl; k++) if (lfnSektor[k] == sektor) sek[lfnOffset[k]] = 0xE5;
                     getroffen = sdSchreiben(sek, sektor);
-                    for (int k = 0; k < lfnAnzahl && getroffen; k++) {   // Stuecke in frueheren Sektoren
+                    for (int k = 0; k < lfnAnzahl && getroffen; k++) {   // pieces in earlier sectors
                         if (lfnSektor[k] == sektor) continue;
                         if (!sdLesen(sek, lfnSektor[k])) { getroffen = false; break; }
                         for (int m = 0; m < lfnAnzahl; m++) if (lfnSektor[m] == lfnSektor[k]) sek[lfnOffset[m]] = 0xE5;
                         if (!sdSchreiben(sek, lfnSektor[k])) getroffen = false;
-                        sektor = lfnSektor[k];   // diese Gruppe ist erledigt
+                        sektor = lfnSektor[k];   // this group is done
                     }
                     break;
                 }
@@ -853,8 +853,8 @@ static bool rohEintragLoeschenIn(uint32_t dirCluster, const String &name, uint32
     return getroffen;
 }
 
-// Cluster eines Unterordners der Wurzel, per 8.3-Name (11 Zeichen, gross,
-// mit Leerzeichen aufgefuellt). 0 = nicht vorhanden.
+// Cluster of a subfolder of the root, by 8.3 name (11 characters, uppercase,
+// padded with spaces). 0 = not present.
 static uint32_t rohOrdnerCluster(const char *name83)
 {
     if (!g_fat.gueltig) fatLageLesen();
@@ -882,8 +882,8 @@ static uint32_t rohOrdnerCluster(const char *name83)
     return ergebnis;
 }
 
-// Startcluster und Groessen aller Dateien eines Verzeichnisses roh einsammeln.
-// Liefert die Anzahl. dirCluster 0 = Wurzel.
+// Collect start clusters and sizes of all files of a directory, raw.
+// Returns the count. dirCluster 0 = root.
 static int rohEintraege(uint32_t dirCluster, uint32_t *starts, uint32_t *groessen, int max, bool nurScans)
 {
     if (!g_fat.gueltig) fatLageLesen();
@@ -914,12 +914,12 @@ static int rohEintraege(uint32_t dirCluster, uint32_t *starts, uint32_t *groesse
     return n;
 }
 
-// Geisterjagd in der Wurzel - roh, bei abgemeldetem Medium, VOR dem Mount.
-// Der 780 schreibt nach dem Wiederanmelden seine alte Verzeichnissicht zurueck:
-// der vorige Scan liegt dann erneut als [Untitled].pdf in der Wurzel und zeigt
-// auf Bloecke, die entweder schon einer Datei in /senden oder /gesendet
-// gehoeren oder laengst frei sind. Solche Eintraege werden nur ausgetragen,
-// die Blockzuordnung bleibt unangetastet. Liefert die Zahl der Geister.
+// Ghost hunt in the root - raw, with the medium unmounted, BEFORE the mount.
+// After remounting, the 780 writes its old view of the directory back:
+// the previous scan then sits in the root again as [Untitled].pdf and points
+// at blocks that either already belong to a file in /senden or /gesendet
+// or have long been free. Such entries are merely struck out,
+// the block allocation stays untouched. Returns the number of ghosts.
 static int geisterJagen()
 {
     uint32_t fremd[64];
@@ -941,31 +941,31 @@ static int geisterJagen()
     for (int i = 0; i < nWurzel; i++) {
         uint32_t st = wurzel[i];
         const char *grund = nullptr;
-        if (st < 2 || fatNaechster(st, fatBuf) == 0) grund = "zeigt auf freie Bloecke";
+        if (st < 2 || fatNaechster(st, fatBuf) == 0) grund = "points at free blocks";
         for (int k = 0; !grund && k < nFremd; k++)
-            if (fremd[k] == st) grund = "zeigt auf Bloecke einer schon weggeraeumten Datei";
+            if (fremd[k] == st) grund = "points at blocks of a file already cleared away";
         for (int k = 0; !grund && k < nWurzel; k++) {
             if (k == i || wurzel[k] != st) continue;
-            // Zwei Wurzeleintraege auf denselben Bloecken: der Geist ist der,
-            // dessen Groesse nicht zur Kettenlaenge passt.
+            // Two root entries on the same blocks: the ghost is the one
+            // whose size does not match the chain length.
             uint32_t n = 0, c = st;
             while (c >= 2 && c < 0x0FFFFFF8 && n < 300000) { n++; c = fatNaechster(c, fatBuf); }
             uint32_t passt = (wurzelGr[i] + clusterBytes - 1) / clusterBytes;
-            if (passt != n) grund = "teilt Bloecke mit einem anderen Eintrag und passt nicht zur Kette";
+            if (passt != n) grund = "shares blocks with another entry and does not match the chain";
         }
         if (!grund) continue;
         bool ok = rohEintragLoeschenIn(0, "", wurzelGr[i], st);
-        logZeile(String("[geist] Wurzeleintrag mit ") + (wurzelGr[i] / 1024) + " kB " + grund +
-                 (ok ? " - ausgetragen" : " - austragen fehlgeschlagen"));
+        logZeile(String("[geist] root entry with ") + (wurzelGr[i] / 1024) + " kB " + grund +
+                 (ok ? " - struck out" : " - striking out failed"));
         if (ok) geister++;
     }
     free(fatBuf);
     return geister;
 }
 
-// ---- Rohes Lesen ganzer Dateien und die Merkliste (siehe Ablauf ab v26 unten) ----
+// ---- Raw reading of whole files and the watch list (see the flow from v26 below) ----
 
-// Verzeichnis roh listen, mit langen Namen. dirCluster 0 = Wurzel.
+// List a directory raw, with long names. dirCluster 0 = root.
 static int rohListe(uint32_t dirCluster, RohEintrag *liste, int max, bool nurScans)
 {
     if (!g_fat.gueltig) fatLageLesen();
@@ -1020,7 +1020,7 @@ static int rohListe(uint32_t dirCluster, RohEintrag *liste, int max, bool nurSca
     return n;
 }
 
-// Absoluter Sektor Nummer sektorIndex einer Datei ab Startcluster, 0 = Fehler
+// Absolute sector number sektorIndex of a file from its start cluster, 0 = error
 static uint32_t rohSektor(uint32_t start, uint32_t sektorIndex, uint8_t *fatBuf)
 {
     uint32_t cl = start;
@@ -1032,7 +1032,7 @@ static uint32_t rohSektor(uint32_t start, uint32_t sektorIndex, uint8_t *fatBuf)
     return clusterSektor(cl) + sektorIndex % g_fat.sektorenProCluster;
 }
 
-// Fertig geschrieben? Bei PDF steht %%EOF in den letzten 1024 Bytes - roh gelesen.
+// Finished writing? With a PDF, %%EOF sits in the last 1024 bytes - read raw.
 static bool rohVollstaendig(const RohEintrag &e)
 {
     String n = e.name;
@@ -1058,7 +1058,7 @@ static bool rohVollstaendig(const RohEintrag &e)
     return false;
 }
 
-// Kennzahl aus Groesse, ersten 256 und letzten bis zu 256 Bytes - roh gelesen
+// Fingerprint from size, first 256 and last up to 256 bytes - read raw
 static uint32_t rohKennzahl(const RohEintrag &e)
 {
     uint8_t *sek    = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
@@ -1077,7 +1077,7 @@ static uint32_t rohKennzahl(const RohEintrag &e)
             for (uint32_t i = im > 256 ? im - 256 : 0; i < im; i++) summe = summe * 31u + sek[i];
         }
     }
-    if (e.groesse > 2048) {                         // und ein Stueck aus der Mitte (Bilddaten)
+    if (e.groesse > 2048) {                         // and a piece from the middle (image data)
         sk = rohSektor(e.start, e.groesse / 1024, fatBuf);
         if (sk && sdLesen(sek, sk))
             for (uint32_t i = 0; i < 256; i++) summe = summe * 31u + sek[i];
@@ -1087,7 +1087,7 @@ static uint32_t rohKennzahl(const RohEintrag &e)
     return summe;
 }
 
-// Liest eine Datei roh entlang der Belegungskette, sektorweise
+// Reads a file raw along the allocation chain, sector by sector
 struct RohLeser {
     uint32_t groesse = 0, pos = 0, cluster = 0;
     uint8_t  idx = 0;
@@ -1116,12 +1116,12 @@ struct RohLeser {
     void ende() { if (sek) free(sek); if (fatBuf) free(fatBuf); sek = fatBuf = nullptr; }
 };
 
-// ---- Merkliste: gesendet, liegt noch auf der Karte ----
+// ---- Memo list: sent, still lying on the card ----
 #define MAX_FERTIG    64
 #define MAX_GELOESCHT 16
 static Fertig g_fertig[MAX_FERTIG];
 static int    g_fertigAnzahl = 0;
-static Fertig g_geloescht[MAX_GELOESCHT];   // Signaturen weggeraeumter Dateien: so erkennt man ihre Geister
+static Fertig g_geloescht[MAX_GELOESCHT];   // Signatures of cleared-away files: that is how their ghosts are spotted
 static int    g_geloeschtAnzahl = 0;
 
 static void fertigSpeichern()
@@ -1142,7 +1142,7 @@ static void fertigLaden()
     n = g_nvs.getBytesLength("geloescht");
     if (n && n <= sizeof g_geloescht && n % sizeof(Fertig) == 0) { g_nvs.getBytes("geloescht", g_geloescht, n); g_geloeschtAnzahl = n / sizeof(Fertig); }
     g_nvs.end();
-    if (g_fertigAnzahl) logZeile(String("[merk] ") + g_fertigAnzahl + " gesendete Datei(en) liegen laut Flash noch auf der Karte");
+    if (g_fertigAnzahl) logZeile(String("[merk] ") + g_fertigAnzahl + " sent file(s) are still on the card according to flash");
 }
 
 static int fertigIndex(uint32_t start, uint32_t groesse)
@@ -1157,11 +1157,11 @@ static bool istGeloescht(uint32_t start, uint32_t groesse)
     return false;
 }
 
-// Startblock und Groesse allein reichen NICHT: nach dem Aufraeumen ist die Karte
-// leer, der naechste Scan landet auf demselben Startblock, und zweimal dasselbe
-// Blatt hat dieselbe Groesse. Am 20.09.2026 galt so eine neue Datei als Geist
-// und wurde nie gesendet. Erst die Kennzahl aus dem Inhalt unterscheidet die
-// Wiederkehr einer alten Datei von einer neuen an derselben Stelle.
+// Start block and size alone are NOT enough: after the cleanup the card is
+// empty, the next scan lands on the same start block, and the same sheet
+// twice has the same size. On 20.09.2026 such a new file counted as a ghost
+// and was never sent. Only the checksum taken from the content tells the
+// return of an old file apart from a new one in the same place.
 static int fertigIndexE(const RohEintrag &e)
 {
     int i = fertigIndex(e.start, e.groesse);
@@ -1182,9 +1182,9 @@ static void fertigMerken(const RohEintrag &e, uint32_t kennzahl, const String &s
     int alt = fertigIndex(e.start, e.groesse);
     if (alt >= 0 && g_fertig[alt].kennzahl == kennzahl) return;
     if (alt >= 0) {
-        // Gleicher Startblock, gleiche Groesse, anderer Inhalt: der Eintrag gehoert
-        // jetzt der neuen Datei. Bliebe die alte Kennzahl stehen, gaelte die neue
-        // Datei bei jedem Blick wieder als neu und wuerde endlos hochgeladen.
+        // Same start block, same size, different content: the entry now belongs
+        // to the new file. If the old checksum stayed, the new file would count
+        // as new on every look and would be uploaded endlessly.
         geloeschtMerken(g_fertig[alt]);
         memmove(g_fertig + alt, g_fertig + alt + 1, (g_fertigAnzahl - alt - 1) * sizeof(Fertig));
         g_fertigAnzahl--;
@@ -1202,10 +1202,10 @@ static void geloeschtMerken(const Fertig &f)
     g_geloescht[g_geloeschtAnzahl++] = f;
 }
 
-// Liegt in der Wurzel ein Scan, der weder gesendet noch als Geist bekannt ist?
-// Liegt in der Wurzel etwas, das noch zu senden ist? Geister zaehlen nicht:
-// Eintraege auf freie Bloecke oder auf die Bloecke eines anderen Eintrags sind
-// Sache des Aufraeumfensters - sonst drehte sich der Waechter an ihnen im Kreis.
+// Is there a scan in the root that is neither sent nor known as a ghost?
+// Is there anything in the root still to be sent? Ghosts do not count:
+// entries pointing at free blocks or at the blocks of another entry are
+// business of the cleanup window - else the watcher would circle on them.
 static bool rohOffen()
 {
     RohEintrag liste[MAX_FUND];
@@ -1224,7 +1224,7 @@ static bool rohOffen()
     return offen;
 }
 
-// Was in der Wurzel noch NICHT gesendet ist - fuer die Anzeige.
+// What in the root is NOT yet sent - for the display.
 static void rohOffenSumme(int &anzahl, uint32_t &summe)
 {
     anzahl = 0; summe = 0;
@@ -1238,12 +1238,12 @@ static void rohOffenSumme(int &anzahl, uint32_t &summe)
 }
 
 
-// ---- Selbstpruefung der Karte: ein kleines fsck auf den rohen Sektoren ----
-// Der 780 schreibt seine alte Verzeichnissicht zurueck und bricht Jobs ab. Was
-// dabei liegen bleibt - doppelt belegte Bloecke, verwaiste Ketten, zu kurze
-// Ketten, die Schmutzmarke - liess ihn am 20.09.2026 die Karte ganz ablehnen
-// ("USB-Stick anschliessen"). Laeuft nur, wenn der Drucker die Karte nicht
-// sieht: beim Start vor dem Anmelden und im Aufraeumfenster.
+// ---- Card self-check: a small fsck on the raw sectors ----
+// The 780 writes its old directory view back and aborts jobs. What is left
+// behind - doubly used blocks, orphaned chains, chains that are too short,
+// the dirty flag - made it reject the card completely on 20.09.2026
+// ("connect USB stick"). Runs only when the printer does not see the card:
+// at start before attaching, and in the cleanup window.
 static KartenBefund g_befund = {};
 static uint32_t     g_befundZeit = 0;
 static int          g_heillosFolge = 0;
@@ -1252,7 +1252,7 @@ static inline bool bitDa(const uint8_t *bits, uint32_t c) { return bits[c >> 3] 
 static inline void bitSetzen(uint8_t *bits, uint32_t c)   { bits[c >> 3] |= (1 << (c & 7)); }
 static inline void bitLoeschen(uint8_t *bits, uint32_t c) { bits[c >> 3] &= ~(1 << (c & 7)); }
 
-// Einen Tabelleneintrag in beide Tabellen schreiben (obere 4 Bit bleiben)
+// Write one table entry into both tables (the upper 4 bits stay)
 static bool fatSetzen(uint32_t c, uint32_t wert, uint8_t *fatBuf)
 {
     uint32_t versatz = c * 4, sek = versatz / 512, off = versatz % 512;
@@ -1264,10 +1264,10 @@ static bool fatSetzen(uint32_t c, uint32_t wert, uint8_t *fatBuf)
     return ok;
 }
 
-// Kette ab 'start' in der Belegungskarte markieren. sollCluster > 0: so lang darf
-// die Datei hoechstens sein, dahinter wird die Kette abgeschnitten. Liefert die
-// Anzahl markierter Cluster. kreuz: ein Cluster gehoerte schon jemand anderem.
-// kaputt: die Kette lief ins Leere oder war zu lang (bei 'heilen' repariert).
+// Mark the chain from 'start' in the allocation map. sollCluster > 0: that is
+// the maximum length of the file, beyond it the chain is cut off. Returns the
+// number of marked clusters. kreuz: a cluster already belonged to someone else.
+// kaputt: the chain ran into nothing or was too long (repaired on 'heilen').
 static uint32_t ketteMarkieren(uint32_t start, uint32_t sollCluster, uint8_t *bits, uint8_t *fatBuf,
                                bool heilen, bool &kreuz, bool &kaputt)
 {
@@ -1286,8 +1286,8 @@ static uint32_t ketteMarkieren(uint32_t start, uint32_t sollCluster, uint8_t *bi
         if (n > g_fat.gesamtCluster) { kaputt = true; break; }
         c = next;
     }
-    if (c >= 0x0FFFFFF8) return n;                 // sauberes Ende
-    kaputt = true;                                  // 0, reserviert oder ausserhalb
+    if (c >= 0x0FFFFFF8) return n;                 // clean end
+    kaputt = true;                                  // 0, reserved or out of range
     if (heilen && vorher) fatSetzen(vorher, 0x0FFFFFFF, fatBuf);
     return n;
 }
@@ -1301,9 +1301,9 @@ static void ketteEntmarkieren(uint32_t start, uint32_t n, uint8_t *bits, uint8_t
     }
 }
 
-// Ein Verzeichnis ablaufen: jede Datei und jeden Unterordner markieren, Schaeden
-// zaehlen und bei 'heilen' beheben. Bei Doppelbelegung gewinnt der zuerst
-// gefundene Eintrag - die Wurzel, also die Datei des Druckers, kommt zuerst.
+// Walk one directory: mark every file and every subfolder, count the damage
+// and fix it on 'heilen'. On a double claim the entry found first wins -
+// the root, that is the printer's file, comes first.
 static bool pruefeVerzeichnis(uint32_t dirCluster, int tiefe, uint8_t *bits, uint8_t *sek, uint8_t *fatBuf,
                               bool heilen, KartenBefund &b)
 {
@@ -1321,17 +1321,17 @@ static bool pruefeVerzeichnis(uint32_t dirCluster, int tiefe, uint8_t *bits, uin
                 if (d[0] == 0x00) { if (geaendert) sdSchreiben(sek, sektor); return true; }
                 if (d[0] == 0xE5) { lfnN = 0; continue; }
                 if (d[11] == 0x0F) { if (lfnN < 20) { lfnSektor[lfnN] = sektor; lfnOffset[lfnN] = e; lfnN++; } continue; }
-                if ((d[11] & 0x08) || d[0] == '.') { lfnN = 0; continue; }   // Datentraegername, . und ..
+                if ((d[11] & 0x08) || d[0] == '.') { lfnN = 0; continue; }   // volume label, . and ..
                 uint32_t start = eintragCluster(d), groesse = le32(d + 28);
                 bool istOrdner = d[11] & 0x10;
-                if (start < 2) { lfnN = 0; continue; }                        // leere Datei
+                if (start < 2) { lfnN = 0; continue; }                        // empty file
                 bool kreuz, kaputt;
                 uint32_t soll = istOrdner ? 0 : (groesse + clusterBytes - 1) / clusterBytes;
                 uint32_t n = ketteMarkieren(start, soll, bits, fatBuf, heilen, kreuz, kaputt);
                 if (kreuz) {
                     b.kreuz++;
                     if (heilen) {
-                        ketteEntmarkieren(start, n, bits, fatBuf);   // was frei bleibt, raeumt der Waisenlauf
+                        ketteEntmarkieren(start, n, bits, fatBuf);   // what stays free is cleared by the orphan pass
                         d[0] = 0xE5;
                         for (int k = 0; k < lfnN; k++) {
                             if (lfnSektor[k] == sektor) { sek[lfnOffset[k]] = 0xE5; continue; }
@@ -1346,7 +1346,7 @@ static bool pruefeVerzeichnis(uint32_t dirCluster, int tiefe, uint8_t *bits, uin
                     }
                 } else {
                     if (kaputt) { b.gekuerzt++; if (heilen) b.geaendert = true; }
-                    if (!istOrdner && n < soll) {                                // Kette kuerzer als die Groesse
+                    if (!istOrdner && n < soll) {                                // chain shorter than the size
                         if (!kaputt) b.gekuerzt++;
                         if (heilen) {
                             uint32_t neu = n * clusterBytes;
@@ -1372,20 +1372,20 @@ static bool pruefeVerzeichnis(uint32_t dirCluster, int tiefe, uint8_t *bits, uin
 
 static String befundText(const KartenBefund &b)
 {
-    if (b.zuGross) return "Partition zu gross fuer die Pruefung";
-    if (b.heillos) return "Dateisystem nicht lesbar";
+    if (b.zuGross) return "partition too large for the check";
+    if (b.heillos) return "file system not readable";
     String t;
-    if (b.fatAbweichungen) t += String(b.fatAbweichungen) + " Tabellensektor(en) abweichend, ";
-    if (b.kreuz)           t += String(b.kreuz) + " Kreuzverkettung(en), ";
-    if (b.verwaist)        t += String(b.verwaist) + " verwaiste Cluster, ";
-    if (b.gekuerzt)        t += String(b.gekuerzt) + " Kette(n) gekuerzt, ";
-    if (b.schmutzig)       t += "Schmutzmarke, ";
-    if (t.isEmpty()) return "in Ordnung";
+    if (b.fatAbweichungen) t += String(b.fatAbweichungen) + " table sector(s) differing, ";
+    if (b.kreuz)           t += String(b.kreuz) + " cross-link(s), ";
+    if (b.verwaist)        t += String(b.verwaist) + " orphaned clusters, ";
+    if (b.gekuerzt)        t += String(b.gekuerzt) + " chain(s) shortened, ";
+    if (b.schmutzig)       t += "dirty flag, ";
+    if (t.isEmpty()) return "in order";
     t.remove(t.length() - 2);
-    return t + (b.geaendert ? " - behoben" : "");
+    return t + (b.geaendert ? " - fixed" : "");
 }
 
-// Die eigentliche Pruefung. Nur aufrufen, wenn der Host die Karte nicht sieht.
+// The actual check. Only call it when the host does not see the card.
 static void kartePruefen(bool heilen, const char *anlass)
 {
     uint32_t t0 = millis();
@@ -1396,14 +1396,14 @@ static void kartePruefen(bool heilen, const char *anlass)
         b.heillos = true;
         g_heillosFolge++;
         g_befund = b; g_befundZeit = millis();
-        logZeile(String("[karte] ") + anlass + ": Dateisystem nicht lesbar (" + g_heillosFolge + ". Mal in Folge)");
+        logZeile(String("[karte] ") + anlass + ": file system not readable (" + g_heillosFolge + " time(s) in a row)");
         return;
     }
     uint32_t bytes = (g_fat.gesamtCluster + 2 + 7) / 8;
     if (bytes > 65536) {
         b.zuGross = true;
         g_befund = b; g_befundZeit = millis();
-        logZeile(String("[karte] ") + anlass + ": " + g_fat.gesamtCluster + " Cluster - zu gross fuer die Pruefung, Partition kleiner machen");
+        logZeile(String("[karte] ") + anlass + ": " + g_fat.gesamtCluster + " clusters - too large for the check, make the partition smaller");
         return;
     }
     uint8_t *bits   = (uint8_t *)calloc(bytes, 1);
@@ -1411,11 +1411,11 @@ static void kartePruefen(bool heilen, const char *anlass)
     uint8_t *fatBuf = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
     if (!bits || !sek || !fatBuf) {
         if (bits) free(bits); if (sek) free(sek); if (fatBuf) free(fatBuf);
-        logZeile("[karte] kein Speicher fuer die Pruefung");
+        logZeile("[karte] no memory for the check");
         return;
     }
 
-    // 1. Beide Tabellen vergleichen - die erste gilt
+    // 1. Compare both tables - the first one counts
     if (g_fat.anzahlFats > 1) {
         for (uint32_t x = 0; x < g_fat.fatSektoren; x++) {
             if (!sdLesen(sek, g_fat.fatStart + x) || !sdLesen(fatBuf, g_fat.fatStart + g_fat.fatSektoren + x)) break;
@@ -1426,14 +1426,14 @@ static void kartePruefen(bool heilen, const char *anlass)
         }
     }
 
-    // 2. Wurzel und alles darunter ablaufen
+    // 2. Walk the root and everything below it
     bool kreuz, kaputt;
     ketteMarkieren(g_fat.rootCluster, 0, bits, fatBuf, heilen, kreuz, kaputt);
     if (kaputt) { b.gekuerzt++; if (heilen) b.geaendert = true; }
     if (!pruefeVerzeichnis(g_fat.rootCluster, 0, bits, sek, fatBuf, heilen, b)) b.heillos = true;
 
-    // 3. Verwaiste Cluster: belegt, aber von niemandem erreicht. Nebenbei die
-    //    freien zaehlen - der Freizaehler im FSInfo-Sektor wird gleich mit gerichtet.
+    // 3. Orphaned clusters: in use, but reached by nobody. Count the free ones
+    //    on the way - the free counter in the FSInfo sector is fixed along with it.
     uint32_t frei = 0, ersterFrei = 0;
     if (!b.heillos) {
         for (uint32_t x = 0; x < g_fat.fatSektoren; x++) {
@@ -1463,10 +1463,10 @@ static void kartePruefen(bool heilen, const char *anlass)
         }
     }
 
-    // 4. Schmutzmarke, zweifach: Bit 27 "sauber ausgehaengt" und Bit 26 "keine
-    //    Fehler" im zweiten Tabelleneintrag (Windows), und Bit 0 im Byte 65 des
-    //    Bootsektors (Linux setzt es beim Einhaengen, loescht es beim Aushaengen;
-    //    faellt das Medium vorher weg, bleibt es stehen - fsck: "Dirty bit is set").
+    // 4. Dirty flag, twice over: bit 27 "cleanly unmounted" and bit 26 "no
+    //    errors" in the second table entry (Windows), and bit 0 in byte 65 of
+    //    the boot sector (Linux sets it on mounting, clears it on unmounting;
+    //    if the medium drops out before that it stays - fsck: "Dirty bit is set").
     if (!b.heillos && sdLesen(sek, g_fat.fatStart)) {
         uint32_t v = le32(sek + 4);
         if ((v & 0x0C000000) != 0x0C000000) {
@@ -1484,7 +1484,7 @@ static void kartePruefen(bool heilen, const char *anlass)
         if (heilen) {
             sek[65] &= ~0x01;
             if (sdSchreiben(sek, g_fat.partStart)) b.geaendert = true;
-            uint16_t sicherung = (uint16_t)sek[50] | ((uint16_t)sek[51] << 8);   // Sicherungskopie des Bootsektors
+            uint16_t sicherung = (uint16_t)sek[50] | ((uint16_t)sek[51] << 8);   // backup copy of the boot sector
             if (sicherung && sicherung < 32) sdSchreiben(sek, g_fat.partStart + sicherung);
         }
     }
@@ -1495,10 +1495,10 @@ static void kartePruefen(bool heilen, const char *anlass)
     free(bits); free(sek); free(fatBuf);
 }
 
-// Letzte Stufe: die Partition frisch als FAT32 anlegen (32-kB-Cluster wie
-// mkfs.vfat -s 64). Nur, wenn nichts Ungesendetes mehr drauf ist - die
-// Einstellungen liegen im Flash, auf der Karte geht nichts verloren, was nicht
-// schon beim Empfaenger waere.
+// Last resort: lay out the partition freshly as FAT32 (32 kB clusters like
+// mkfs.vfat -s 64). Only when nothing unsent is left on it - the settings
+// live in flash, nothing is lost on the card that would not already be at
+// the receiver.
 static bool karteFormatieren(const char *anlass)
 {
     uint8_t *s = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
@@ -1508,28 +1508,28 @@ static bool karteFormatieren(const char *anlass)
         partStart = le32(s + 446 + 8); partSektoren = le32(s + 446 + 12);
     }
     uint32_t karte = SD_MMC.sectorSize() ? (uint32_t)(SD_MMC.cardSize() / SD_MMC.sectorSize()) : 0;
-    if (!partStart || !partSektoren || partStart + partSektoren > karte) { free(s); logZeile("[karte] Formatieren: keine brauchbare Partition"); return false; }
+    if (!partStart || !partSektoren || partStart + partSektoren > karte) { free(s); logZeile("[karte] format: no usable partition"); return false; }
     const uint8_t spc = 64; const uint16_t rsv = 32; const uint8_t nfat = 2;
     uint32_t fatSek = 0;
-    for (int i = 0; i < 4; i++) {                     // Tabellengroesse einpendeln
+    for (int i = 0; i < 4; i++) {                     // settle the table size
         uint32_t cl = (partSektoren - rsv - nfat * fatSek) / spc;
         fatSek = ((cl + 2) * 4 + 511) / 512;
     }
     uint32_t cluster = (partSektoren - rsv - nfat * fatSek) / spc;
-    if (cluster < 65525) { free(s); logZeile("[karte] Formatieren: Partition zu klein fuer FAT32"); return false; }
-    logZeile(String("[karte] formatiere (") + anlass + "): " + (partSektoren / 2048) + " MB, " + cluster + " Cluster");
+    if (cluster < 65525) { free(s); logZeile("[karte] format: partition too small for FAT32"); return false; }
+    logZeile(String("[karte] formatting (") + anlass + "): " + (partSektoren / 2048) + " MB, " + cluster + " clusters");
     uint32_t t0 = millis();
     bool ok = true;
-    // Tabellen leeren
+    // Clear the tables
     memset(s, 0, 512);
     for (uint32_t x = 0; x < nfat * fatSek && ok; x++) ok = sdSchreiben(s, partStart + rsv + x);
-    // Wurzel leeren (ein Cluster)
+    // Clear the root (one cluster)
     for (uint32_t x = 0; x < spc && ok; x++) ok = sdSchreiben(s, partStart + rsv + nfat * fatSek + x);
-    // Ersten Tabellensektor: Medienbyte, sauber-Marken, Wurzel-Ende
+    // First table sector: media byte, clean flags, root end
     const uint8_t kopf[12] = { 0xF8, 0xFF, 0xFF, 0x0F, 0xFF, 0xFF, 0xFF, 0x0F, 0xFF, 0xFF, 0xFF, 0x0F };
     memset(s, 0, 512); memcpy(s, kopf, 12);
     for (int f = 0; f < nfat && ok; f++) ok = sdSchreiben(s, partStart + rsv + f * fatSek);
-    // Bootsektor
+    // Boot sector
     memset(s, 0, 512);
     const uint8_t bs[] = { 0xEB, 0x58, 0x90, 'M','S','W','I','N','4','.','1' };
     memcpy(s, bs, sizeof(bs));
@@ -1555,40 +1555,40 @@ static bool karteFormatieren(const char *anlass)
     free(s);
     g_fat.gueltig = false;
     g_fertigAnzahl = 0; g_geloeschtAnzahl = 0; fertigSpeichern();
-    logZeile(String("[karte] formatiert in ") + (millis() - t0) + " ms" + (ok ? "" : " - MIT FEHLERN"));
+    logZeile(String("[karte] formatted in ") + (millis() - t0) + " ms" + (ok ? "" : " - WITH ERRORS"));
     return ok;
 }
 
-#define AUFRAEUM_VORGABE 3           // Minuten ohne Zugriff des Druckers (der 780 fasst den Stick zwischen Jobs gar nicht an)
+#define AUFRAEUM_VORGABE 3           // Minutes without printer access (the 780 does not touch the stick between jobs at all)
 static uint32_t g_aufraeumMin      = AUFRAEUM_VORGABE;
 static bool     g_aufraeumJetzt    = false;
 static uint32_t g_letztesAufraeumen = 0;
 
 
-// ---- Konfiguration von der SD lesen ----
-// Die Datei gilt nur, wenn sie sich seit dem letzten Uebernehmen GEAENDERT hat.
-// Vorher gewann sie bei jedem Start - wer das Upload-Ziel in der Weboberflaeche
-// umstellte, bekam beim naechsten Neustart still den alten Wert aus der Datei
-// zurueck. Der Pruefstand ist genau daran gescheitert. Liefert true, wenn die
-// Werte uebernommen wurden.
+// ---- Read the configuration from the SD card ----
+// The file only counts when it has CHANGED since it was last taken over.
+// Before, it won at every start - whoever switched the upload target in the
+// web interface silently got the old value from the file back at the next
+// restart. The test rig failed on exactly that. Returns true when the
+// values were taken over.
 static bool ladeConfig()
 {
     File f = SD_MMC.open("/wifi.cfg");
-    if (!f) { logZeile("[cfg] /wifi.cfg fehlt"); return false; }
+    if (!f) { logZeile("[cfg] /wifi.cfg missing"); return false; }
     String inhalt = f.readString();
     f.close();
 
-    uint32_t stand = 2166136261u;                    // FNV-1a ueber den Dateiinhalt
+    uint32_t stand = 2166136261u;                    // FNV-1a over the file content
     for (unsigned i = 0; i < inhalt.length(); i++) { stand ^= (uint8_t)inhalt[i]; stand *= 16777619u; }
     g_nvs.begin("scanstick", true);
     uint32_t bekannt = g_nvs.getUInt("cfgstand", 0);
     g_nvs.end();
     if (stand == bekannt) {
-        logZeile("[cfg] /wifi.cfg unveraendert - Einstellungen aus dem Flash gelten");
+        logZeile("[cfg] /wifi.cfg unchanged - the settings from flash count");
         return false;
     }
 
-    // Jede ssid=-Zeile beginnt ein neues Netz, pass= gehoert zur letzten ssid.
+    // Every ssid= line starts a new network, pass= belongs to the last ssid.
     String neuSsid[MAX_NETZE], neuPass[MAX_NETZE];
     int neu = 0;
     int von = 0;
@@ -1616,42 +1616,42 @@ static bool ladeConfig()
     g_nvs.end();
     String liste;
     for (int i = 0; i < cfgNetze; i++) liste += (i ? ", " : "") + cfgNetzSsid[i];
-    logZeile(String("[cfg] /wifi.cfg neu uebernommen: Netze=") + liste + " endpoint=" + cfgEndpoint);
+    logZeile(String("[cfg] /wifi.cfg newly taken over: networks=") + liste + " endpoint=" + cfgEndpoint);
     return true;
 }
 
-// Warum sind wir gestartet? Ohne diese Zeile ist ein Neustart im Betrieb nicht
-// von einem Stromausfall zu unterscheiden - und Brownout, Absturz und Watchdog
-// verlangen voellig verschiedene Gegenmassnahmen.
-static const char *g_startGrund = "unbekannt";
+// Why did we start? Without this line a restart during operation cannot be
+// told apart from a power failure - and brownout, crash and watchdog each
+// demand completely different countermeasures.
+static const char *g_startGrund = "unknown";
 static const char *resetGrund()
 {
     switch (esp_reset_reason()) {
-        case ESP_RST_POWERON:  return "Strom eingeschaltet";
-        case ESP_RST_SW:       return "Software-Neustart";
-        case ESP_RST_PANIC:    return "Absturz (Panic)";
-        case ESP_RST_INT_WDT:  return "Interrupt-Watchdog";
-        case ESP_RST_TASK_WDT: return "Task-Watchdog";
-        case ESP_RST_WDT:      return "Watchdog";
-        case ESP_RST_BROWNOUT: return "Brownout (Spannungseinbruch)";
-        case ESP_RST_DEEPSLEEP: return "Tiefschlaf";
-        case ESP_RST_EXT:      return "externer Reset";
-        case ESP_RST_USB:      return "USB-Reset";
-        default:               return "unbekannt";
+        case ESP_RST_POWERON:  return "power switched on";
+        case ESP_RST_SW:       return "software restart";
+        case ESP_RST_PANIC:    return "crash (panic)";
+        case ESP_RST_INT_WDT:  return "interrupt watchdog";
+        case ESP_RST_TASK_WDT: return "task watchdog";
+        case ESP_RST_WDT:      return "watchdog";
+        case ESP_RST_BROWNOUT: return "brownout (voltage dip)";
+        case ESP_RST_DEEPSLEEP: return "deep sleep";
+        case ESP_RST_EXT:      return "external reset";
+        case ESP_RST_USB:      return "USB reset";
+        default:               return "unknown";
     }
 }
 
-// ---- Zugangsdaten zusaetzlich im NVS-Flash ----
-// Sie stehen auf der SD (/wifi.cfg). Mountet die Karte nicht, gaebe es ohne
-// Kopie im Flash kein WLAN und keine Weboberflaeche - also genau dann keine
-// Diagnose, wenn man sie braucht. Darum spiegeln.
+// ---- Credentials also kept in the NVS flash ----
+// They live on the SD card (/wifi.cfg). If the card does not mount, without a
+// copy in flash there would be no WiFi and no web interface - that is, no
+// diagnostics exactly when you need them. So we mirror them.
 static void cfgAusNvs()
 {
     g_nvs.begin("scanstick", true);
-    // Netze als Zeilen "ssid<TAB>pass". Aeltere Staende kennen nur ssid/pass.
+    // Networks as lines "ssid<TAB>pass". Older versions only know ssid/pass.
     String netze = g_nvs.getString("netze", "");
     cfgNetze = 0;
-    if (netze.isEmpty() && !g_nvs.isKey("netze")) {   // nur wenn es die Liste noch nie gab: alte Einzelwerte
+    if (netze.isEmpty() && !g_nvs.isKey("netze")) {   // only if the list never existed: old single values
         String s = g_nvs.getString("ssid", "");
         if (s.length()) { cfgNetzSsid[0] = s; cfgNetzPass[0] = g_nvs.getString("pass", ""); cfgNetze = 1; }
     } else {
@@ -1674,7 +1674,7 @@ static void cfgAusNvs()
     cfgSchluessel = g_nvs.getString("schluessel", "");
     g_idleMs    = g_nvs.getUInt("idle", IDLE_VORGABE);
     g_aufraeumMin = g_nvs.getUInt("aufraeum", AUFRAEUM_VORGABE);
-    g_loeschen  = true;   // "nach /gesendet verschieben" gibt es nicht mehr (Kreuzverkettungen, 20.09.2026)
+    g_loeschen  = true;   // "move to /gesendet" no longer exists (cross-linked clusters, 20.09.2026)
     g_invertiert = g_nvs.getBool("invers", true);
     g_ledHell   = (uint8_t)g_nvs.getUChar("ledhell", 5);
     for (int i = 0; i < Z_ANZAHL; i++) {
@@ -1685,7 +1685,7 @@ static void cfgAusNvs()
     g_farbeSendet = g_nvs.getUInt("fsendet", g_farbeSendet);
     g_farbeFertig = g_nvs.getUInt("ffertig", g_farbeFertig);
     g_nvs.end();
-    if (cfgNetze) logZeile(String("[nvs] ") + cfgNetze + " Netz(e) aus dem Flash, erstes: " + cfgNetzSsid[0]);
+    if (cfgNetze) logZeile(String("[nvs] ") + cfgNetze + " network(s) from flash, first: " + cfgNetzSsid[0]);
 }
 
 static void cfgNachNvs()
@@ -1694,7 +1694,7 @@ static void cfgNachNvs()
     String netze;
     for (int i = 0; i < cfgNetze; i++) netze += cfgNetzSsid[i] + "\t" + cfgNetzPass[i] + "\n";
     g_nvs.putString("netze", netze);
-    g_nvs.remove("ssid"); g_nvs.remove("pass");   // alte Einzelwerte: sonst kehrt ein entferntes Netz zurueck
+    g_nvs.remove("ssid"); g_nvs.remove("pass");   // old single values: otherwise a removed network comes back
     g_nvs.putString("endpoint", cfgEndpoint);
     g_nvs.putString("webpass", cfgWebPass);
     g_nvs.putString("praefix", cfgPraefix);
@@ -1714,26 +1714,26 @@ static void cfgNachNvs()
     g_nvs.end();
 }
 
-// WLAN nur anstossen, nicht auf die Verbindung warten: der Drucker soll den
-// Stick sofort als Laufwerk sehen, nicht erst nach dem WLAN-Timeout.
-static String  g_apKennung;      // Kennung des gewaehlten Zugangspunkts
+// Only kick WiFi off, do not wait for the connection: the printer should see
+// the stick as a drive at once, not only after the WiFi timeout.
+static String  g_apKennung;      // BSSID of the chosen access point
 static int     g_apKanal  = 0;
 static long    g_apRssi   = 0;
-static uint32_t g_wlanVerloren = 0;   // seit wann ohne Netz (0 = verbunden)
-#define WLAN_NEUSUCHE 120000          // so lange ohne Netz, dann neu suchen
+static uint32_t g_wlanVerloren = 0;   // since when without a network (0 = connected)
+#define WLAN_NEUSUCHE 120000          // this long without a network, then search again
 
-// Mehrere Zugangspunkte koennen dieselbe SSID tragen (einzelne APs, kein Mesh),
-// und der Stick kennt mehrere Netze. WiFiMulti sucht ueber alle bekannten Netze
-// hinweg, nimmt den staerksten Zugangspunkt und verbindet gezielt mit dessen
-// Kennung und Kanal. Blockiert bis zur Verbindung oder WIFI_TIMEOUT - deshalb
-// laeuft das erst, wenn der Drucker den Stick schon als Laufwerk sieht.
+// Several access points can carry the same SSID (single APs, no mesh), and the
+// stick knows several networks. WiFiMulti searches across all known networks,
+// takes the strongest access point and connects to it deliberately by its
+// BSSID and channel. Blocks until connected or WIFI_TIMEOUT - which is why
+// this only runs once the printer already sees the stick as a drive.
 //
-// Die feste Kennung hat eine Kehrseite: faellt genau dieser Zugangspunkt aus,
-// versucht der Auto-Reconnect nur ihn. Darum sucht loop() nach zwei Minuten
-// ohne Netz von vorn - dann darf es auch ein anderer Zugangspunkt sein.
+// The fixed BSSID has a downside: if exactly that access point fails, the
+// auto-reconnect only tries that one. So loop() searches from scratch after
+// two minutes without a network - then another access point is allowed too.
 static void wlanStarten()
 {
-    if (!cfgNetze) { logZeile("[wifi] kein Netz bekannt"); return; }
+    if (!cfgNetze) { logZeile("[wifi] no network known"); return; }
     WiFi.mode(WIFI_STA);
     WiFi.setHostname(geraeteName().c_str());
     g_wifiMulti.APlistClean();
@@ -1744,11 +1744,11 @@ static void wlanStarten()
         g_apKanal   = WiFi.channel();
         g_apRssi    = WiFi.RSSI();
         g_wlanVerloren = 0;
-        logZeile(String("[wifi] ") + WiFi.SSID() + " ueber " + g_apKennung + " auf Kanal " +
-                 g_apKanal + " mit " + g_apRssi + " dBm, IP " + WiFi.localIP().toString());
+        logZeile(String("[wifi] ") + WiFi.SSID() + " via " + g_apKennung + " on channel " +
+                 g_apKanal + " with " + g_apRssi + " dBm, IP " + WiFi.localIP().toString());
     } else {
         g_apKennung = "";
-        logZeile("[wifi] kein bekanntes Netz erreichbar");
+        logZeile("[wifi] no known network reachable");
     }
 }
 
@@ -1759,12 +1759,12 @@ static bool wifiVerbinden()
     return WiFi.status() == WL_CONNECTED;
 }
 
-// ---- Einrichtung ohne Karte im Lesegeraet ----
-// Kennt der Stick kein Netz oder erreicht er keins, spannt er ein eigenes WLAN
-// auf (Name = Geraetename, offen) und beantwortet jede Namensanfrage mit sich
-// selbst - Handy oder Rechner oeffnen dann von selbst die Einrichtungsseite,
-// wie im Hotel. Sobald ein bekanntes Netz erreichbar ist, geht das WLAN wieder
-// aus. Der Scanpfad ist davon unberuehrt: USB laeuft, Uploads warten nur.
+// ---- Setup without a card in the reader ----
+// If the stick knows no network or reaches none, it opens a WiFi of its own
+// (name = device name, open) and answers every name lookup with itself -
+// phone or computer then open the setup page by themselves, like in a hotel.
+// As soon as a known network is reachable, that WiFi goes off again. The scan
+// path is untouched by this: USB runs, uploads merely wait.
 static DNSServer g_dns;
 static bool      g_einrichtung = false;
 static bool      g_einrichtungGezeichnet = false;
@@ -1780,16 +1780,16 @@ static void zeigeEinrichtung()
     g_gfx->setTextColor(COL_BLACK);
     g_gfx->setTextSize(2);
     g_gfx->setCursor(4, 4);
-    g_gfx->print("WLAN EINRICHTEN");
+    g_gfx->print("WIFI SETUP");
     g_gfx->setTextSize(1);
     g_gfx->setCursor(4, 30);
-    g_gfx->print("Mit diesem Netz verbinden:");
+    g_gfx->print("Connect to this network:");
     g_gfx->setTextSize(2);
     g_gfx->setCursor(4, 42);
     g_gfx->print(geraeteName());
     g_gfx->setTextSize(1);
     g_gfx->setCursor(4, 66);
-    g_gfx->print("dann http://192.168.4.1/");
+    g_gfx->print("then http://192.168.4.1/");
 }
 
 static void einrichtungStarten(const char *grund)
@@ -1801,7 +1801,7 @@ static void einrichtungStarten(const char *grund)
     g_dns.start(53, "*", WiFi.softAPIP());
     g_einrichtung = true;
     g_einrichtungGezeichnet = false;
-    logZeile(String("[einrichtung] ") + grund + " - eigenes WLAN \"" + geraeteName() + "\" offen, Seite http://" +
+    logZeile(String("[einrichtung] ") + grund + " - own WiFi \"" + geraeteName() + "\" open, page http://" +
              WiFi.softAPIP().toString() + "/");
 }
 
@@ -1813,13 +1813,13 @@ static void einrichtungBeenden()
     WiFi.mode(WIFI_STA);
     g_einrichtung = false;
     g_screen = -1;
-    logZeile("[einrichtung] Netz gefunden - eigenes WLAN wieder aus");
+    logZeile("[einrichtung] network found - own WiFi off again");
 }
 
-// http://host[:port]/pfad zerlegen
+// split http://host[:port]/path
 static bool urlTeile(const String &url, String &host, uint16_t &port, String &pfad)
 {
-    if (!url.startsWith("http://")) return false;   // bewusst nur http, kein TLS auf dem Stick
+    if (!url.startsWith("http://")) return false;   // deliberately http only, no TLS on the stick
     String rest = url.substring(7);
     int sl = rest.indexOf('/');
     String hostteil = (sl < 0) ? rest : rest.substring(0, sl);
@@ -1830,13 +1830,13 @@ static bool urlTeile(const String &url, String &host, uint16_t &port, String &pf
     return host.length() > 0;
 }
 
-// Upload in Bloecken. Wir schreiben HTTP selbst, weil HTTPClient die Datei in
-// einem Zug schluckt und keinen Fortschritt meldet - den braucht das Display,
-// und bei schwachem WLAN sieht man so ueberhaupt, ob es vorangeht oder haengt.
-// ---- Uhrzeit per NTP ----
-// Nur fuer Dateinamen: "Untitled_7.pdf" ist im Ablageziel wertlos,
-// "scan-20260919-1432.pdf" sortiert sich von selbst.
-#define ZEIT_WIEDERHOLUNG 120000   // alle 2 Minuten erneut versuchen, bis es klappt
+// Upload in blocks. We write HTTP ourselves because HTTPClient swallows the
+// file in one go and reports no progress - the display needs it, and on weak
+// WiFi it is the only way to see whether things move at all or hang.
+// ---- Clock via NTP ----
+// Only for file names: "Untitled_7.pdf" is worthless in the filing target,
+// "scan-20260919-1432.pdf" sorts itself.
+#define ZEIT_WIEDERHOLUNG 120000   // try again every 2 minutes until it works
 static uint32_t g_zeitVersuch = 0;
 
 static void zeitHolen()
@@ -1850,11 +1850,11 @@ static void zeitHolen()
         strftime(s, sizeof s, "%d.%m.%Y %H:%M:%S", &t);
         logZeile(String("[zeit] ") + s);
     } else {
-        logZeile("[zeit] keine NTP-Antwort - Dateinamen bekommen die Laufzeit");
+        logZeile("[zeit] no NTP reply - file names get the uptime");
     }
 }
 
-// Eindeutiger Name mit Zeitstempel, Endung bleibt erhalten.
+// Unique name with time stamp, the extension is kept.
 static String neuerName(const String &alt)
 {
     String endung;
@@ -1863,12 +1863,12 @@ static String neuerName(const String &alt)
     char stempel[32];
     struct tm t;
     if (g_zeitOk && getLocalTime(&t, 200)) strftime(stempel, sizeof stempel, "%Y%m%d-%H%M%S", &t);
-    else snprintf(stempel, sizeof stempel, "nach%lus", (unsigned long)(millis() / 1000));
+    else snprintf(stempel, sizeof stempel, "after%lus", (unsigned long)(millis() / 1000));
     return cfgPraefix + "-" + stempel + endung;
 }
 
-// Fuer Links: Klammern, Leerzeichen und Umlaute muessen kodiert werden,
-// sonst zeigt der Download-Link ins Leere.
+// For links: brackets, spaces and umlauts have to be encoded, otherwise the
+// download link points nowhere.
 static String urlKodiert(const String &s)
 {
     String r;
@@ -1880,14 +1880,14 @@ static String urlKodiert(const String &s)
     return r;
 }
 
-// Ist die Datei fertig geschrieben? Bei PDF steht das in der Datei selbst:
-// sie endet mit "%%EOF". Das ist ein Beweis - anders als Stille oder Dateigroesse,
-// denn der 780 traegt die endgueltige Groesse schon vor dem Schreiben ein und
-// reserviert den Platz. Ohne diese Pruefung haben wir eine halb geschriebene
-// Datei hochgeladen, deren hinterer Teil nur aus Leerbytes bestand.
+// Is the file written completely? For PDF the file itself says so: it ends
+// with "%%EOF". That is proof - unlike silence or file size, because the 780
+// enters the final size before writing and reserves the space. Without this
+// check we have uploaded a half-written file whose tail consisted only of
+// empty bytes.
 static bool dateiVollstaendig(const String &pfad, uint32_t groesse)
 {
-    if (!pfad.endsWith(".pdf") && !pfad.endsWith(".PDF")) return true;   // nur PDF pruefbar
+    if (!pfad.endsWith(".pdf") && !pfad.endsWith(".PDF")) return true;   // only PDF can be checked
     if (groesse < 32) return false;
     File f = SD_MMC.open(pfad);
     if (!f) return false;
@@ -1902,14 +1902,14 @@ static bool dateiVollstaendig(const String &pfad, uint32_t groesse)
     return false;
 }
 
-// Kennung der Datei fuer den Empfaenger. Der Drucker stellt nach dem
-// Verschieben gern seine alte Verzeichnissicht wieder her - dann zeigt
-// "[Untitled].pdf" erneut auf dieselben Daten und wir laden sie ein zweites
-// Mal hoch. Der Empfaenger erkennt die Wiederholung an dieser Kennung.
+// Identifier of the file for the receiver. After a move the printer likes to
+// restore its old directory view - then "[Untitled].pdf" points at the same
+// data again and we upload it a second time. The receiver recognises the
+// repeat by this identifier.
 //
-// Kurze Kennzahl aus Groesse plus erstem und letztem Block - reicht, um
-// dieselbe Datei wiederzuerkennen, und kostet kaum Lesezeit. Zum LOESCHEN ohne
-// Upload taugt sie bewusst nicht (siehe sendeGefundene).
+// Short check number from size plus first and last block - enough to recognise
+// the same file again, and it costs hardly any read time. For DELETING without
+// an upload it deliberately does not suffice (see sendeGefundene).
 static uint32_t dateiKennzahl(const String &pfad, uint32_t groesse)
 {
     File f = SD_MMC.open(pfad);
@@ -1929,37 +1929,37 @@ static uint32_t dateiKennzahl(const String &pfad, uint32_t groesse)
 
 #define UP_FEHLER   0
 #define UP_OK       1
-#define UP_DUPLIKAT 2   // angenommen, aber der Empfaenger kannte die Datei schon
-// Upload aus einer beliebigen Quelle: lese(puffer, n) liefert Bytes, 0 = Ende,
-// negativ = Fehler. Datei per Dateisystem oder roh entlang der Belegungskette.
+#define UP_DUPLIKAT 2   // accepted, but the receiver already knew the file
+// Upload from any source: lese(puffer, n) delivers bytes, 0 = end, negative =
+// error. File via the file system or raw along the allocation chain.
 static int ladeHochQuelle(const String &name, const String &id, uint32_t len,
                           std::function<int(uint8_t *, size_t)> lese)
 {
-    if (!len) { logZeile("[up] " + name + " ist leer, uebersprungen"); return UP_FEHLER; }
+    if (!len) { logZeile("[up] " + name + " is empty, skipped"); return UP_FEHLER; }
     String host, ziel;
     uint16_t port;
     if (!urlTeile(cfgEndpoint, host, port, ziel)) {
-        logZeile("[up] Ziel-Adresse unbrauchbar: " + cfgEndpoint);
+        logZeile("[up] target address unusable: " + cfgEndpoint);
         return UP_FEHLER;
     }
     ziel += (ziel.indexOf('?') < 0) ? "?name=" : "&name=";
     ziel += name;
-    // Eindeutige Kennung derselben Datei. Damit kann der Empfaenger doppelte
-    // Uebertragungen erkennen und verwerfen - etwa wenn ein Upload abbricht und
-    // spaeter wiederholt wird, oder wenn der Drucker seine alte Verzeichnissicht
-    // zurueckschreibt und die Datei dadurch erneut auftaucht.
+    // Unique identifier of the same file. With it the receiver can spot and
+    // discard duplicate transfers - for instance when an upload breaks off and
+    // is repeated later, or when the printer writes back its old directory
+    // view and the file shows up again because of that.
     if (id.length()) { ziel += "&id="; ziel += id; }
 
-    // Bei schwachem Funk scheitert der erste Verbindungsaufbau gern mal.
-    // Einmal aufgeben hiess bisher: Datei bleibt liegen, naechster Anlauf erst
-    // beim naechsten Scan.
+    // On weak radio the first connection attempt likes to fail. Giving up once
+    // used to mean: the file stays put, the next try only comes with the next
+    // scan.
     WiFiClient c;
     bool verbunden = false;
     for (int v = 1; v <= 3 && !verbunden; v++) {
         verbunden = c.connect(host.c_str(), port);
         if (!verbunden) {
-            logZeile(String("[up] keine Verbindung zu ") + host + ":" + port +
-                     " (Versuch " + v + " von 3)");
+            logZeile(String("[up] no connection to ") + host + ":" + port +
+                     " (attempt " + v + " of 3)");
             delay(1500);
         }
     }
@@ -1976,19 +1976,19 @@ static int ladeHochQuelle(const String &name, const String &id, uint32_t len,
     uint8_t puffer[1024];
     uint32_t geschickt = 0, t0 = millis();
     while (geschickt < len) {
-        // Der Drucker schreibt den naechsten Scan: dann jetzt nicht von der Karte
-        // lesen. Vor v26 war das Medium waehrend des Uploads weg, seit v26 lesen
-        // wir daneben - und genau in dieser Ueberlappung brach der 780 zweimal
-        // mit 44.12.05 ab. Also abbrechen und nachholen, sobald er fertig ist;
-        // ein doppelt angekommener Upload ist beim Empfaenger ein Duplikat.
-        if ((int32_t)(g_lastWrite - t0) > 0) { logZeile("[up] Drucker schreibt - Upload abgebrochen, wird nachgeholt"); break; }
+        // The printer is writing the next scan: then do not read from the card
+        // now. Before v26 the medium was gone during the upload, since v26 we
+        // read alongside - and exactly in that overlap the 780 aborted twice
+        // with 44.12.05. So abort and catch up once it is done; an upload that
+        // arrived twice is a duplicate at the receiver.
+        if ((int32_t)(g_lastWrite - t0) > 0) { logZeile("[up] printer is writing - upload aborted, will be caught up"); break; }
         int gelesen = lese(puffer, sizeof puffer);
-        if (gelesen <= 0) { logZeile("[up] Karte liefert keine Daten mehr"); break; }
+        if (gelesen <= 0) { logZeile("[up] card delivers no more data"); break; }
         int raus = c.write(puffer, gelesen);
-        if (raus != gelesen) { logZeile("[up] Verbindung brach beim Senden ab"); break; }
+        if (raus != gelesen) { logZeile("[up] connection broke while sending"); break; }
         geschickt += raus;
         zeigeSendenFortschritt(geschickt, len);
-        if (millis() - t0 > 180000) { logZeile("[up] Zeitueberschreitung beim Senden"); break; }
+        if (millis() - t0 > 180000) { logZeile("[up] timeout while sending"); break; }
     }
 
     if (geschickt != len) { c.stop(); return UP_FEHLER; }
@@ -2001,38 +2001,38 @@ static int ladeHochQuelle(const String &name, const String &id, uint32_t len,
         String zeile = c.readStringUntil('\n');          // "HTTP/1.1 200 OK"
         int sp = zeile.indexOf(' ');
         if (sp > 0) code = zeile.substring(sp + 1, sp + 4).toInt();
-        // Rest der Antwort: sagt der Empfaenger "Duplikat", kannte er die Datei
-        // schon - dann ist unser Eintrag ein Geist (siehe sendeGefundene).
+        // Rest of the response: if the receiver says "duplicate" (or the older
+        // "Duplikat"), it already knew the file - our entry is a ghost (see sendeGefundene).
         uint32_t tr = millis();
         while ((c.connected() || c.available()) && millis() - tr < 3000) {
             if (!c.available()) { delay(10); continue; }
             String z = c.readStringUntil('\n');
-            if (z.indexOf("Duplikat") >= 0) duplikat = true;
+            if (z.indexOf("Duplikat") >= 0 || z.indexOf("uplicate") >= 0) duplikat = true;
         }
     }
     c.stop();
     if (WiFi.status() == WL_CONNECTED) { g_rssiLetztLast = WiFi.RSSI(); rssiErfassen(g_rssiLetztLast); }
     logZeile(String("[up] ") + name + " " + (geschickt / 1024) + " kB HTTP " + code +
-             (duplikat ? " (Duplikat)" : "") + " in " + ((millis() - t0) / 1000) + " s");
+             (duplikat ? " (duplicate)" : "") + " in " + ((millis() - t0) / 1000) + " s");
     if (code >= 200 && code < 300) { zeigeFertig(geschickt); delay(1200); return duplikat ? UP_DUPLIKAT : UP_OK; }
     return UP_FEHLER;
 }
 
-// Upload per Dateisystem (fuer Reste in /senden aus v25)
+// Upload via the file system (for leftovers in /senden from v25)
 static int ladeHoch(fs::FS &fs, const String &pfad, const String &name, const String &id)
 {
     File f = fs.open(pfad);
-    if (!f) { logZeile("[up] " + pfad + " nicht oeffenbar"); return UP_FEHLER; }
+    if (!f) { logZeile("[up] " + pfad + " cannot be opened"); return UP_FEHLER; }
     uint32_t len = f.size();
     int erg = ladeHochQuelle(name, id, len, [&](uint8_t *b, size_t n) { return f.read(b, n); });
     f.close();
     return erg;
 }
 
-// ================= Weboberflaeche =================
-// Der Stick steckt im Drucker: kein Serial (der CDC gehoert im MSC-Betrieb dem
-// TinyUSB-Stack), Display nur fuer den, der davorsteht. Die Webseite ist der
-// einzige Kanal, der von ueberall offen ist.
+// ================= Web interface =================
+// The stick sits in the printer: no Serial (in MSC mode the CDC belongs to the
+// TinyUSB stack), display only for whoever stands in front of it. The web page
+// is the only channel that is open from anywhere.
 
 static String menschlich(uint64_t b)
 {
@@ -2056,8 +2056,8 @@ static String dauer(uint32_t ms)
     return String(t);
 }
 
-// Die letzten Schreibzugriffe des Hosts als Text: fuer die Statusseite (html)
-// und fuers Protokoll, wenn ein Zyklus nichts hochgeladen hat.
+// The host's last write accesses as text: for the status page (html) and for
+// the log, when a cycle has uploaded nothing.
 static String spurText(bool html)
 {
     String spur;
@@ -2067,15 +2067,15 @@ static String spurText(bool html)
         uint32_t lba = g_spurLba[i];
         const char *wo = !g_fat.gueltig ? "?" : lba < g_fat.fatStart ? "Boot"
                        : lba < g_fat.ersterDatenSektor ? "FAT"
-                       : lba < clusterSektor(g_fat.rootCluster) + g_fat.sektorenProCluster ? "Wurzel" : "Daten";
-        if (html) spur += String("vor ") + dauer(millis() - g_spurT[i]) + ": " + lba + " +" + g_spurN[i] + " (" + wo + ")<br>";
+                       : lba < clusterSektor(g_fat.rootCluster) + g_fat.sektorenProCluster ? "Root" : "Data";
+        if (html) spur += String("") + dauer(millis() - g_spurT[i]) + " ago: " + lba + " +" + g_spurN[i] + " (" + wo + ")<br>";
         else      spur += String(lba) + "+" + g_spurN[i] + wo[0] + " ";
     }
     return spur;
 }
 
-// Die Seite gibt gescannte Post zum Herunterladen frei. Ohne Passwort kann
-// jedes Geraet im WLAN mitlesen - deshalb Basic-Auth, sobald eines gesetzt ist.
+// The page hands out scanned mail for download. Without a password every
+// device on the WiFi can read along - hence Basic Auth as soon as one is set.
 static bool webAuth()
 {
     if (cfgWebPass.isEmpty()) return true;
@@ -2093,7 +2093,7 @@ static String hexFarbe(uint32_t rgb)
 
 static String htmlKopf(const String &titel)
 {
-    return String("<!doctype html><html lang=\"de\"><head><meta charset=\"utf-8\">"
+    return String("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
         "<title>Scan-Stick</title><style>"
         "body{font-family:system-ui,sans-serif;margin:0;padding:1rem;background:#15171a;color:#e8e8e8}"
@@ -2109,9 +2109,9 @@ static String htmlKopf(const String &titel)
         ".btn{display:inline-block;background:#2a4d6e;color:#fff;padding:.45rem .8rem;"
         "border-radius:6px;text-decoration:none;margin:.2rem .4rem .2rem 0}"
         "</style></head><body><h1>") + titel + "</h1>"
-        "<nav><a href=\"/\">Status</a><a href=\"/log\">Protokoll</a>"
-        "<a href=\"/dateien\">Dateien</a><a href=\"/roh\">Roh</a>"
-        "<a href=\"/einstellungen\">Einstellungen</a>"
+        "<nav><a href=\"/\">Status</a><a href=\"/log\">Log</a>"
+        "<a href=\"/dateien\">Files</a><a href=\"/roh\">Raw</a>"
+        "<a href=\"/einstellungen\">Settings</a>"
         "<a href=\"/update\">Firmware</a></nav>";
 }
 
@@ -2126,97 +2126,97 @@ static void webStatus()
     bool     sdOk = sec > 0;
     String h = htmlKopf("Scan-Stick " FW_VERSION);
     h += "<table>";
-    h += zl("Karte", sdOk ? "<span class=\"ok\">gemountet</span>"
-                          : "<span class=\"bad\">NICHT gemountet</span>");
+    h += zl("Card", sdOk ? "<span class=\"ok\">mounted</span>"
+                          : "<span class=\"bad\">NOT mounted</span>");
     if (sdOk) {
         uint64_t roh = SD_MMC.cardSize();
-        h += zl("Kartengroesse (roh)", menschlich(roh) + " / " + String((uint32_t)(roh / sec)) + " Sektoren");
-        h += zl("Dateisystem", menschlich(SD_MMC.totalBytes()));
+        h += zl("Card size (raw)", menschlich(roh) + " / " + String((uint32_t)(roh / sec)) + " sectors");
+        h += zl("File system", menschlich(SD_MMC.totalBytes()));
     }
     uint32_t seitHost = millis() - g_lastHost;
-    h += zl("Letzter Zugriff des Hosts", g_lastHost ? ("vor " + dauer(seitHost)) : "noch keiner");
-    h += zl("Unverarbeitete Schreibvorgaenge", g_dirty ? "<span class=\"warn\">ja</span>" : "nein");
-    h += zl("Vom Host geschrieben", menschlich(g_bytesGeschrieben) +
-            " <small>(seit dem letzten Durchlauf)</small>");
-    h += zl("Roh erkannt", g_rohAnzahl ? (String(g_rohAnzahl) + " Datei(en), " +
+    h += zl("Last host access", g_lastHost ? ("" + dauer(seitHost)) : "none yet");
+    h += zl("Unprocessed writes", g_dirty ? "<span class=\"warn\">yes</span>" : "no");
+    h += zl("Written by the host", menschlich(g_bytesGeschrieben) +
+            " <small>(since the last run)</small>");
+    h += zl("Raw detected", g_rohAnzahl ? (String(g_rohAnzahl) + " file(s), " +
             menschlich(g_rohSumme) + ", " + String(g_rohStabil) + "/" + String(ROH_STABIL) +
-            " stabil") : "nichts");
-    h += zl("Letztes Abschlusskommando", g_letztesStop
-            ? ("vor " + dauer(millis() - g_letztesStop))
-            : "<span class=\"warn\">noch keines - der Drucker meldet sein Jobende nicht</span>");
+            " stable") : "nothing");
+    h += zl("Last completion command", g_letztesStop
+            ? ("" + dauer(millis() - g_letztesStop))
+            : "<span class=\"warn\">none yet - the printer does not report its job end</span>");
     if (g_dirty) {
-        h += zl("Wartet auf Commit, Versuch", String(g_versuche) + " von " + String(MAX_VERSUCHE));
+        h += zl("Waiting for commit, attempt", String(g_versuche) + " of " + String(MAX_VERSUCHE));
         uint32_t rest = (millis() - g_lastWrite < IDLE_MS) ? (IDLE_MS - (millis() - g_lastWrite)) : 0;
-        h += zl("Naechster Blick in", rest ? dauer(rest) : "gleich");
+        h += zl("Next look in", rest ? dauer(rest) : "right away");
     }
-    h += zl("WLAN", WiFi.status() == WL_CONNECTED
+    h += zl("WiFi", WiFi.status() == WL_CONNECTED
               ? ("<span class=\"ok\">" + WiFi.SSID() + "</span>, " + WiFi.localIP().toString() +
                  ", " + String(WiFi.RSSI()) + " dBm")
-              : "<span class=\"bad\">nicht verbunden</span>");
+              : "<span class=\"bad\">not connected</span>");
     if (g_apKennung.length())
-        h += zl("Zugangspunkt", g_apKennung + ", Kanal " + String(g_apKanal) +
-                ", bei der Wahl " + String(g_apRssi) + " dBm <small>(staerkster ueber alle "
-                "bekannten Netze)</small>");
+        h += zl("Access point", g_apKennung + ", channel " + String(g_apKanal) +
+                ", at selection " + String(g_apRssi) + " dBm <small>(strongest across all "
+                "known networks)</small>");
     {
         String liste;
         for (int i = 0; i < cfgNetze; i++) liste += (i ? ", " : "") + cfgNetzSsid[i];
-        h += zl("Bekannte Netze", cfgNetze ? liste : "<span class=\"bad\">keine</span>");
+        h += zl("Known networks", cfgNetze ? liste : "<span class=\"bad\">none</span>");
     }
-    h += zl("Ziel fuer Uploads", cfgEndpoint.length() ? cfgEndpoint : "<span class=\"bad\">nicht gesetzt</span>");
-    h += zl("Ruhefrist bis \"fertig\"", dauer(g_idleMs));
-    h += zl("Gesendet, liegt noch auf der Karte", String(g_fertigAnzahl) + " Datei(en)" +
-            (g_fertigAnzahl ? " <small>(werden in der naechsten Ruhephase geraeumt)</small>" : ""));
-    h += zl("Aufraeumen", String("nach ") + g_aufraeumMin + " min ohne Zugriff des Druckers" +
-            (g_letztesAufraeumen ? ", zuletzt vor " + dauer(millis() - g_letztesAufraeumen) : ", noch nie"));
-    h += zl("Nach dem Senden", "von der Karte loeschen <small>(die Kopie liegt beim Empfaenger)</small>");
-    h += zl("Weboberflaeche", cfgWebPass.length() ? "<span class=\"ok\">passwortgeschuetzt</span>"
-                                                  : "<span class=\"bad\">offen, jeder im WLAN kann die Scans lesen</span>");
-    h += zl("Upload-Signatur", cfgSchluessel.length() ? "<span class=\"ok\">Geraeteschluessel gesetzt</span>"
-                                                       : "<span class=\"warn\">keiner, der Empfaenger nimmt alles an</span>");
-    h += zl("Uhrzeit", g_zeitOk ? "<span class=\"ok\">per NTP gestellt</span>"
-                                 : "<span class=\"warn\">unbekannt, Namen mit Laufzeit</span>");
-    h += zl("Namensschema", cfgPraefix + "-JJJJMMTT-HHMMSS.pdf");
+    h += zl("Upload target", cfgEndpoint.length() ? cfgEndpoint : "<span class=\"bad\">not set</span>");
+    h += zl("Idle time until \"done\"", dauer(g_idleMs));
+    h += zl("Sent, still on the card", String(g_fertigAnzahl) + " file(s)" +
+            (g_fertigAnzahl ? " <small>(will be cleared in the next idle phase)</small>" : ""));
+    h += zl("Cleanup", String("after ") + g_aufraeumMin + " min without printer access" +
+            (g_letztesAufraeumen ? ", last run " + dauer(millis() - g_letztesAufraeumen) : ", never yet"));
+    h += zl("After sending", "delete from the card <small>(the copy is at the receiver)</small>");
+    h += zl("Web interface", cfgWebPass.length() ? "<span class=\"ok\">password protected</span>"
+                                                  : "<span class=\"bad\">open, anyone on the WiFi can read the scans</span>");
+    h += zl("Upload signature", cfgSchluessel.length() ? "<span class=\"ok\">device key set</span>"
+                                                       : "<span class=\"warn\">none, the receiver accepts everything</span>");
+    h += zl("Clock", g_zeitOk ? "<span class=\"ok\">set via NTP</span>"
+                                 : "<span class=\"warn\">unknown, names with uptime</span>");
+    h += zl("Name scheme", cfgPraefix + "-YYYYMMDD-HHMMSS.pdf");
     if (g_rssiAnzahl)
-        h += zl("Empfang schlechtester / mittlerer / bester",
+        h += zl("Signal worst / average / best",
                 String(g_rssiMin) + " / " + String(g_rssiSumme / (long)g_rssiAnzahl) + " / " +
-                String(g_rssiMax) + " dBm <small>(" + String(g_rssiAnzahl) + " Messungen)</small>");
+                String(g_rssiMax) + " dBm <small>(" + String(g_rssiAnzahl) + " measurements)</small>");
     if (g_rssiLetztLast)
-        h += zl("Empfang am Ende des letzten Uploads", String(g_rssiLetztLast) + " dBm");
+        h += zl("Signal at the end of the last upload", String(g_rssiLetztLast) + " dBm");
     {
         String spur = spurText(true);
-        h += zl("Letzte Schreibzugriffe des Hosts", spur.length() ? "<small>" + spur + "</small>" : "keine");
-        String fehler = String((uint32_t)g_usbFehlerLesen) + " lesen, " + String((uint32_t)g_usbFehlerSchreiben) + " schreiben";
-        if (g_usbFehlerZeit) fehler += " <small>(zuletzt vor " + dauer(millis() - g_usbFehlerZeit) + ", Sektor " + String((uint32_t)g_usbFehlerLba) + ")</small>";
-        h += zl("Abgewiesene Host-Zugriffe", (g_usbFehlerLesen || g_usbFehlerSchreiben) ? "<span class=warn>" + fehler + "</span>" : "keine");
-        if (g_usbFehlerAlt.length()) h += zl("Vor dem letzten Neustart", "<span class=bad>" + g_usbFehlerAlt + "</span>");
+        h += zl("Last write accesses of the host", spur.length() ? "<small>" + spur + "</small>" : "none");
+        String fehler = String((uint32_t)g_usbFehlerLesen) + " read, " + String((uint32_t)g_usbFehlerSchreiben) + " write";
+        if (g_usbFehlerZeit) fehler += " <small>(last " + dauer(millis() - g_usbFehlerZeit) + " ago, sector " + String((uint32_t)g_usbFehlerLba) + ")</small>";
+        h += zl("Rejected host accesses", (g_usbFehlerLesen || g_usbFehlerSchreiben) ? "<span class=warn>" + fehler + "</span>" : "none");
+        if (g_usbFehlerAlt.length()) h += zl("Before the last restart", "<span class=bad>" + g_usbFehlerAlt + "</span>");
         if (g_befundZeit) {
             String t = befundText(g_befund);
-            bool schlecht = g_befund.heillos || g_befund.zuGross || (t != "in Ordnung" && !g_befund.geaendert);
-            h += zl("Kartenpruefung", String(schlecht ? "<span class=bad>" : "") + t + (schlecht ? "</span>" : "") +
-                    " <small>(vor " + dauer(millis() - g_befundZeit) + ")</small>");
+            bool schlecht = g_befund.heillos || g_befund.zuGross || (t != "in order" && !g_befund.geaendert);
+            h += zl("Card check", String(schlecht ? "<span class=bad>" : "") + t + (schlecht ? "</span>" : "") +
+                    " <small>(" + dauer(millis() - g_befundZeit) + " ago)</small>");
         }
     }
-    h += zl("Geraetename", geraeteName() + ".local");
-    h += zl("Laufzeit", dauer(millis()));
-    h += zl("Letzter Startgrund", g_startGrund);
-    h += zl("Freier Speicher", menschlich(ESP.getFreeHeap()));
+    h += zl("Device name", geraeteName() + ".local");
+    h += zl("Uptime", dauer(millis()));
+    h += zl("Last boot reason", g_startGrund);
+    h += zl("Free memory", menschlich(ESP.getFreeHeap()));
     h += "</table><p>"
          "<form method=\"post\" action=\"/jetzt-schauen\" style=\"display:inline\">"
-         "<button class=\"btn\" type=\"submit\">Jetzt nach Scans schauen</button></form>"
+         "<button class=\"btn\" type=\"submit\">Look for scans now</button></form>"
          "<form method=\"post\" action=\"/aufraeumen\" style=\"display:inline\">"
-         "<button class=\"btn\" type=\"submit\">Jetzt aufraeumen</button></form>"
+         "<button class=\"btn\" type=\"submit\">Clean up now</button></form>"
          "<form method=\"post\" action=\"/neustart\" style=\"display:inline\">"
-         "<button class=\"btn\" type=\"submit\">Neu starten</button></form></p>";
+         "<button class=\"btn\" type=\"submit\">Restart</button></form></p>";
     g_web.send(200, "text/html; charset=utf-8", h + htmlFuss());
 }
 
 static void webLog()
 {
     if (!webAuth()) return;
-    String h = htmlKopf("Protokoll");
-    h += "<p><small>Zahl am Zeilenanfang = Millisekunden seit dem Start. "
-         "Der Puffer liegt im RAM, ein Neustart loescht ihn.</small></p><pre>";
-    h += g_logPuffer.length() ? g_logPuffer : String("(noch leer)");
+    String h = htmlKopf("Log");
+    h += "<p><small>Number at the start of a line = milliseconds since boot. "
+         "The buffer lives in RAM, a restart clears it.</small></p><pre>";
+    h += g_logPuffer.length() ? g_logPuffer : String("(still empty)");
     h += "</pre>";
     g_web.send(200, "text/html; charset=utf-8", h + htmlFuss());
 }
@@ -2229,7 +2229,7 @@ static void webDateienListe(const String &pfad, String &h, int tiefe)
         String voll = e.path();
         if (e.isDirectory()) {
             h += "<tr><td>" + String(tiefe ? "&nbsp;&nbsp;&nbsp;&nbsp;" : "") +
-                 "\xF0\x9F\x93\x81 " + voll + "/</td><td>Ordner</td></tr>";
+                 "\xF0\x9F\x93\x81 " + voll + "/</td><td>Folder</td></tr>";
             if (tiefe < 3) webDateienListe(voll, h, tiefe + 1);
         } else {
             h += "<tr><td>" + String(tiefe ? "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;" : "") +
@@ -2242,29 +2242,29 @@ static void webDateienListe(const String &pfad, String &h, int tiefe)
 static void webDateien()
 {
     if (!webAuth()) return;
-    String h = htmlKopf("Dateien auf der Karte");
+    String h = htmlKopf("Files on the card");
     if (!SD_MMC.sectorSize()) {
-        h += "<p class=\"bad\">Karte ist nicht gemountet.</p>";
+        h += "<p class=\"bad\">Card is not mounted.</p>";
     } else {
-        // BEWUSST kein Ab- und Anhaengen der Karte mehr. Das lief hier in der
-        // Hauptschleife, waehrend der USB-Teil parallel Lesezugriffe des Druckers
-        // bediente - trafen beide zusammen, griff der USB-Teil auf einen gerade
-        // abgeraeumten Kartentreiber zu und der Stick startete neu. Ein blosser
-        // Blick auf diese Seite durfte den Betrieb nie gefaehrden.
-        // Wurzel roh gelesen - so sieht sie der Drucker gerade wirklich
+        // DELIBERATELY no unmounting and remounting of the card any more. That ran
+        // here in the main loop while the USB part served read accesses of the
+        // printer in parallel - if both met, the USB part touched a card driver
+        // that was just being torn down and the stick restarted. A mere look at
+        // this page must never put operation at risk.
+        // Root read raw - that is how the printer really sees it right now
         RohEintrag liste[MAX_FUND];
         int n = rohListe(0, liste, MAX_FUND, false);
-        h += "<table><tr><th>Wurzel (roh)</th><th>Groesse</th><th>Stand</th></tr>";
+        h += "<table><tr><th>Root (raw)</th><th>Size</th><th>State</th></tr>";
         for (int i = 0; i < n; i++) {
             String nm = liste[i].name;
-            String stand = fertigIndexE(liste[i]) >= 0 ? "<span class=\"ok\">gesendet</span>"
-                         : istGeloeschtE(liste[i]) ? "<span class=\"warn\">Geist</span>"
-                         : istScanName(nm) && liste[i].groesse >= ROH_MIN_GROESSE ? "<span class=\"warn\">offen</span>" : "";
+            String stand = fertigIndexE(liste[i]) >= 0 ? "<span class=\"ok\">sent</span>"
+                         : istGeloeschtE(liste[i]) ? "<span class=\"warn\">ghost</span>"
+                         : istScanName(nm) && liste[i].groesse >= ROH_MIN_GROESSE ? "<span class=\"warn\">open</span>" : "";
             h += "<tr><td><a href=\"/holen?p=" + urlKodiert("/" + nm) + "\">" + nm + "</a></td><td>" +
                  menschlich(liste[i].groesse) + "</td><td>" + stand + "</td></tr>";
         }
         h += "</table>";
-        h += "<table><tr><th>Ordner</th><th>Groesse</th></tr>";
+        h += "<table><tr><th>Folder</th><th>Size</th></tr>";
         webDateienListe("/gesendet", h, 1);
         webDateienListe("/senden", h, 1);
         h += "</table>";
@@ -2276,9 +2276,9 @@ static void webHolen()
 {
     if (!webAuth()) return;
     String pfad = g_web.arg("p");
-    if (!pfad.startsWith("/")) { g_web.send(400, "text/plain; charset=utf-8", "Pfad fehlt\n"); return; }
+    if (!pfad.startsWith("/")) { g_web.send(400, "text/plain; charset=utf-8", "path missing\n"); return; }
     if (pfad.lastIndexOf('/') == 0) {
-        // Wurzel: roh lesen, der Mount vom Start kennt frische Dateien nicht
+        // Root: read raw, the mount from startup does not know fresh files
         RohEintrag liste[MAX_FUND];
         int n = rohListe(0, liste, MAX_FUND, false);
         for (int i = 0; i < n; i++) {
@@ -2296,14 +2296,14 @@ static void webHolen()
             rl.ende();
             return;
         }
-        g_web.send(404, "text/plain; charset=utf-8", "nicht gefunden\n");
+        g_web.send(404, "text/plain; charset=utf-8", "not found\n");
         return;
     }
     File f = SD_MMC.open(pfad);
-    if (!f || f.isDirectory()) { g_web.send(404, "text/plain; charset=utf-8", "nicht gefunden\n"); return; }
-    // Ohne Dateinamen hiess der Download im Browser "holen" und ohne passenden
-    // Typ stufte Chrome ihn als unsicher ein und blockierte ihn. Mit Name und
-    // Typ zeigt der Browser das PDF einfach an.
+    if (!f || f.isDirectory()) { g_web.send(404, "text/plain; charset=utf-8", "not found\n"); return; }
+    // Without a filename the download was called "holen" in the browser, and
+    // without a matching type Chrome rated it unsafe and blocked it. With name
+    // and type the browser simply shows the PDF.
     String basis = pfad;
     int sl = basis.lastIndexOf('/');
     if (sl >= 0) basis = basis.substring(sl + 1);
@@ -2315,13 +2315,13 @@ static void webHolen()
     f.close();
 }
 
-// Formulare nur von der eigenen Seite annehmen. Ein Browser schickt bei einer
-// Absendung von einer fremden Seite immer die Kopfzeile Origin mit - stimmt sie
-// nicht mit unserem Host ueberein, war es nicht unsere Seite. So konnte eine
-// beliebige Webseite im selben Browser das Upload-Ziel umbiegen oder den Stick
-// mitten im Upload neu starten; ein gespeichertes Passwort schickt der Browser
-// automatisch mit. Werkzeuge wie curl schicken kein Origin und duerfen weiter,
-// sie haben ohnehin kein im Browser gespeichertes Passwort.
+// Accept forms only from our own page. On a submission from a foreign page a
+// browser always sends the header Origin along - if it does not match our
+// host, it was not our page. Without that, any web page in the same browser
+// could bend the upload target or restart the stick in the middle of an
+// upload; a stored password is sent along by the browser automatically. Tools
+// like curl send no Origin and may pass, they have no password stored in the
+// browser anyway.
 static bool herkunftOk()
 {
     String eigen = "http://" + g_web.hostHeader();
@@ -2335,17 +2335,17 @@ static bool herkunftOk()
 static bool herkunftPruefen()
 {
     if (herkunftOk()) return true;
-    g_web.send(403, "text/plain; charset=utf-8", "Anfrage kam nicht von dieser Seite\n");
+    g_web.send(403, "text/plain; charset=utf-8", "request did not come from this page\n");
     return false;
 }
 
 static void webJetztSchauen()
 {
     if (!webAuth() || !herkunftPruefen()) return;
-    // Einmal nachschauen. Frueher wurde hier g_dirty gesetzt - das loeste den
-    // Wiederhol-Mechanismus fuer den Drucker-Commit aus, der hier nicht gemeint ist.
+    // Look once. Earlier g_dirty was set here - that triggered the retry
+    // mechanism for the printer commit, which is not what is meant here.
     g_einmalSchauen = true;
-    logZeile("[web] Suche manuell ausgeloest");
+    logZeile("[web] search triggered manually");
     g_web.sendHeader("Location", "/log");
     g_web.send(303, "text/plain; charset=utf-8", "");
 }
@@ -2353,19 +2353,19 @@ static void webJetztSchauen()
 static void webUpdateSeite()
 {
     if (!webAuth()) return;
-    String h = htmlKopf("Firmware aktualisieren");
-    h += "<p>Datei <code>scanner.ino.bin</code> auswaehlen. Das Abbild wird in den "
-         "zweiten Programmbereich geschrieben; erst wenn es vollstaendig und gepruefte "
-         "ist, startet der Stick damit. Bricht die Uebertragung ab, laeuft die "
-         "bisherige Firmware unveraendert weiter.</p>";
+    String h = htmlKopf("Update firmware");
+    h += "<p>Select the file <code>scanner.ino.bin</code>. The image is written to the "
+         "second program area; only when it is complete and checked does the stick "
+         "start with it. If the transfer breaks off, the previous firmware keeps "
+         "running unchanged.</p>";
     h += "<form method=\"post\" action=\"/update\" enctype=\"multipart/form-data\">"
          "<p><input type=\"file\" name=\"firmware\" accept=\".bin\"></p>"
-         "<p><button class=\"btn\" type=\"submit\">Hochladen und neu starten</button></p></form>";
-    h += "<p><small>Laeuft gerade: " FW_VERSION "</small></p>";
+         "<p><button class=\"btn\" type=\"submit\">Upload and restart</button></p></form>";
+    h += "<p><small>Currently running: " FW_VERSION "</small></p>";
     g_web.send(200, "text/html; charset=utf-8", h + htmlFuss());
 }
 
-// Pruefseite fuer den Rohleser: zeigt, was er ohne Dateisystem-Treiber sieht.
+// Check page for the raw reader: shows what it sees without a filesystem driver.
 static void webRoh()
 {
     if (!webAuth()) return;
@@ -2373,24 +2373,24 @@ static void webRoh()
     uint32_t summe = 0;
     fatLageLesen();
     bool ok = rohVerzeichnis(anz, summe);
-    String h = htmlKopf("Rohes Mitlesen");
+    String h = htmlKopf("Raw reading");
     h += "<table>";
-    h += zl("Layout erkannt", g_fat.gueltig ? "<span class=\"ok\">ja</span>"
-                                            : "<span class=\"bad\">nein</span>");
+    h += zl("Layout detected", g_fat.gueltig ? "<span class=\"ok\">yes</span>"
+                                            : "<span class=\"bad\">no</span>");
     if (g_fat.gueltig) {
-        h += zl("Sektoren je Cluster", String(g_fat.sektorenProCluster));
-        h += zl("Zuordnungstabelle ab Sektor", String(g_fat.fatStart));
-        h += zl("Datenbereich ab Sektor", String(g_fat.ersterDatenSektor));
-        h += zl("Wurzelverzeichnis in Cluster", String(g_fat.rootCluster));
+        h += zl("Sectors per cluster", String(g_fat.sektorenProCluster));
+        h += zl("Allocation table from sector", String(g_fat.fatStart));
+        h += zl("Data area from sector", String(g_fat.ersterDatenSektor));
+        h += zl("Root directory in cluster", String(g_fat.rootCluster));
     }
-    h += zl("Lesen erfolgreich", ok ? "ja" : "<span class=\"bad\">nein</span>");
-    h += zl("Gefundene Dateien", String(anz) + " <small>(ab " +
-            String(ROH_MIN_GROESSE / 1024) + " kB; kleinere gelten als Hilfsdateien)</small>");
-    h += zl("Summe der Groessen", menschlich(summe));
-    h += zl("Stabile Messungen in Folge", String(g_rohStabil) + " von " + String(ROH_STABIL));
-    h += "</table><p><small>Dieser Blick geht direkt auf die Sektoren der Karte und "
-         "stoert den Drucker nicht - anders als das Ab- und Anhaengen, das bisher "
-         "noetig war.</small></p>";
+    h += zl("Read successful", ok ? "yes" : "<span class=\"bad\">no</span>");
+    h += zl("Files found", String(anz) + " <small>(from " +
+            String(ROH_MIN_GROESSE / 1024) + " kB; smaller ones count as helper files)</small>");
+    h += zl("Sum of the sizes", menschlich(summe));
+    h += zl("Stable readings in a row", String(g_rohStabil) + " of " + String(ROH_STABIL));
+    h += "</table><p><small>This look goes straight to the sectors of the card and "
+         "does not disturb the printer - unlike the unmounting and remounting that "
+         "used to be needed.</small></p>";
     g_web.send(200, "text/html; charset=utf-8", h + htmlFuss());
 }
 
@@ -2398,8 +2398,8 @@ static void webNeustart()
 {
     if (!webAuth() || !herkunftPruefen()) return;
     g_web.send(200, "text/html; charset=utf-8",
-               htmlKopf("Neustart") + "<p>Der Stick startet neu. Diese Seite ist in etwa "
-               "15 Sekunden wieder da.</p>" + htmlFuss());
+               htmlKopf("Restart") + "<p>The stick is restarting. This page will be back in about "
+               "15 seconds.</p>" + htmlFuss());
     delay(300);
     sanftNeustarten();
 }
@@ -2411,8 +2411,8 @@ static void webEinstellungen()
     if (g_web.method() == HTTP_POST) {
         if (!herkunftPruefen()) return;
         if (g_web.hasArg("endpoint")) cfgEndpoint = g_web.arg("endpoint");
-        // Bekannte Netze: entfernen per Kaestchen, hinzufuegen per Feld. Wirkt beim
-        // naechsten Suchlauf (Neustart oder zwei Minuten ohne Netz).
+        // Known networks: remove via checkbox, add via field. Takes effect at the
+        // next scan (restart or two minutes without a network).
         for (int i = MAX_NETZE - 1; i >= 0; i--) {
             char k[12];
             snprintf(k, sizeof k, "netzweg%d", i);
@@ -2425,7 +2425,7 @@ static void webEinstellungen()
             String neuS = g_web.arg("ssid_neu"), neuP = g_web.arg("pass_neu");
             int vorhanden = -1;
             for (int i = 0; i < cfgNetze; i++) if (cfgNetzSsid[i] == neuS) vorhanden = i;
-            if (vorhanden >= 0) cfgNetzPass[vorhanden] = neuP;                       // Passwort erneuern
+            if (vorhanden >= 0) cfgNetzPass[vorhanden] = neuP;                       // refresh password
             else if (cfgNetze < MAX_NETZE) { cfgNetzSsid[cfgNetze] = neuS; cfgNetzPass[cfgNetze] = neuP; cfgNetze++; }
         }
         if (g_web.hasArg("aufraeum")) {
@@ -2449,10 +2449,10 @@ static void webEinstellungen()
             v.trim();
             if (v.length() && v.length() < 24) cfgPraefix = v;
         }
-        // Leeres Passwortfeld heisst "unveraendert lassen", nicht "Schutz aus" -
-        // sonst schaltet ein unbedachtes Speichern den Schutz ab.
+        // An empty password field means "leave unchanged", not "protection off" -
+        // otherwise a careless save switches the protection off.
         if (g_web.hasArg("webpass") && g_web.arg("webpass").length()) cfgWebPass = g_web.arg("webpass");
-        if (g_web.hasArg("passweg") && g_web.arg("passweg") == "ja") cfgWebPass = "";
+        if (g_web.hasArg("passweg") && g_web.arg("passweg") == "ja") { cfgWebPass = ""; logZeile("[web] web password removed via the settings form"); }
         if (g_web.hasArg("schluessel") && g_web.arg("schluessel").length()) cfgSchluessel = g_web.arg("schluessel");
         if (g_web.hasArg("schluesselweg") && g_web.arg("schluesselweg") == "ja") cfgSchluessel = "";
         for (int i = 0; i < Z_ANZAHL; i++) {
@@ -2463,74 +2463,74 @@ static void webEinstellungen()
         if (g_web.hasArg("fsendet")) g_farbeSendet = strtoul(g_web.arg("fsendet").c_str() + 1, nullptr, 16);
         if (g_web.hasArg("ffertig")) g_farbeFertig = strtoul(g_web.arg("ffertig").c_str() + 1, nullptr, 16);
         cfgNachNvs();
-        logZeile("[web] Einstellungen gespeichert");
-        g_screen = -1;            // Anzeige mit den neuen Farben neu zeichnen
+        logZeile("[web] settings saved");
+        g_screen = -1;            // redraw the display with the new colors
         g_web.sendHeader("Location", "/einstellungen?ok=1");
         g_web.send(303, "text/plain; charset=utf-8", "");
         return;
     }
 
-    String h = htmlKopf("Einstellungen");
-    if (g_web.hasArg("ok")) h += "<p class=\"ok\">Gespeichert.</p>";
+    String h = htmlKopf("Settings");
+    if (g_web.hasArg("ok")) h += "<p class=\"ok\">Saved.</p>";
     h += "<form method=\"post\" action=\"/einstellungen\">"
          "<input type=\"hidden\" name=\"speichern\" value=\"1\"><table>";
-    h += "<tr><td>Helligkeit der Status-LED<br><small>0 = aus, 31 = maximal. "
-         "Voll aufgedreht ist sie als Dauerlicht sehr grell.</small></td>"
+    h += "<tr><td>Brightness of the status LED<br><small>0 = off, 31 = maximum. "
+         "Fully turned up it is very glaring as a steady light.</small></td>"
          "<td><input name=\"ledhell\" type=\"number\" min=\"0\" max=\"31\" value=\"" +
          String(g_ledHell) + "\"></td></tr>";
-    h += String("<tr><td>Displayfarben umkehren<br><small>dieses Modul stellt sonst alles als "
-         "Negativ dar - eingestelltes Blau erscheint gelb</small></td><td>"
+    h += String("<tr><td>Invert display colors<br><small>otherwise this module shows everything as a "
+         "negative - blue set here appears yellow</small></td><td>"
          "<label><input type=\"checkbox\" name=\"invers\" value=\"1\"") +
-         (g_invertiert ? " checked" : "") + "> umkehren</label></td></tr>";
-    h += "<tr><td>Upload-Ziel</td><td><input name=\"endpoint\" size=\"34\" value=\"" + cfgEndpoint + "\"></td></tr>";
+         (g_invertiert ? " checked" : "") + "> invert</label></td></tr>";
+    h += "<tr><td>Upload target</td><td><input name=\"endpoint\" size=\"34\" value=\"" + cfgEndpoint + "\"></td></tr>";
     {
         String netze;
         for (int i = 0; i < cfgNetze; i++)
             netze += String("<label><input type=\"checkbox\" name=\"netzweg") + i + "\" value=\"1\"> " + cfgNetzSsid[i] +
-                     " <small>entfernen</small></label><br>";
-        if (!cfgNetze) netze = "<span class=\"bad\">keins hinterlegt</span><br>";
-        netze += "<small>neu:</small> <input name=\"ssid_neu\" placeholder=\"Netzname\" size=\"14\"> "
-                 "<input name=\"pass_neu\" type=\"password\" placeholder=\"Passwort\" size=\"14\">";
-        h += "<tr><td>Bekannte WLAN-Netze<br><small>bis zu " + String(MAX_NETZE) + "; der staerkste erreichbare "
-             "Zugangspunkt gewinnt. Aenderungen gelten ab dem naechsten Suchlauf (Neustart).</small></td><td>" + netze + "</td></tr>";
+                     " <small>remove</small></label><br>";
+        if (!cfgNetze) netze = "<span class=\"bad\">none stored</span><br>";
+        netze += "<small>new:</small> <input name=\"ssid_neu\" placeholder=\"Network name\" size=\"14\"> "
+                 "<input name=\"pass_neu\" type=\"password\" placeholder=\"Password\" size=\"14\">";
+        h += "<tr><td>Known Wi-Fi networks<br><small>up to " + String(MAX_NETZE) + "; the strongest reachable "
+             "access point wins. Changes apply from the next scan (restart).</small></td><td>" + netze + "</td></tr>";
     }
-    h += "<tr><td>Namensanfang der Dateien<br><small>ergibt z.B. <code>" + cfgPraefix +
-         "-20260919-143205.pdf</code>; bei mehreren Sticks den Standort hier eintragen</small></td>"
+    h += "<tr><td>Start of the file names<br><small>gives e.g. <code>" + cfgPraefix +
+         "-20260919-143205.pdf</code>; with several sticks enter the location here</small></td>"
          "<td><input name=\"praefix\" size=\"16\" value=\"" + cfgPraefix + "\"></td></tr>";
-    h += "<tr><td>Aufraeumen nach Minuten Ruhe<br><small>so lange darf der Drucker den Stick nicht "
-         "angefasst haben, bevor Gesendetes von der Karte geraeumt wird - das ist der einzige Moment, "
-         "in dem das Medium kurz weg ist</small></td><td><input name=\"aufraeum\" type=\"number\" "
+    h += "<tr><td>Clean up after minutes of quiet<br><small>the printer must not have touched the "
+         "stick for this long before sent files are cleared off the card - that is the only moment "
+         "in which the medium is briefly gone</small></td><td><input name=\"aufraeum\" type=\"number\" "
          "min=\"1\" max=\"1440\" value=\"" + String(g_aufraeumMin) + "\"></td></tr>";
-    h += "<tr><td>Ruhefrist in Sekunden<br><small>so lange Stille, bis ein Scan als fertig gilt "
-         "(der 780 braucht 45)</small></td><td><input name=\"idle\" type=\"number\" min=\"5\" max=\"600\" value=\"" +
+    h += "<tr><td>Quiet period in seconds<br><small>this much silence until a scan counts as done "
+         "(the 780 needs 45)</small></td><td><input name=\"idle\" type=\"number\" min=\"5\" max=\"600\" value=\"" +
          String(g_idleMs / 1000) + "\"></td></tr>";
-    h += "<tr><td>Passwort der Weboberflaeche<br><small>Benutzername ist <b>scan</b>. "
-         "Leer lassen = unveraendert.</small></td><td><input name=\"webpass\" type=\"password\" size=\"18\">"
-         "<br><label><small><input type=\"checkbox\" name=\"passweg\" value=\"ja\"> Schutz entfernen</small></label></td></tr>";
-    h += String("<tr><td>Geraeteschluessel fuer den Upload<br><small>signiert jeden Upload "
-         "(HMAC-SHA256); derselbe Schluessel gehoert in den Empfaenger (<code>SCAN_KEY</code>). "
-         "Leer lassen = unveraendert. Zurzeit: ") + (cfgSchluessel.length() ? "gesetzt" : "keiner") +
+    h += "<tr><td>Password of the web interface<br><small>the user name is <b>scan</b>. "
+         "Leave empty = unchanged.</small></td><td><input name=\"webpass\" type=\"password\" size=\"18\">"
+         "<br><label><small><input type=\"checkbox\" name=\"passweg\" value=\"ja\"> remove protection</small></label></td></tr>";
+    h += String("<tr><td>Device key for the upload<br><small>signs every upload "
+         "(HMAC-SHA256); the same key belongs in the receiver (<code>SCAN_KEY</code>). "
+         "Leave empty = unchanged. At present: ") + (cfgSchluessel.length() ? "set" : "none") +
          "</small></td><td><input name=\"schluessel\" type=\"password\" size=\"18\">"
-         "<br><label><small><input type=\"checkbox\" name=\"schluesselweg\" value=\"ja\"> Schluessel entfernen</small></label></td></tr>";
+         "<br><label><small><input type=\"checkbox\" name=\"schluesselweg\" value=\"ja\"> remove key</small></label></td></tr>";
     for (int i = 0; i < Z_ANZAHL; i++) {
         char k[10];
         snprintf(k, sizeof k, "f%d", i);
-        h += String("<tr><td>Farbe: ") + Z_NAME[i] + " <small>(" + Z_TEXT[i] + ")</small></td>"
+        h += String("<tr><td>Color: ") + Z_NAME[i] + " <small>(" + Z_TEXT[i] + ")</small></td>"
              "<td><input type=\"color\" name=\"" + k + "\" value=\"" + hexFarbe(g_farbe[i]) + "\"></td></tr>";
     }
-    h += "<tr><td>Farbe: sendet gerade</td><td><input type=\"color\" name=\"fsendet\" value=\"" +
+    h += "<tr><td>Color: sending right now</td><td><input type=\"color\" name=\"fsendet\" value=\"" +
          hexFarbe(g_farbeSendet) + "\"></td></tr>";
-    h += "<tr><td>Farbe: erfolgreich gesendet</td><td><input type=\"color\" name=\"ffertig\" value=\"" +
+    h += "<tr><td>Color: sent successfully</td><td><input type=\"color\" name=\"ffertig\" value=\"" +
          hexFarbe(g_farbeFertig) + "\"></td></tr>";
-    h += "</table><p><button class=\"btn\" type=\"submit\">Speichern</button></p></form>";
-    h += "<p><small>WLAN-Zugangsdaten kommen weiter aus <code>/wifi.cfg</code> auf der Karte und "
-         "werden in den Flash gespiegelt.</small></p>";
+    h += "</table><p><button class=\"btn\" type=\"submit\">Save</button></p></form>";
+    h += "<p><small>Wi-Fi credentials still come from <code>/wifi.cfg</code> on the card and "
+         "are mirrored into the flash.</small></p>";
     g_web.send(200, "text/html; charset=utf-8", h + htmlFuss());
 }
 
-// Einrichtungsseite: Netz waehlen oder eintragen, Ziel, Schluessel, Passwort.
-// Erreichbar immer, im eigenen WLAN als Startseite. Speichert in den Flash und
-// startet neu - danach sucht der Stick das eingetragene Netz.
+// Setup page: choose or enter a network, target, key, password. Always reachable,
+// on our own Wi-Fi it is the start page. Saves into the flash and restarts -
+// after that the stick looks for the network that was entered.
 static void webEinrichten()
 {
     if (!webAuth()) return;
@@ -2543,7 +2543,7 @@ static void webEinrichten()
             for (int i = 0; i < cfgNetze; i++) if (cfgNetzSsid[i] == ssid) vorhanden = i;
             if (vorhanden >= 0) cfgNetzPass[vorhanden] = pass;
             else {
-                if (cfgNetze >= MAX_NETZE) cfgNetze = MAX_NETZE - 1;          // aeltestes faellt raus
+                if (cfgNetze >= MAX_NETZE) cfgNetze = MAX_NETZE - 1;          // oldest one drops out
                 cfgNetzSsid[cfgNetze] = ssid; cfgNetzPass[cfgNetze] = pass; cfgNetze++;
             }
         }
@@ -2551,16 +2551,16 @@ static void webEinrichten()
         if (g_web.hasArg("schluessel") && g_web.arg("schluessel").length()) cfgSchluessel = g_web.arg("schluessel");
         if (g_web.hasArg("webpass") && g_web.arg("webpass").length()) cfgWebPass = g_web.arg("webpass");
         cfgNachNvs();
-        logZeile("[einrichtung] gespeichert: Netz " + ssid + ", Ziel " + cfgEndpoint + " - Neustart");
-        g_web.send(200, "text/html; charset=utf-8", htmlKopf("Gespeichert") +
-                   "<p class=\"ok\">Der Stick startet neu und verbindet sich mit <b>" + ssid + "</b>. "
-                   "Das eigene WLAN verschwindet dabei. Danach ist er im Heimnetz unter <b>http://" + geraeteName() +
-                   ".local/</b> erreichbar; die Adresse steht auch im Display.</p>" + htmlFuss());
+        logZeile("[einrichtung] saved: network " + ssid + ", target " + cfgEndpoint + " - restart");
+        g_web.send(200, "text/html; charset=utf-8", htmlKopf("Saved") +
+                   "<p class=\"ok\">The stick restarts and connects to <b>" + ssid + "</b>. "
+                   "Its own Wi-Fi disappears while doing so. After that it is reachable on the home network at <b>http://" + geraeteName() +
+                   ".local/</b>; the address is shown on the display as well.</p>" + htmlFuss());
         delay(1500);
         sanftNeustarten();
         return;
     }
-    // Netze in der Naehe anbieten - im eigenen WLAN kann man nicht tippen, was man nicht sieht
+    // Offer networks nearby - on our own Wi-Fi you cannot type what you cannot see
     String liste;
     int n = WiFi.scanNetworks();
     for (int i = 0; i < n && i < 15; i++) {
@@ -2568,21 +2568,21 @@ static void webEinrichten()
         if (ss.isEmpty()) continue;
         liste += "<option value=\"" + ss + "\">" + ss + " (" + WiFi.RSSI(i) + " dBm)</option>";
     }
-    String h = htmlKopf("Scan-Stick einrichten");
-    h += "<p>Netz waehlen oder eintragen, Ziel angeben, speichern. Der Stick startet dann neu.</p>";
+    String h = htmlKopf("Set up the Scan-Stick");
+    h += "<p>Choose or enter a network, give the target, save. The stick then restarts.</p>";
     h += "<form method=\"post\" action=\"/einrichten\"><table>";
-    h += "<tr><td>Gefundene Netze</td><td><select name=\"ssid_liste\"><option value=\"\">- bitte waehlen -</option>" + liste + "</select></td></tr>";
-    h += "<tr><td>oder Netzname von Hand</td><td><input name=\"ssid\" size=\"24\"></td></tr>";
-    h += "<tr><td>WLAN-Passwort</td><td><input name=\"pass\" type=\"password\" size=\"24\"></td></tr>";
-    h += "<tr><td>Upload-Ziel<br><small>Adresse des Empfaengers</small></td><td><input name=\"endpoint\" size=\"34\" value=\"" +
+    h += "<tr><td>Networks found</td><td><select name=\"ssid_liste\"><option value=\"\">- please choose -</option>" + liste + "</select></td></tr>";
+    h += "<tr><td>or network name by hand</td><td><input name=\"ssid\" size=\"24\"></td></tr>";
+    h += "<tr><td>Wi-Fi password</td><td><input name=\"pass\" type=\"password\" size=\"24\"></td></tr>";
+    h += "<tr><td>Upload target<br><small>address of the receiver</small></td><td><input name=\"endpoint\" size=\"34\" value=\"" +
          (cfgEndpoint.length() ? cfgEndpoint : String("http://192.168.1.50:8080/scan")) + "\"></td></tr>";
-    h += String("<tr><td>Geraeteschluessel<br><small>optional, wie SCAN_KEY beim Empfaenger</small></td><td><input name=\"schluessel\" type=\"password\" size=\"24\"") +
-         (cfgSchluessel.length() ? " placeholder=\"gesetzt - leer = behalten\"" : "") + "></td></tr>";
-    h += String("<tr><td>Passwort der Weboberflaeche<br><small>Benutzer scan</small></td><td><input name=\"webpass\" type=\"password\" size=\"24\"") +
-         (cfgWebPass.length() ? " placeholder=\"gesetzt - leer = behalten\"" : "") + "></td></tr>";
-    h += "</table><p><button class=\"btn\" type=\"submit\">Speichern und neu starten</button></p></form>";
+    h += String("<tr><td>Device key<br><small>optional, same as SCAN_KEY on the receiver</small></td><td><input name=\"schluessel\" type=\"password\" size=\"24\"") +
+         (cfgSchluessel.length() ? " placeholder=\"set - empty = keep\"" : "") + "></td></tr>";
+    h += String("<tr><td>Password of the web interface<br><small>user scan</small></td><td><input name=\"webpass\" type=\"password\" size=\"24\"") +
+         (cfgWebPass.length() ? " placeholder=\"set - empty = keep\"" : "") + "></td></tr>";
+    h += "</table><p><button class=\"btn\" type=\"submit\">Save and restart</button></p></form>";
     if (cfgNetze) {
-        h += "<p><small>Bekannt: ";
+        h += "<p><small>Known: ";
         for (int i = 0; i < cfgNetze; i++) h += (i ? ", " : "") + cfgNetzSsid[i];
         h += "</small></p>";
     }
@@ -2598,95 +2598,95 @@ static void webStarten()
     g_web.on("/einstellungen", HTTP_GET, webEinstellungen);
     g_web.on("/einstellungen", HTTP_POST, webEinstellungen);
     g_web.on("/holen", webHolen);
-    // Nebenwirkungen nur per POST: ein GET laesst sich von jeder fremden Seite
-    // als Bild-Adresse unterschieben, ein POST nicht ohne Origin-Kopfzeile.
+    // Side effects only via POST: a GET can be slipped in by any foreign page as
+    // an image address, a POST cannot without the Origin header.
     g_web.on("/jetzt-schauen", HTTP_POST, webJetztSchauen);
     g_web.on("/neustart", HTTP_POST, webNeustart);
     g_web.on("/formatieren", HTTP_POST, []() {
         if (!webAuth() || !herkunftPruefen()) return;
-        if (g_dirty || rohOffen()) { g_web.send(409, "text/plain", "Es liegt noch etwas Ungesendetes auf der Karte"); return; }
-        if (!karteUebernehmen()) { g_web.send(503, "text/plain", "Der Host laesst die Karte nicht los"); return; }
-        bool ok = karteFormatieren("auf Knopfdruck");
+        if (g_dirty || rohOffen()) { g_web.send(409, "text/plain", "There is still something unsent on the card"); return; }
+        if (!karteUebernehmen()) { g_web.send(503, "text/plain", "The host will not let go of the card"); return; }
+        bool ok = karteFormatieren("on button press");
         remount();
         karteZurueckgeben();
         logFlushNetz();
         g_web.sendHeader("Location", "/");
-        g_web.send(303, "text/plain", ok ? "formatiert" : "fehlgeschlagen");
+        g_web.send(303, "text/plain", ok ? "formatted" : "failed");
     });
     g_web.on("/aufraeumen", HTTP_POST, []() {
         if (!webAuth() || !herkunftPruefen()) return;
         g_aufraeumJetzt = true;
-        logZeile("[web] Aufraeumen angefordert");
+        logZeile("[web] cleanup requested");
         g_web.sendHeader("Location", "/log");
         g_web.send(303, "text/plain; charset=utf-8", "");
     });
     g_web.on("/update", HTTP_GET, webUpdateSeite);
     g_web.on("/update", HTTP_POST,
         []() {
-            // Der Abschluss lief frueher ohne Passwortpruefung und startete den
-            // Stick auch dann neu, wenn gar kein Abbild geschrieben worden war.
-            // Ein "curl -X POST /update" von irgendwem im WLAN genuegte damit,
-            // einen laufenden Upload abzuschiessen.
+            // The finish used to run without a password check and restarted the
+            // stick even when no image had been written at all. A "curl -X POST
+            // /update" from anybody on the Wi-Fi was therefore enough to shoot
+            // down a running upload.
             if (!webAuth() || !herkunftPruefen()) return;
             bool ok = g_updateBegonnen && Update.isFinished() && !Update.hasError();
             g_updateBegonnen = false;
             g_web.send(ok ? 200 : 400, "text/html; charset=utf-8",
-                       htmlKopf(ok ? "Update eingespielt" : "Update fehlgeschlagen") +
-                       (ok ? "<p class=\"ok\">Der Stick startet jetzt neu. Diese Seite ist in "
-                             "etwa 10 Sekunden wieder da.</p>"
-                           : "<p class=\"bad\">Es wurde kein vollstaendiges Abbild geschrieben, "
-                             "die bisherige Firmware laeuft weiter.</p>") + htmlFuss());
+                       htmlKopf(ok ? "Update installed" : "Update failed") +
+                       (ok ? "<p class=\"ok\">The stick is restarting now. This page will be back in "
+                             "about 10 seconds.</p>"
+                           : "<p class=\"bad\">No complete image was written, "
+                             "the previous firmware keeps running.</p>") + htmlFuss());
             delay(600);
             if (ok) sanftNeustarten();
         },
         []() {
-            // Hier nur pruefen, nicht antworten - die Antwort gibt der Abschluss.
-            // Ein Passwort ist gesetzt und fehlt: Abbild gar nicht erst annehmen.
+            // Only check here, do not answer - the answer is given by the finish.
+            // A password is set and missing: do not even accept the image.
             if (cfgWebPass.length() && !g_web.authenticate("scan", cfgWebPass.c_str())) return;
             if (!herkunftOk()) return;
             HTTPUpload &up = g_web.upload();
             if (up.status == UPLOAD_FILE_START) {
-                logZeile("[update] Start: " + up.filename);
+                logZeile("[update] start: " + up.filename);
                 g_updateBegonnen = Update.begin(UPDATE_SIZE_UNKNOWN);
-                if (!g_updateBegonnen) logZeile("[update] begin fehlgeschlagen");
+                if (!g_updateBegonnen) logZeile("[update] begin failed");
             } else if (up.status == UPLOAD_FILE_WRITE) {
                 if (Update.write(up.buf, up.currentSize) != up.currentSize)
-                    logZeile("[update] Schreibfehler");
+                    logZeile("[update] write error");
             } else if (up.status == UPLOAD_FILE_END) {
-                if (Update.end(true)) logZeile(String("[update] fertig, ") + up.totalSize + " Bytes");
-                else logZeile("[update] Abschluss fehlgeschlagen");
+                if (Update.end(true)) logZeile(String("[update] done, ") + up.totalSize + " bytes");
+                else logZeile("[update] finish failed");
             }
         });
     g_web.on("/einrichten", HTTP_GET, webEinrichten);
     g_web.on("/einrichten", HTTP_POST, webEinrichten);
-    // Im eigenen WLAN landet jede fremde Adresse (Hotspot-Erkennung von iOS,
-    // Android, Windows) auf der Einrichtungsseite; sonst auf dem Status.
+    // On our own Wi-Fi every foreign address (hotspot detection of iOS, Android,
+    // Windows) lands on the setup page; otherwise on the status.
     g_web.onNotFound([]() {
         g_web.sendHeader("Location", g_einrichtung ? "http://" + WiFi.softAPIP().toString() + "/einrichten" : String("/"));
         g_web.send(302, "text/plain", "");
     });
-    // Der WebServer behaelt nur angeforderte Kopfzeilen; Host merkt er sich immer.
+    // The web server keeps only requested headers; Host it always remembers.
     const char *kopf[] = { "Origin", "Referer" };
     g_web.collectHeaders(kopf, 2);
     g_web.begin();
     if (MDNS.begin(geraeteName().c_str())) MDNS.addService("http", "tcp", 80);
     g_webAn = true;
-    logZeile(String("[web] erreichbar unter http://") + WiFi.localIP().toString() +
-             "/ und http://" + geraeteName() + ".local/");
+    logZeile(String("[web] reachable at http://") + WiFi.localIP().toString() +
+             "/ and http://" + geraeteName() + ".local/");
 }
 
-// ---- nach Scan-Ende: neue Dateien hochladen ----
-// Ordner rekursiv durchgehen, Dateien hochladen; loggt jeden Eintrag (Diagnose)
+// ---- after the end of a scan: upload new files ----
+// Walk through folders recursively, upload files; logs every entry (diagnostics)
 static String g_fund[MAX_FUND];
 static int    g_fundAnzahl = 0;
-// Geist-Eintraege (siehe sendeGefundene), die nach dem Remount roh ausgetragen werden
+// Ghost entries (see sendeGefundene) that are removed raw after the remount
 #define MAX_GEISTER 8
 static String   g_geisterName[MAX_GEISTER];
 static uint32_t g_geisterGroesse[MAX_GEISTER];
 static int      g_geisterAnzahl = 0;
 
-// SCHRITT 1: nur suchen. Reines Lesen - das darf gefahrlos passieren,
-// waehrend der Drucker das Medium noch hat.
+// STEP 1: only search. Pure reading - that may happen without danger
+// while the printer still has the medium.
 static void sammleDateien(const String &pfad, int tiefe)
 {
     File dir = SD_MMC.open(pfad.length() ? pfad : "/");
@@ -2698,32 +2698,32 @@ static void sammleDateien(const String &pfad, int tiefe)
         String basis = voll;
         int sl = basis.lastIndexOf('/');
         if (sl >= 0) basis = basis.substring(sl + 1);
-        logZeile(String("[fund] ") + (istDir ? "DIR " : "DAT ") + voll + " " + sz + "B");
+        logZeile(String("[fund] ") + (istDir ? "DIR " : "FIL ") + voll + " " + sz + "B");
         if (istDir) {
             if (tiefe < 3 && !basis.startsWith(".") && !basis.equalsIgnoreCase("gesendet") &&
                 !basis.equalsIgnoreCase("senden"))
                 sammleDateien(voll, tiefe + 1);
             continue;
         }
-        if (!istScanName(basis)) continue;   // derselbe Massstab wie im Rohleser
+        if (!istScanName(basis)) continue;   // the same yardstick as in the raw reader
         if (!sz) continue;
         if (g_fundAnzahl < MAX_FUND) g_fund[g_fundAnzahl++] = voll;
     }
 }
 
-// ================= Ablauf ab v26: das Medium bleibt beim Drucker =================
-// Im Betrieb wird das Medium NIE abgemeldet. Fertige Scans liest der Stick roh -
-// Verzeichnis, Belegungskette, Datenbloecke - und laedt sie hoch, waehrend der
-// Drucker die Karte weiter hat. Was gesendet ist, merkt er sich im Flash
-// (Startcluster, Groesse, Kennzahl). Umbenennen ist unnoetig: der Drucker
-// nennt den naechsten Scan von selbst [Untitled]_<Zeit>.pdf. Aufgeraeumt wird
-// erst in einer Ruhephase - wenn der Drucker eine Weile nichts angefasst hat,
-// die Merkliste voll wird oder jemand den Knopf drueckt. Nur dann ist das
-// Medium fuer unter eine Sekunde weg, und niemand steht am Geraet.
-// v25 hatte das Fenster bei jedem Scan; v18-v24 sogar fuer die Dauer des Uploads.
+// =============== Flow since v26: the medium stays with the printer ===============
+// In operation the medium is NEVER ejected. The stick reads finished scans raw -
+// directory, cluster chain, data blocks - and uploads them while the
+// printer still has the card. What has been sent it remembers in flash
+// (start cluster, size, checksum). Renaming is unnecessary: the printer
+// names the next scan [Untitled]_<time>.pdf by itself. Cleanup happens
+// only in an idle phase - when the printer has not touched anything for a while,
+// the memo list fills up or somebody presses the button. Only then is the
+// medium gone for less than a second, and nobody is standing at the device.
+// v25 had the window on every scan; v18-v24 even for the duration of the upload.
 
-// ---- Reste aus v25: /senden ----
-static String g_erledigtPfad[MAX_FUND];   // in /senden, erfolgreich hochgeladen
+// ---- Leftovers from v25: /senden ----
+static String g_erledigtPfad[MAX_FUND];   // in /senden, successfully uploaded
 static int    g_erledigtAnzahl = 0;
 
 static bool sendenLeer()
@@ -2771,12 +2771,12 @@ static void sendenAusSenden(int &hoch, int &fehler)
     }
 }
 
-// ---- Verarbeiten: roh lesen und hochladen, das Medium bleibt beim Drucker ----
+// ---- Processing: read raw and upload, the medium stays with the printer ----
 static void verarbeiteRoh(bool manuell)
 {
     uint32_t begonnen = millis();
     g_warteAnzeige = false;
-    logZeile(manuell ? "[scan] manuelle Suche" : "[scan] Scan fertig, verarbeite");
+    logZeile(manuell ? "[scan] manual search" : "[scan] scan finished, processing");
     zeigeScreen(Z_SUCHT);
 
     RohEintrag liste[MAX_FUND];
@@ -2789,24 +2789,24 @@ static void verarbeiteRoh(bool manuell)
         RohEintrag &e = liste[i];
         if (fertigIndexE(e) >= 0) { bekannt++; continue; }
         if (istGeloeschtE(e)) {
-            logZeile(String("[geist] ") + e.name + " ist die Wiederkehr einer weggeraeumten Datei - wartet aufs Aufraeumen");
+            logZeile(String("[geist] ") + e.name + " is the return of a cleaned-up file - waits for cleanup");
             geister++;
             continue;
         }
         if (e.start < 2 || fatNaechster(e.start, fatBuf) == 0) {
-            logZeile(String("[geist] ") + e.name + " zeigt auf freie Bloecke - wartet aufs Aufraeumen");
+            logZeile(String("[geist] ") + e.name + " points to free blocks - waits for cleanup");
             geister++;
             continue;
         }
         bool geteilt = false;
         for (int k = 0; k < n; k++) if (k != i && liste[k].start == e.start) geteilt = true;
         if (geteilt) {
-            logZeile(String("[geist] ") + e.name + " teilt Bloecke mit einem anderen Eintrag - wartet aufs Aufraeumen");
+            logZeile(String("[geist] ") + e.name + " shares blocks with another entry - waits for cleanup");
             geister++;
             continue;
         }
         if (!rohVollstaendig(e)) {
-            logZeile(String("[warte] ") + e.name + " (" + (e.groesse / 1024) + " kB) hat noch keine Endmarke - der Drucker schreibt noch");
+            logZeile(String("[warte] ") + e.name + " (" + (e.groesse / 1024) + " kB) has no end marker yet - the printer is still writing");
             fehler++;
             continue;
         }
@@ -2826,37 +2826,37 @@ static void verarbeiteRoh(bool manuell)
     }
     if (fatBuf) free(fatBuf);
 
-    // Reste aus v25 in /senden - der Mount vom Start kennt sie
+    // Leftovers from v25 in /senden - the mount from startup knows them
     if (!sendenLeer()) sendenAusSenden(hoch, fehler);
 
-    logZeile(String("[scan] fertig: ") + hoch + " hochgeladen, " + bekannt + " schon bekannt, " + fehler +
-             " Fehler, vom Host geschrieben: " + (g_bytesGeschrieben / 1024) + " kB");
+    logZeile(String("[scan] done: ") + hoch + " uploaded, " + bekannt + " already known, " + fehler +
+             " errors, written by host: " + (g_bytesGeschrieben / 1024) + " kB");
     if (hoch == 0) {
-        // Der Drucker hat geschrieben, aber keine neue Datei liegt da - was genau
-        // hat er geschrieben? (Sektor+Anzahl, F=FAT W=Wurzel D=Daten B=Boot)
+        // The printer wrote, but no new file is there - what exactly
+        // did it write? (sector+count, F=FAT W=root D=data B=boot)
         String spur = spurText(false);
         if (spur.length()) logZeile("[spur] " + spur);
     }
     if (hoch > 0) g_bytesGeschrieben = 0;
 
     if ((int32_t)(g_lastWrite - begonnen) > 0) {
-        logZeile("[scan] neuer Schreibzugriff waehrend der Verarbeitung - bleibe dran");
+        logZeile("[scan] new write access during processing - staying on it");
         g_versuche = 0;
         g_naechsterVersuch = 0;
         logFlushNetz();
-        return;                       // g_dirty bleibt stehen
+        return;                       // g_dirty stays set
     }
 
     g_versuche++;
     if (hoch == 0 && fehler == 0 && geister > 0) {
-        // Nur Geister: da kommt nichts mehr, das Aufraeumfenster erledigt sie.
-        // Ein Wiederholzyklus wuerde nur alle 30 s dieselbe Zeile schreiben.
-        logZeile(String("[scan] nur ") + geister + " Geist(er) - wartet aufs Aufraeumen");
+        // Only ghosts: nothing more will come, the cleanup window handles them.
+        // A retry cycle would just write the same line every 30 s.
+        logZeile(String("[scan] only ") + geister + " ghost(s) - waits for cleanup");
         g_versuche = MAX_VERSUCHE;
     }
     if (hoch == 0 && fehler == 0) {
         if (manuell) {
-            logZeile("[scan] nichts Neues");
+            logZeile("[scan] nothing new");
             g_versuche = 0;
             logFlushNetz();
             return;
@@ -2864,13 +2864,13 @@ static void verarbeiteRoh(bool manuell)
         if (g_versuche < MAX_VERSUCHE) {
             g_naechsterVersuch = millis() + RETRY_MS;
             g_dirty = true;
-            logZeile(String("[warte] nichts Neues (Versuch ") + g_versuche + "/" + MAX_VERSUCHE +
-                  "), neuer Blick in " + (RETRY_MS / 1000) + "s");
+            logZeile(String("[warte] nothing new (attempt ") + g_versuche + "/" + MAX_VERSUCHE +
+                  "), next look in " + (RETRY_MS / 1000) + "s");
             zeigeWarte(g_versuche, MAX_VERSUCHE);
             logFlushNetz();
             return;
         }
-        logZeile(String("[warte] nach ") + g_versuche + " Versuchen nichts Neues - aufgegeben");
+        logZeile(String("[warte] nothing new after ") + g_versuche + " attempts - gave up");
     }
     g_dirty = false;
     g_versuche = 0;
@@ -2881,7 +2881,7 @@ static void verarbeiteRoh(bool manuell)
     logFlushNetz();
 }
 
-// ---- Aufraeumen: das einzige Fenster, in dem die Karte veraendert wird ----
+// ---- Cleanup: the only window in which the card is modified ----
 static bool aufraeumenNoetig()
 {
     return g_fertigAnzahl > 0 || g_erledigtAnzahl > 0 || g_geisterAnzahl > 0;
@@ -2892,23 +2892,23 @@ static void aufraeumFenster(const String &grund)
     uint32_t t0 = millis();
     logZeile("[aufraeumen] " + grund);
     zeigeScreen(Z_SUCHT);
-    if (!karteUebernehmen()) { logZeile("[aufraeumen] Karte nicht bekommen, spaeter"); return; }
+    if (!karteUebernehmen()) { logZeile("[aufraeumen] did not get the card, later"); return; }
 
-    // roh, vor dem Mount
+    // raw, before the mount
     int geister = geisterJagen();
     uint32_t cs = rohOrdnerCluster("SENDEN     ");
     for (int i = 0; i < g_geisterAnzahl; i++) {
         bool ok = cs && rohEintragLoeschenIn(cs, g_geisterName[i], g_geisterGroesse[i], 0);
-        logZeile(String("[geist] /senden/") + g_geisterName[i] + (ok ? " ausgetragen" : " NICHT gefunden"));
+        logZeile(String("[geist] /senden/") + g_geisterName[i] + (ok ? " removed" : " NOT found"));
     }
     g_geisterAnzahl = 0;
 
-    // Selbstpruefung: was der Drucker an Schaeden hinterlassen hat, jetzt beheben -
-    // hier sieht er die Karte nicht. Ist das Dateisystem zum zweiten Mal in Folge
-    // unlesbar, gibt es nichts mehr zu retten: neu anlegen.
-    kartePruefen(true, "im Aufraeumfenster");
+    // Self-check: fix now whatever damage the printer left behind -
+    // here it cannot see the card. If the file system is unreadable for the
+    // second time in a row, there is nothing left to save: create it anew.
+    kartePruefen(true, "in the cleanup window");
     if (g_befund.heillos && g_heillosFolge >= 2) {
-        karteFormatieren("Dateisystem zweimal in Folge unlesbar");
+        karteFormatieren("file system unreadable twice in a row");
         remount();
         karteZurueckgeben();
         g_letztesAufraeumen = millis();
@@ -2919,22 +2919,22 @@ static void aufraeumFenster(const String &grund)
     RohEintrag liste[MAX_FUND];
     int n = rohListe(0, liste, MAX_FUND, true);
 
-    if (!remount()) { logZeile("[aufraeumen] Mount fehlgeschlagen"); karteZurueckgeben(); return; }
+    if (!remount()) { logZeile("[aufraeumen] mount failed"); karteZurueckgeben(); return; }
 
     int weg = 0;
-    // Eintraege der Merkliste, zu denen keine Datei mehr liegt: der Drucker hat die
-    // Datei ueberschrieben ("Ersetzen") oder geloescht. Sie muessen raus - sonst
-    // bleibt aufraeumenNoetig() fuer immer wahr und das Fenster lief im Kreis, alle
-    // 300 ms mit Medium weg und wieder da (am 20.09.2026 ueber eine halbe Stunde,
-    // der 780 brach den naechsten Scan dann mit "Error writing multi-page image file" ab).
+    // Memo list entries whose file is no longer there: the printer has
+    // overwritten the file ("Replace") or deleted it. They have to go - otherwise
+    // aufraeumenNoetig() stays true forever and the window ran in circles, every
+    // 300 ms with the medium gone and back (on 20.09.2026 for over half an hour,
+    // the 780 then aborted the next scan with "Error writing multi-page image file").
     for (int fi = g_fertigAnzahl - 1; fi >= 0; fi--) {
         bool da = false;
         for (int i = 0; i < n && !da; i++)
             da = liste[i].start == g_fertig[fi].start && liste[i].groesse == g_fertig[fi].groesse &&
                  (!g_fertig[fi].kennzahl || rohKennzahl(liste[i]) == g_fertig[fi].kennzahl);
         if (da) continue;
-        logZeile(String("[aufraeumen] Merkliste: ") + g_fertig[fi].name + " (" + (g_fertig[fi].groesse / 1024) +
-                 " kB) liegt nicht mehr auf der Karte - Eintrag ausgetragen");
+        logZeile(String("[aufraeumen] memo list: ") + g_fertig[fi].name + " (" + (g_fertig[fi].groesse / 1024) +
+                 " kB) is no longer on the card - entry removed");
         geloeschtMerken(g_fertig[fi]);
         memmove(g_fertig + fi, g_fertig + fi + 1, (g_fertigAnzahl - fi - 1) * sizeof(Fertig));
         g_fertigAnzahl--;
@@ -2942,15 +2942,15 @@ static void aufraeumFenster(const String &grund)
     for (int i = 0; i < n; i++) {
         int fi = fertigIndexE(liste[i]);
         if (fi < 0) {
-            // Nicht gesendet und keine Endmarke: ein abgebrochener Scan (Stromschnitt,
-            // Schreibfehler des Druckers). Der Drucker fragt beim naechsten Job sonst
-            // "Datei bereits vorhanden" - und nach der Ruhefrist schreibt er da sicher
-            // nicht mehr weiter.
+            // Not sent and no end marker: an aborted scan (power cut,
+            // write error of the printer). Otherwise the printer asks on the next
+            // job "File already exists" - and after the idle period it surely
+            // will not write there any more.
             if (!istGeloeschtE(liste[i]) && !rohVollstaendig(liste[i])) {
                 String pfad = "/" + String(liste[i].name);
                 bool ok = SD_MMC.remove(pfad);
-                logZeile(String("[aufraeumen] unfertige Datei ") + liste[i].name + " (" + (liste[i].groesse / 1024) +
-                         " kB, keine Endmarke) " + (ok ? "verworfen" : "liess sich nicht loeschen"));
+                logZeile(String("[aufraeumen] unfinished file ") + liste[i].name + " (" + (liste[i].groesse / 1024) +
+                         " kB, no end marker) " + (ok ? "discarded" : "could not be deleted"));
                 if (ok) weg++;
             }
             continue;
@@ -2969,7 +2969,7 @@ static void aufraeumFenster(const String &grund)
                        (punkt > 0 ? basis.substring(punkt) : String(""));
             }
             ok = SD_MMC.rename(pfad, ziel);
-            if (!ok) { logZeile("[aufraeumen] Verschieben fehlgeschlagen, loesche " + pfad); ok = SD_MMC.remove(pfad); }
+            if (!ok) { logZeile("[aufraeumen] move failed, deleting " + pfad); ok = SD_MMC.remove(pfad); }
         }
         if (ok) {
             geloeschtMerken(g_fertig[fi]);
@@ -2977,10 +2977,10 @@ static void aufraeumFenster(const String &grund)
             g_fertigAnzahl--;
             weg++;
         } else {
-            logZeile("[aufraeumen] " + pfad + " liess sich nicht wegraeumen");
+            logZeile("[aufraeumen] " + pfad + " could not be cleaned up");
         }
     }
-    // Reste aus v25
+    // Leftovers from v25
     for (int i = 0; i < g_erledigtAnzahl; i++) {
         if (g_loeschen) SD_MMC.remove(g_erledigtPfad[i]);
         else {
@@ -2996,8 +2996,8 @@ static void aufraeumFenster(const String &grund)
     karteZurueckgeben();
     fertigSpeichern();
     g_letztesAufraeumen = millis();
-    logZeile(String("[aufraeumen] ") + (millis() - t0) + " ms: " + weg + " weggeraeumt, " + geister +
-             " Geister, " + g_fertigAnzahl + " gesendete liegen noch");
+    logZeile(String("[aufraeumen] ") + (millis() - t0) + " ms: " + weg + " cleaned up, " + geister +
+             " ghosts, " + g_fertigAnzahl + " sent still on the card");
     logFlushNetz();
 }
 
@@ -3007,41 +3007,41 @@ void setup()
     delay(300);
     Serial.println("\n=== Scan-Stick " FW_VERSION " ===");
     g_startGrund = resetGrund();
-    logZeile(String("[boot] " FW_VERSION ", Grund: ") + g_startGrund + ", Geraet " + geraeteName());
+    logZeile(String("[boot] " FW_VERSION ", reason: ") + g_startGrund + ", device " + geraeteName());
 
     ledInit();
-    ledColor(60, 60, 60);   // WEISS = Strom da, bootet
+    ledColor(60, 60, 60);   // WHITE = power there, booting
     displayInit();
-    zeigeScreen(0);         // STROM + Blitz
+    zeigeScreen(0);         // POWER + flash
 
-    // Zugangsdaten zuerst aus dem Flash. Damit kommen WLAN und Weboberflaeche
-    // auch hoch, wenn die Karte fehlt oder nicht mountet - dann kann der Stick
-    // selbst melden, was ihm fehlt, statt stumm zu bleiben.
+    // Credentials from flash first. That way WiFi and the web UI come up
+    // even when the card is missing or does not mount - then the stick can
+    // report what it is missing instead of staying mute.
     cfgAusNvs();
     fertigLaden();
 
     SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0, SD_D1, SD_D2, SD_D3);
     if (!g_sdRiegel) g_sdRiegel = xSemaphoreCreateMutex();
     bool sdOk = SD_MMC.begin("/sdcard", false, false);
-    if (!sdOk) { logZeile("[sd] Mount fehlgeschlagen"); zeigeScreen(Z_SDFEHL); }
-    else fixMbrTyp();   // MBR nur bei gemounteter Karte anfassen
+    if (!sdOk) { logZeile("[sd] mount failed"); zeigeScreen(Z_SDFEHL); }
+    else fixMbrTyp();   // touch the MBR only with the card mounted
 
-    if (sdOk && ladeConfig()) {          // nur eine GEAENDERTE /wifi.cfg gewinnt
+    if (sdOk && ladeConfig()) {          // only a CHANGED /wifi.cfg wins
         cfgNachNvs();
-        logZeile("[nvs] aus /wifi.cfg uebernommen");
+        logZeile("[nvs] taken from /wifi.cfg");
     }
     g_nvs.begin("scanstick", false);
     if (g_nvs.getUInt("usbFehler", 0)) {
-        g_usbFehlerAlt = String(g_nvs.getUInt("usbFehler", 0)) + " abgewiesene(r) Host-Zugriff(e), zuletzt Sektor " +
-                         g_nvs.getUInt("usbFehlerLba", 0) + " um " + g_nvs.getString("usbFehlerWann", "?");
+        g_usbFehlerAlt = String(g_nvs.getUInt("usbFehler", 0)) + " rejected host access(es), last sector " +
+                         g_nvs.getUInt("usbFehlerLba", 0) + " at " + g_nvs.getString("usbFehlerWann", "?");
         String spur = g_nvs.getString("usbFehlerSpur", "");
-        logZeile("[usb] VOR DEM LETZTEN NEUSTART: " + g_usbFehlerAlt);
-        if (spur.length()) logZeile("[usb] Schreibspur davor: " + spur);
+        logZeile("[usb] BEFORE THE LAST RESTART: " + g_usbFehlerAlt);
+        if (spur.length()) logZeile("[usb] write trace before that: " + spur);
         g_nvs.remove("usbFehler"); g_nvs.remove("usbFehlerLba"); g_nvs.remove("usbFehlerWann"); g_nvs.remove("usbFehlerSpur");
     }
     g_nvs.end();
-    if (sdOk) {                          // Karte heilen, solange sie noch niemand sieht
-        kartePruefen(true, "beim Start");
+    if (sdOk) {                          // heal the card while nobody sees it yet
+        kartePruefen(true, "at startup");
         if (g_befund.geaendert) sdOk = remount();
     }
 
@@ -3051,23 +3051,23 @@ void setup()
     MSC.onStartStop(onStartStop);
     MSC.onRead(onRead);
     MSC.onWrite(onWrite);
-    // Ohne Karte "kein Medium" melden statt eines Laufwerks mit 0 Sektoren. So
-    // sieht der Host einen leeren Kartenleser, und von aussen ist der Zustand
-    // vom frueheren Boot-Haenger zu unterscheiden.
+    // Without a card report "no medium" instead of a drive with 0 sectors. That
+    // way the host sees an empty card reader, and from outside the state can be
+    // told apart from the earlier boot hang.
     MSC.mediaPresent(sdOk);
     MSC.isWritable(true);
     uint32_t sec = SD_MMC.sectorSize();
     uint32_t rawSectors = sec ? (uint32_t)(SD_MMC.cardSize() / sec) : 0;
-    Serial.printf("[usb] MSC-Sektoren(roh)=%u sec=%u\n", rawSectors, sec);
+    Serial.printf("[usb] MSC sectors(raw)=%u sec=%u\n", rawSectors, sec);
     MSC.begin(rawSectors, sec ? sec : 512);
     USB.begin();
-    Serial.println("[usb] als USB-Speicher gestartet");
+    Serial.println("[usb] started as USB storage");
 
-    // WLAN erst jetzt: der Suchlauf blockiert einige Sekunden, und der Drucker
-    // soll den Stick sofort als Laufwerk sehen, nicht erst nach dem WLAN.
+    // WiFi only now: the scan blocks for a few seconds, and the printer
+    // should see the stick as a drive right away, not only after the WiFi.
     wlanStarten();
     if (WiFi.status() != WL_CONNECTED) {
-        einrichtungStarten(cfgNetze ? "kein bekanntes Netz erreichbar" : "kein Netz hinterlegt");
+        einrichtungStarten(cfgNetze ? "no known network in range" : "no network configured");
         webStarten();
     }
     if (g_screen != Z_SDFEHL) zeigeScreen(Z_BEREIT);
@@ -3075,33 +3075,33 @@ void setup()
 
 void loop()
 {
-    // Ohne Uhr heissen die Dateien "scan-nach173s.pdf" statt mit Datum. Ein
-    // einzelner Fehlversuch beim Start soll das nicht fuer immer festlegen.
+    // Without a clock the files are named "scan-after173s.pdf" instead of with a
+    // date. A single failed attempt at startup must not settle that forever.
     if (!g_zeitOk && WiFi.status() == WL_CONNECTED && !g_dirty &&
         millis() - g_zeitVersuch > ZEIT_WIEDERHOLUNG) {
         zeitHolen();
     }
 
-    // Ein Stromausfall oder Neustart mitten im Ablauf darf keine Datei
-    // liegenlassen: Schreibzugriffe merkt sich der Stick nur im Arbeitsspeicher,
-    // nach dem Start weiss er also nichts von dem, was schon da ist.
+    // A power failure or restart in the middle of the flow must not leave a
+    // file behind: the stick remembers write accesses only in RAM,
+    // so after a restart it knows nothing about what is already there.
     if (!g_startGeprueft && WiFi.status() == WL_CONNECTED && millis() > 8000) {
         g_startGeprueft = true;
         int a = 0;
         uint32_t gr = 0;
         (void)a; (void)gr;
         if (rohOffen() || !sendenLeer()) {
-            logZeile("[start] es liegt noch etwas Ungesendetes auf der Karte - nehme es mit");
+            logZeile("[start] something unsent is still on the card - taking it along");
             g_dirty = true;
-            g_lastWrite = millis() - IDLE_MS - 1;   // sofort faellig
+            g_lastWrite = millis() - IDLE_MS - 1;   // due immediately
             g_versuche = 0;
             g_naechsterVersuch = 0;
         }
     }
 
-    // Liegt etwas, das nicht wegging - Empfaenger war nicht erreichbar, WLAN
-    // fehlte? Bisher gab es den naechsten Versuch erst mit dem naechsten Scan.
-    // Jetzt alle zehn Minuten roh nachsehen, ohne den Drucker zu stoeren.
+    // Is something left that did not go out - receiver unreachable, WiFi
+    // missing? So far the next attempt only came with the next scan.
+    // Now look raw every ten minutes, without disturbing the printer.
     #define NACHSCHAU_MS 600000
     static uint32_t nachschau = 0;
     if (!g_dirty && g_startGeprueft && WiFi.status() == WL_CONNECTED &&
@@ -3111,54 +3111,54 @@ void loop()
         uint32_t gr = 0;
         (void)a; (void)gr;
         if (rohOffen() || !sendenLeer()) {
-            logZeile("[nachschau] es liegt noch etwas Ungesendetes auf der Karte - neuer Anlauf");
+            logZeile("[nachschau] something unsent is still on the card - new attempt");
             g_dirty = true;
-            g_lastWrite = millis() - IDLE_MS - 1;   // sofort faellig
+            g_lastWrite = millis() - IDLE_MS - 1;   // due immediately
             g_versuche = 0;
             g_naechsterVersuch = 0;
         }
     }
 
-    // Aufraeumen nur in Ruhe: der Drucker hat lange nichts angefasst, die
-    // Merkliste wird voll, oder jemand hat den Knopf gedrueckt.
+    // Cleanup only when idle: the printer has not touched anything for long, the
+    // memo list is filling up, or somebody has pressed the button.
     if (g_aufraeumJetzt && g_startGeprueft && millis() - g_lastHost > 5000) {
-        // Knopfdruck: der Mensch weiss, dass gerade nicht gescannt wird
+        // Button press: the human knows that nothing is being scanned right now
         g_aufraeumJetzt = false;
-        aufraeumFenster("auf Knopfdruck");
+        aufraeumFenster("on button press");
         g_dirty = false;
         g_versuche = 0;
         g_naechsterVersuch = 0;
     } else if (!g_dirty && g_startGeprueft && aufraeumenNoetig()) {
         uint32_t ruhe = millis() - g_lastHost;
-        // Ein Fenster je Ruhephase: bleibt danach etwas liegen, das sich nicht
-        // wegraeumen laesst, darf das Fenster nicht sofort wieder aufgehen -
-        // erst, wenn der Drucker seitdem wieder zugegriffen hat.
+        // One window per idle phase: if something stays behind afterwards that
+        // cannot be cleaned up, the window must not open again right away -
+        // only once the printer has accessed the card since then.
         bool neuSeitdem = g_letztesAufraeumen == 0 || (int32_t)(g_lastHost - g_letztesAufraeumen) > 0;
-        if (neuSeitdem && ruhe > g_aufraeumMin * 60000UL) aufraeumFenster(String("Drucker seit ") + dauer(ruhe) + " ohne Zugriff");
-        else if (neuSeitdem && g_fertigAnzahl >= MAX_FERTIG - 8 && ruhe > 60000) aufraeumFenster("Merkliste fast voll");
+        if (neuSeitdem && ruhe > g_aufraeumMin * 60000UL) aufraeumFenster(String("printer ") + dauer(ruhe) + " without access");
+        else if (neuSeitdem && g_fertigAnzahl >= MAX_FERTIG - 8 && ruhe > 60000) aufraeumFenster("memo list almost full");
     }
 
     if (g_stopNeu) {
         g_stopNeu = false;
-        logZeile(String("[scsi] START STOP UNIT: start=") + (g_stopStart ? "ja" : "nein") +
-                 " eject=" + (g_stopEject ? "ja" : "nein") + " pc=" + g_stopPc);
+        logZeile(String("[scsi] START STOP UNIT: start=") + (g_stopStart ? "yes" : "no") +
+                 " eject=" + (g_stopEject ? "yes" : "no") + " pc=" + g_stopPc);
     }
-    // Netz weg? Der Auto-Reconnect haengt an der festen Kennung des einen
-    // Zugangspunkts. Nach zwei Minuten ohne Netz neu suchen, ueber alle Netze.
+    // Network gone? The auto reconnect clings to the fixed id of the one
+    // access point. After two minutes without network search again, all networks.
     if (WiFi.status() != WL_CONNECTED && cfgNetze) {
         if (!g_wlanVerloren) g_wlanVerloren = millis() ? millis() : 1;
         else if (millis() - g_wlanVerloren > WLAN_NEUSUCHE) {
-            logZeile("[wifi] zwei Minuten ohne Netz - suche neu");
-            // Erst die alte Verbindung aufgeben: solange der Treiber noch am
-            // verschwundenen Zugangspunkt haengt und wiederverbinden will, kommt
-            // der Suchlauf gar nicht zustande (im Test: "kein Netz" nach 3 ms,
-            // erst der zweite Anlauf zwei Minuten spaeter fand das Heimnetz).
+            logZeile("[wifi] two minutes without network - searching again");
+            // Drop the old connection first: as long as the driver still clings
+            // to the vanished access point and wants to reconnect, the scan
+            // does not happen at all (in the test: "no network" after 3 ms,
+            // only the second attempt two minutes later found the home network).
             WiFi.disconnect(false, false);
             delay(200);
             g_wlanVerloren = 0;
             wlanStarten();
             if (WiFi.status() != WL_CONNECTED) {
-                // Fehlschlag: nicht wieder zwei Minuten warten, in 30 s nochmal
+                // Failure: do not wait two minutes again, retry in 30 s
                 uint32_t jetzt = millis() ? millis() : 1;
                 g_wlanVerloren = jetzt - (WLAN_NEUSUCHE - 30000);
             }
@@ -3170,9 +3170,9 @@ void loop()
     if (g_webAn) g_web.handleClient();
 
     if (g_usbFehlerNeu) {
-        // Sofort, nicht erst nach Ruhe: der 780 nimmt dem Port nach einem
-        // Medienfehler den Strom, und dann waere alles im RAM verloren. Deshalb
-        // zusaetzlich in den Flash - beim naechsten Start wird es gemeldet.
+        // Right away, not only when idle: after a media error the 780 cuts
+        // the power to the port, and then everything in RAM would be lost. So
+        // additionally into the flash - on the next start it gets reported.
         g_usbFehlerNeu = false;
         char wann[16] = "?";
         if (g_zeitOk) { time_t t = time(nullptr); struct tm tm; localtime_r(&t, &tm); strftime(wann, sizeof wann, "%H:%M:%S", &tm); }
@@ -3182,25 +3182,25 @@ void loop()
         g_nvs.putString("usbFehlerWann", wann);
         g_nvs.putString("usbFehlerSpur", spurText(false).substring(0, 400));
         g_nvs.end();
-        logZeile(String("[usb] abgewiesene Host-Zugriffe: ") + (uint32_t)g_usbFehlerLesen + " lesen, " +
-                 (uint32_t)g_usbFehlerSchreiben + " schreiben, zuletzt Sektor " + (uint32_t)g_usbFehlerLba + " um " + wann);
+        logZeile(String("[usb] rejected host accesses: ") + (uint32_t)g_usbFehlerLesen + " read, " +
+                 (uint32_t)g_usbFehlerSchreiben + " write, last sector " + (uint32_t)g_usbFehlerLba + " at " + wann);
         logFlushNetz();
     }
 
     uint32_t nun = millis();
 
-    // Roh nachsehen, solange etwas offen ist. Reines Lesen - der Drucker merkt
-    // davon nichts, deshalb darf es jede Sekunde passieren. Bleiben Anzahl und
-    // Groesse mehrfach gleich, hat der Drucker die Datei geschlossen.
-    // Die erkannte Groesse allein genuegt NICHT: der 780 traegt die endgueltige
-    // Groesse schon vor dem Schreiben ein. Wuerden wir darauf vertrauen, benennen
-    // wir mitten im laufenden Scan um - der Drucker schreibt dann seine alte
-    // Verzeichnissicht zurueck und die Umbenennung ist weg. Also zusaetzlich Ruhe abwarten.
-    // Ruhe heisst: weder Schreiben NOCH Lesen. Ein Host, der nach dem Schreiben
-    // noch liest (Linux beim Aushaengen, ein Drucker beim Nachpruefen), ist nicht
-    // fertig - ihm jetzt das Medium zu entziehen bringt nur Fehler auf seiner Seite.
-    // ... aber nicht schneller als der Wartezyklus erlaubt: liegt nur Bekanntes
-    // in der Wurzel, lief das sonst alle vier Sekunden im Kreis.
+    // Look raw as long as something is open. Pure reading - the printer notices
+    // nothing of it, so it may happen every second. If count and
+    // size stay the same several times, the printer has closed the file.
+    // The reported size alone is NOT enough: the 780 enters the final
+    // size already before writing. If we trusted that, we would rename
+    // in the middle of a running scan - the printer then writes back its old
+    // directory view and the rename is gone. So wait for quiet on top of that.
+    // Quiet means: neither writing NOR reading. A host that still reads after
+    // writing (Linux while unmounting, a printer while verifying) is not
+    // done - taking the medium away now only causes errors on its side.
+    // ... but not faster than the wait cycle allows: if only known files are
+    // in the root, this otherwise ran in circles every four seconds.
     if (g_dirty && !g_warteAnzeige && nun - g_lastHost > ROH_RUHE &&
         nun - g_rohLetzt > ROH_INTERVALL &&
         (g_naechsterVersuch == 0 || (int32_t)(nun - g_naechsterVersuch) >= 0)) {
@@ -3216,19 +3216,19 @@ void loop()
                     g_rohAnzahl = 0;
                     g_rohSumme = 0;
                     if (!rohOffen()) {
-                        // Der Drucker hat geschrieben, aber es liegt nichts Neues -
-                        // etwa seine Verzeichnisdaten. Vorher lief das alle vier
-                        // Sekunden im Kreis, mit einem Protokoll-Upload pro Runde.
-                        logZeile(anz ? String("[roh] ") + anz + " Datei(en) stabil, alle schon gesendet - nichts zu tun"
-                                     : String("[roh] keine Scan-Datei - der Drucker hat nur Verzeichnisdaten geschrieben, nichts zu tun"));
+                        // The printer wrote, but there is nothing new -
+                        // its directory data for instance. Before, this ran every
+                        // four seconds in circles, with one log upload per round.
+                        logZeile(anz ? String("[roh] ") + anz + " file(s) stable, all already sent - nothing to do"
+                                     : String("[roh] no scan file - the printer only wrote directory data, nothing to do"));
                         g_dirty = false;
                         g_versuche = 0;
                         g_naechsterVersuch = 0;
                         logFlushNetz();
                         return;
                     }
-                    logZeile(String("[roh] ") + anz + " Datei(en), " + (summe / 1024) +
-                             " kB, Groesse stabil - verarbeite sofort");
+                    logZeile(String("[roh] ") + anz + " file(s), " + (summe / 1024) +
+                             " kB, size stable - processing now");
                     verarbeiteRoh(false);
                     return;
                 }
@@ -3244,24 +3244,24 @@ void loop()
         g_einmalSchauen = false;
         verarbeiteRoh(true);
     } else if (nun - g_lastWrite < IDLE_MS) {
-        // Der Host schreibt noch: Beobachtung von vorn beginnen
+        // The host is still writing: start the observation over
         g_versuche = 0;
         g_naechsterVersuch = 0;
         g_warteAnzeige = false;
     } else if (g_dirty && (g_naechsterVersuch == 0 || (int32_t)(nun - g_naechsterVersuch) >= 0)) {
         verarbeiteRoh(false);
     }
-    // Nur die WARTE-Anzeige ist geschuetzt. Frueher stand hier !g_dirty - das
-    // fror JEDE Anzeige ein, sobald ein Schreibvorgang offen war, also ueber die
-    // gesamte Ruhefrist hinweg.
+    // Only the WAIT display is protected. This used to read !g_dirty - that
+    // froze EVERY display as soon as a write was open, so across the
+    // whole idle period.
     if (g_einrichtung && !g_dirty && g_screen != Z_SDFEHL && !g_warteAnzeige) {
         zeigeEinrichtung();
     } else if (g_screen != Z_SDFEHL && !g_warteAnzeige) {
         if (g_einrichtungGezeichnet) { g_einrichtungGezeichnet = false; g_screen = -1; }
         uint32_t seitWrite = nun - g_lastWrite;
-        // Noch nicht roh nachgesehen seit dem letzten Schreibzugriff, oder es
-        // liegt wirklich etwas Ungesendetes: dann "SCAN ERKANNT". Nur die
-        // Verzeichnisdaten des Druckers: bloss "Host aktiv".
+        // Not looked raw since the last write access, or there really is
+        // something unsent: then "SCAN FOUND". Only the printer's
+        // directory data: just "Host active".
         bool ungeprueft = (int32_t)(g_rohGeprueft - g_lastWrite) < 0;
         if (g_dirty && seitWrite < IDLE_MS && (ungeprueft || g_zeigAnzahl > 0))
             zeigeFrist((IDLE_MS - seitWrite + 999) / 1000);
@@ -3275,6 +3275,6 @@ void loop()
     }
 
     static uint32_t hb = 0;
-    if (millis() - hb > 2000) { hb = millis(); ledHeartbeat(); }   // alle 2s kurz blinken
-    delay(20);   // kurz, damit die Weboberflaeche fluessig antwortet
+    if (millis() - hb > 2000) { hb = millis(); ledHeartbeat(); }   // short blink every 2s
+    delay(20);   // short, so the web UI answers smoothly
 }

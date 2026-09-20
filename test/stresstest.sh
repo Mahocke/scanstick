@@ -1,42 +1,42 @@
 #!/usr/bin/env bash
-# Pruefstand fuer den Scan-Stick - ohne Drucker.
+# Test rig for the Scan-Stick - without a printer.
 #
-# Laeuft auf einem Linux-Rechner (etwa einem Raspberry Pi), an dem der Stick als
-# USB-Laufwerk haengt. Der Rechner spielt den Drucker: er mountet den Stick,
-# schreibt Test-PDFs, wirft aus. Ein Empfaenger auf demselben Rechner prueft,
-# ob jede Datei vollstaendig und genau einmal ankommt.
+# Runs on a Linux machine (a Raspberry Pi for example) with the stick attached as
+# a USB drive. The machine plays the printer: it mounts the stick, writes test
+# PDFs, ejects. A receiver on the same machine checks whether every file arrives
+# complete and exactly once.
 #
-#   sudo test/stresstest.sh [Stick-Adresse] [Partition]
-#     Stick-Adresse  http://scanstick-1a2b.local  (Vorgabe scanstick.local; besser den eigenen Namen oder die IP,
-#                    mit zwei Sticks im Netz trifft der Name sonst den falschen)
-#     Partition      /dev/sda1               (Vorgabe)
+#   sudo test/stresstest.sh [stick address] [partition]
+#     stick address  http://scanstick-1a2b.local  (default scanstick.local; better your own name or the IP,
+#                    with two sticks on the network the name hits the wrong one)
+#     partition      /dev/sda1               (default)
 #
-#   Umgebung: SCAN_WEBPASS=...  Passwort der Weboberflaeche (Benutzer scan)
-#             SCAN_PORT=8090    Port des Test-Empfaengers
-#             SCAN_SZENARIEN=ABCD  welche Szenarien laufen (E extra: Karte beschaedigen)
+#   Environment: SCAN_WEBPASS=...  password of the web interface (user scan)
+#                SCAN_PORT=8090    port of the test receiver
+#                SCAN_SZENARIEN=ABCD  which scenarios run (E extra: damage the card)
 #
-# Das Upload-Ziel des Sticks wird fuer die Dauer des Tests auf diesen Rechner
-# umgestellt und am Ende zurueckgesetzt. Die Partition wird nur angefasst, wenn
-# sie zu einem Espressif-USB-Geraet gehoert und SCANS heisst.
+# The upload target of the stick is switched to this machine for the duration of
+# the test and reset at the end. The partition is only touched if it belongs to
+# an Espressif USB device and is named SCANS.
 #
-# Szenarien:
-#   A  eine Datei
-#   B  zwei Dateien in einem Zug (der Drucker legt sie nacheinander ab)
-#   C  zweite Datei, sobald das Medium nach dem ersten Upload wieder da ist -
-#      der engste Zeitpunkt, den ein Drucker real treffen kann
-#   D  fuenf Jobs Schlag auf Schlag, jeder in eigenem Einhaengen und mit den
-#      Namen des Druckers; zaehlt, wie oft das Medium gerade weg war - genau
-#      diese Jobs haette ein Drucker abgewiesen
-#   W  (nur auf Wunsch) zweimal dieselbe Groesse nacheinander, dazwischen
-#      aufgeraeumt: gleicher Startblock, neuer Inhalt - muss ankommen; danach
-#      derselbe Inhalt noch einmal - der Empfaenger muss ihn als Wiederholung sehen
-#   E  (nur auf Wunsch) Karte absichtlich beschaedigen - Kette laeuft in eine
-#      andere, verwaiste Cluster, Schmutzmarke - und den Stick heilen lassen;
-#      fsck muss danach sauber sein
+# Scenarios:
+#   A  one file
+#   B  two files in one go (the printer drops them one after another)
+#   C  second file as soon as the medium is back after the first upload -
+#      the tightest moment a real printer can hit
+#   D  five jobs back to back, each with its own mount and with the printer's
+#      names; counts how often the medium was gone - exactly those jobs a
+#      printer would have rejected
+#   W  (on request only) twice the same size in a row, cleanup in between:
+#      same start block, new content - must arrive; then the same content
+#      once more - the receiver must see it as a repeat
+#   E  (on request only) damage the card on purpose - chain runs into another
+#      one, orphaned clusters, dirty flag - and let the stick heal it;
+#      fsck must be clean afterwards
 #
-# Der Linux-Treiber schreibt Verzeichniseintraege frueher und anders als ein
-# Drucker. Der Pruefstand ersetzt den Drucktest nicht, macht aber Regressionen
-# wiederholbar sichtbar.
+# The Linux driver writes directory entries earlier and differently than a
+# printer. The test rig does not replace the print test, but it makes
+# regressions repeatably visible.
 set -u
 export PATH="/sbin:/usr/sbin:$PATH"
 
@@ -60,64 +60,64 @@ CURL=(curl -s -m 15)
 [ -n "$PASS" ] && CURL+=(-u "scan:$PASS")
 
 log()  { printf '%s  %s\n' "$(date +%H:%M:%S)" "$*"; }
-fail() { log "FEHLER: $*"; FEHLER=$((FEHLER + 1)); }
+fail() { log "ERROR: $*"; FEHLER=$((FEHLER + 1)); }
 
 aufraeumen() {
     mountpoint -q "$MNT" && umount "$MNT"
     if [ -n "$ALTES_ZIEL" ]; then
         "${CURL[@]}" --data-urlencode "endpoint=$ALTES_ZIEL" "$STICK/einstellungen" >/dev/null \
-            && log "Upload-Ziel zurueckgesetzt auf $ALTES_ZIEL" \
-            || log "WARNUNG: Upload-Ziel konnte nicht zurueckgesetzt werden (war $ALTES_ZIEL)"
+            && log "Upload target reset to $ALTES_ZIEL" \
+            || log "WARNING: could not reset the upload target (was $ALTES_ZIEL)"
     fi
     [ -n "$EMPFAENGER_PID" ] && kill "$EMPFAENGER_PID" 2>/dev/null
-    log "Arbeitsordner: $ARBEIT (Empfaenger-Log, Inbox)"
+    log "Work directory: $ARBEIT (receiver log, inbox)"
 }
 trap aufraeumen EXIT
 
-[ "$(id -u)" = 0 ] || { echo "bitte mit sudo starten (mount/umount)"; exit 2; }
+[ "$(id -u)" = 0 ] || { echo "please start with sudo (mount/umount)"; exit 2; }
 
-# ---- Sicherheitsnetz: nur den Stick anfassen ----
+# ---- Safety net: touch only the stick ----
 VID=$(udevadm info -q property -n "$BLOCK" 2>/dev/null | sed -n 's/^ID_VENDOR_ID=//p')
 LABEL=$(lsblk -no LABEL "$DEV" 2>/dev/null)
 if [ "$VID" != "303a" ] || [ "$LABEL" != "SCANS" ]; then
-    echo "$DEV ist kein Scan-Stick (USB-Hersteller '$VID', Name '$LABEL') - Abbruch"
+    echo "$DEV is not a Scan-Stick (USB vendor '$VID', name '$LABEL') - aborting"
     exit 2
 fi
 
-# ---- Stick erreichbar? ----
-STATUS=$("${CURL[@]}" "$STICK/") || { echo "Weboberflaeche $STICK nicht erreichbar"; exit 2; }
+# ---- Stick reachable? ----
+STATUS=$("${CURL[@]}" "$STICK/") || { echo "web interface $STICK not reachable"; exit 2; }
 VERSION=$(printf '%s' "$STATUS" | grep -o 'Scan-Stick v[0-9]*' | head -1)
-ALTES_ZIEL=$(printf '%s' "$STATUS" | grep -o 'Ziel fuer Uploads</td><td>[^<]*' | sed 's/.*<td>//')
+ALTES_ZIEL=$(printf '%s' "$STATUS" | grep -o 'Upload target</td><td>[^<]*' | sed 's/.*<td>//')
 STICK_IP=$(getent hosts "${STICK#http://}" | awk '{print $1}')
 [ -z "$STICK_IP" ] && STICK_IP="${STICK#http://}"
 MEINE_IP=$(ip -o route get "$STICK_IP" | sed -n 's/.*src \([0-9.]*\).*/\1/p')
-log "Stick: $VERSION unter $STICK, bisheriges Ziel: $ALTES_ZIEL"
-log "Pruefstand: $(hostname) $MEINE_IP, Empfaenger auf Port $PORT"
+log "Stick: $VERSION at $STICK, previous target: $ALTES_ZIEL"
+log "Test rig: $(hostname) $MEINE_IP, receiver on port $PORT"
 
-# ---- Empfaenger starten und Stick umstellen ----
+# ---- Start the receiver and switch the stick over ----
 SCAN_PORT="$PORT" SCAN_INBOX="$INBOX" python3 -u "$HIER/empfaenger/scan-receiver.py" \
     >"$ARBEIT/empfaenger.log" 2>&1 &
 EMPFAENGER_PID=$!
 sleep 1
-curl -s -m 3 "http://127.0.0.1:$PORT/" >/dev/null || { echo "Empfaenger startet nicht, siehe $ARBEIT/empfaenger.log"; exit 2; }
+curl -s -m 3 "http://127.0.0.1:$PORT/" >/dev/null || { echo "receiver does not start, see $ARBEIT/empfaenger.log"; exit 2; }
 
 NEUES_ZIEL="http://$MEINE_IP:$PORT/scan"
 "${CURL[@]}" --data-urlencode "endpoint=$NEUES_ZIEL" "$STICK/einstellungen" >/dev/null
-JETZT=$("${CURL[@]}" "$STICK/" | grep -o 'Ziel fuer Uploads</td><td>[^<]*' | sed 's/.*<td>//')
-[ "$JETZT" = "$NEUES_ZIEL" ] || { echo "Upload-Ziel liess sich nicht setzen (steht auf '$JETZT')"; exit 2; }
-log "Upload-Ziel fuer den Test: $NEUES_ZIEL"
+JETZT=$("${CURL[@]}" "$STICK/" | grep -o 'Upload target</td><td>[^<]*' | sed 's/.*<td>//')
+[ "$JETZT" = "$NEUES_ZIEL" ] || { echo "could not set the upload target (is '$JETZT')"; exit 2; }
+log "Upload target for the test: $NEUES_ZIEL"
 
-# ---- Hilfsfunktionen ----
+# ---- Helper functions ----
 medium_da() { dd if="$BLOCK" of=/dev/null bs=512 count=1 2>/dev/null; }
 
-warte_medium() {   # warte_medium da|weg Sekunden
+warte_medium() {   # warte_medium da|weg seconds
     local ziel=$1 frist=$2 t=0
     while [ $t -lt "$frist" ]; do
         if [ "$ziel" = da ]; then
             if medium_da; then partprobe "$BLOCK" 2>/dev/null; sleep 1; [ -b "$DEV" ] && return 0; fi
             sleep 1; t=$((t + 1))
         else
-            # Das Fenster ist seit v25 nur noch ein bis zwei Sekunden lang - eng abtasten
+            # Since v25 the window is only one or two seconds long - sample tightly
             medium_da || return 0
             sleep 0.2; t=$((t + 1))
         fi
@@ -125,8 +125,8 @@ warte_medium() {   # warte_medium da|weg Sekunden
     return 1
 }
 
-# erzeugt eine PDF mit gueltigem Kopf, Zufallsinhalt und %%EOF am Ende
-mach_pdf() {   # mach_pdf Datei Bytes
+# creates a PDF with a valid header, random content and %%EOF at the end
+mach_pdf() {   # mach_pdf file bytes
     python3 - "$1" "$2" <<'PY'
 import os, sys
 pfad, groesse = sys.argv[1], int(sys.argv[2])
@@ -142,45 +142,45 @@ with open(pfad, "wb") as f:
 PY
 }
 
-# schreibt Dateien wie ein Drucker: mounten, ablegen, sync, auswerfen
-schreibe() {   # schreibe Datei...
-    warte_medium da 120 || { fail "Medium kam nicht zurueck"; return 1; }
+# writes files like a printer: mount, drop, sync, eject
+schreibe() {   # schreibe file...
+    warte_medium da 120 || { fail "medium did not come back"; return 1; }
     mount -t vfat "$DEV" "$MNT" || { fail "mount $DEV"; return 1; }
     for f in "$@"; do
         cp "$f" "$MNT/[Untitled].pdf" 2>/dev/null && mv "$MNT/[Untitled].pdf" "$MNT/$(basename "$f")"
-        log "  geschrieben: $(basename "$f") ($(stat -c %s "$f") Bytes)"
+        log "  written: $(basename "$f") ($(stat -c %s "$f") bytes)"
         GESCHRIEBEN=$((GESCHRIEBEN + 1))
     done
     sync
     umount "$MNT" || fail "umount"
 }
 
-# wartet, bis eine Datei mit dieser Pruefsumme im Posteingang liegt
-warte_ankunft() {   # warte_ankunft Datei Sekunden
+# waits until a file with this checksum is in the inbox
+warte_ankunft() {   # warte_ankunft file seconds
     local soll t=0
     soll=$(sha256sum "$1" | cut -d' ' -f1)
     while [ $t -lt "$2" ]; do
         if ls "$INBOX"/*.pdf >/dev/null 2>&1 && sha256sum "$INBOX"/*.pdf | grep -q "^$soll "; then
-            log "  angekommen: $(basename "$1") nach ${t}s"
+            log "  arrived: $(basename "$1") after ${t}s"
             return 0
         fi
         sleep 2; t=$((t + 2))
     done
-    fail "$(basename "$1") kam innerhalb von $2 s nicht vollstaendig an"
+    fail "$(basename "$1") did not arrive completely within $2 s"
     return 1
 }
 
-# ---- Szenario A: eine Datei ----
+# ---- Scenario A: one file ----
 if [[ $SZENARIEN == *A* ]]; then
-log "Szenario A: eine Datei (300 kB)"
+log "Scenario A: one file (300 kB)"
 mach_pdf "$ARBEIT/a1.pdf" 300000
 schreibe "$ARBEIT/a1.pdf"
 warte_ankunft "$ARBEIT/a1.pdf" 180
 fi
 
-# ---- Szenario B: zwei Dateien in einem Zug ----
+# ---- Scenario B: two files in one go ----
 if [[ $SZENARIEN == *B* ]]; then
-log "Szenario B: zwei Dateien nacheinander im selben Mount (800 kB + 150 kB)"
+log "Scenario B: two files in a row in the same mount (800 kB + 150 kB)"
 mach_pdf "$ARBEIT/b1.pdf" 800000
 mach_pdf "$ARBEIT/b2.pdf" 150000
 schreibe "$ARBEIT/b1.pdf" "$ARBEIT/b2.pdf"
@@ -188,84 +188,84 @@ warte_ankunft "$ARBEIT/b1.pdf" 240
 warte_ankunft "$ARBEIT/b2.pdf" 120
 fi
 
-# ---- Szenario C: zweite Datei, sobald das Medium zurueck ist ----
+# ---- Scenario C: second file as soon as the medium is back ----
 if [[ $SZENARIEN == *C* ]]; then
-log "Szenario C: grosse Datei (2 MB), zweite sofort nach Rueckkehr des Mediums"
+log "Scenario C: large file (2 MB), second one right after the medium returns"
 mach_pdf "$ARBEIT/c1.pdf" 2000000
 mach_pdf "$ARBEIT/c2.pdf" 250000
 schreibe "$ARBEIT/c1.pdf"
-if warte_medium weg 300; then      # 300 Abtastungen zu 0,2 s = 60 s
-    log "  Stick hat das Medium genommen"
+if warte_medium weg 300; then      # 300 samples of 0.2 s = 60 s
+    log "  stick has taken the medium"
 else
-    log "  Fenster nicht beobachtet (zu kurz?) - schreibe c2 trotzdem, mitten in den Upload"
+    log "  window not observed (too short?) - writing c2 anyway, right into the upload"
 fi
-schreibe "$ARBEIT/c2.pdf"         # wartet selbst, bis das Medium wieder da ist
+schreibe "$ARBEIT/c2.pdf"         # waits by itself until the medium is back
 warte_ankunft "$ARBEIT/c1.pdf" 300
 warte_ankunft "$ARBEIT/c2.pdf" 300
 fi
 
 
-# ---- Szenario D: fuenf Jobs Schlag auf Schlag ----
-# So arbeitet der Drucker: ein Job = einhaengen, schreiben, auswerfen, und der
-# naechste sofort hinterher. Ist das Medium beim Einhaengen gerade weg, haette
-# der Drucker den Job abgewiesen - wir zaehlen das und lassen den Job ausfallen.
+# ---- Scenario D: five jobs back to back ----
+# This is how the printer works: one job = mount, write, eject, and the next one
+# right after. If the medium is gone at mount time, the printer would have
+# rejected the job - we count that and let the job drop out.
 VERPASST=0
 if [[ $SZENARIEN == *D* ]]; then
-log "Szenario D: fuenf Jobs Schlag auf Schlag, je eigenes Einhaengen, Druckernamen"
+log "Scenario D: five jobs back to back, each with its own mount, printer names"
 for i in 1 2 3 4 5; do
     mach_pdf "$ARBEIT/d$i.pdf" $((250000 + i * 50000))
     name="[Untitled].pdf"; [ $i -gt 1 ] && name="[Untitled]_$(date +%Y%m%d%H%M%S)0$i.pdf"
     partprobe "$BLOCK" 2>/dev/null
     if [ -b "$DEV" ] && mount -t vfat "$DEV" "$MNT" 2>/dev/null; then
-        cp "$ARBEIT/d$i.pdf" "$MNT/$name"; sync; umount "$MNT" || fail "umount Job $i"
-        log "  Job $i geschrieben als $name"
+        cp "$ARBEIT/d$i.pdf" "$MNT/$name"; sync; umount "$MNT" || fail "umount job $i"
+        log "  job $i written as $name"
         GESCHRIEBEN=$((GESCHRIEBEN + 1))
     else
         VERPASST=$((VERPASST + 1))
-        log "  Job $i: Medium nicht da - der Drucker haette den Job abgewiesen"
+        log "  job $i: medium not there - the printer would have rejected the job"
         rm -f "$ARBEIT/d$i.pdf"
         warte_medium da 60 >/dev/null
     fi
 done
 for i in 1 2 3 4 5; do [ -f "$ARBEIT/d$i.pdf" ] && warte_ankunft "$ARBEIT/d$i.pdf" 300; done
-log "  Szenario D: $VERPASST von 5 Jobs haette der Drucker abgewiesen"
+log "  Scenario D: $VERPASST of 5 jobs would have been rejected by the printer"
 fi
 
-# ---- Szenario W: gleiche Groesse, gleicher Startblock, neuer Inhalt ----
-# Nach dem Aufraeumen ist die Karte leer, der naechste Scan landet auf demselben
-# Startblock wie der vorige - und zweimal dasselbe Blatt hat dieselbe Groesse.
-# Der Stick darf das nicht fuer die Wiederkehr der alten Datei halten.
+# ---- Scenario W: same size, same start block, new content ----
+# After the cleanup the card is empty, the next scan lands on the same start
+# block as the previous one - and the same sheet twice has the same size.
+# The stick must not take that for the return of the old file.
 if [[ $SZENARIEN == *W* ]]; then
-log "Szenario W: zweimal 300 kB nacheinander, dazwischen aufgeraeumt"
+log "Scenario W: twice 300 kB in a row, cleanup in between"
 mach_pdf "$ARBEIT/w1.pdf" 300000
 schreibe "$ARBEIT/w1.pdf"
 warte_ankunft "$ARBEIT/w1.pdf" 180
 sleep 8
 "${CURL[@]}" -X POST "$STICK/aufraeumen" >/dev/null
 sleep 6
-mach_pdf "$ARBEIT/w2.pdf" 300000                # gleiche Groesse, anderer Inhalt
+mach_pdf "$ARBEIT/w2.pdf" 300000                # same size, different content
 schreibe "$ARBEIT/w2.pdf"
 warte_ankunft "$ARBEIT/w2.pdf" 180
-# und denselben Inhalt noch einmal: der Stick sieht eine neue Datei (anderer
-# Startblock), der Empfaenger muss sie an der Kennung als Wiederholung erkennen
+# and the same content once more: the stick sees a new file (different start
+# block), the receiver must recognize it as a repeat by its identifier
 sleep 8
 cp "$ARBEIT/w2.pdf" "$ARBEIT/w3.pdf"
 warte_medium da 60 >/dev/null
 mount -t vfat "$DEV" "$MNT" && cp "$ARBEIT/w3.pdf" "$MNT/w3.pdf" && sync && umount "$MNT"
-log "  geschrieben: w3.pdf (Kopie von w2, zaehlt nicht als neu)"
-t=0; while [ $t -lt 120 ] && ! grep -q "schon empfangen" "$ARBEIT/empfaenger.log"; do sleep 2; t=$((t + 2)); done
-if grep -q "schon empfangen" "$ARBEIT/empfaenger.log"; then log "  Empfaenger hat w3 als Wiederholung erkannt (nach ${t}s)"
-else fail "w3 wurde nicht als Wiederholung erkannt"; fi
-[ "$(ls "$INBOX"/w*.pdf 2>/dev/null | wc -l)" -le 2 ] || fail "w3 wurde trotzdem abgelegt"
+log "  written: w3.pdf (copy of w2, does not count as new)"
+t=0; while [ $t -lt 120 ] && ! grep -q "already received" "$ARBEIT/empfaenger.log"; do sleep 2; t=$((t + 2)); done
+if grep -q "already received" "$ARBEIT/empfaenger.log"; then log "  receiver recognized w3 as a repeat (after ${t}s)"
+else fail "w3 was not recognized as a repeat"; fi
+[ "$(ls "$INBOX"/w*.pdf 2>/dev/null | wc -l)" -le 2 ] || fail "w3 was stored anyway"
 fi
 
-# ---- Szenario E: beschaedigte Karte heilen ----
-# Der Drucker hinterlaesst nach abgebrochenen Jobs und zurueckgeschriebenen
-# Verzeichnissen Kreuzverkettungen, verwaiste Cluster und die Schmutzmarke -
-# und lehnt so eine Karte irgendwann ab. Wir richten genau das an, lassen den
-# Stick aufraeumen und pruefen mit fsck, ob die Karte danach sauber ist.
+# ---- Scenario E: heal a damaged card ----
+# After aborted jobs and written-back directories the printer leaves behind
+# cross-links, orphaned clusters and the dirty flag - and at some point rejects
+# such a card. We create exactly that, let the stick clean up and check with
+# fsck whether the card is clean afterwards.
 if [[ $SZENARIEN == *E* ]]; then
-log "Szenario E: Karte beschaedigen (Kreuzverkettung, Waise, Schmutzmarke) und heilen lassen"
+log "Scenario E: damage the card (cross-link, orphan, dirty flag) and let it heal"
 mach_pdf "$ARBEIT/e1.pdf" 120000
 mach_pdf "$ARBEIT/e2.pdf" 90000
 schreibe "$ARBEIT/e1.pdf" "$ARBEIT/e2.pdf"
@@ -296,45 +296,45 @@ for i in range(0, len(d), 32):
     st = (struct.unpack_from("<H", e, 20)[0] << 16) | struct.unpack_from("<H", e, 26)[0]
     starts[name] = (i, st)
 i1, s1 = starts["E1      PDF"]; i2, s2 = starts["E2      PDF"]
-# 1. Kreuzverkettung mitten in der Kette: e2 laeuft nach dem ersten Cluster in e1 hinein
-#    (die Geisterjagd sieht nur gleiche Startcluster, das hier findet erst die Selbstpruefung)
+# 1. cross-link in the middle of the chain: after its first cluster e2 runs into e1
+#    (the ghost hunt only sees equal start clusters, this one the self-check finds)
 fat_set(s2, s1)
-# 2. Waise: eine Kette, die niemandem gehoert
+# 2. orphan: a chain that belongs to nobody
 w = max(s1, s2) + 40
 fat_set(w, 0x0FFFFFFF); fat_set(w + 1, 0x0FFFFFFF)
-# 3. Schmutzmarke
+# 3. dirty flag
 fat_set(1, fat_get(1) & ~0x08000000)
 f.flush(); f.close()
-print("  angerichtet: Kette von e2 (Cluster %d) laeuft in e1 (Cluster %d), Waisen %d+%d, Schmutzmarke" % (s2, s1, w, w + 1))
+print("  created: chain of e2 (cluster %d) runs into e1 (cluster %d), orphans %d+%d, dirty flag" % (s2, s1, w, w + 1))
 PY
 sync
-fsck.fat -n "$DEV" 2>&1 | grep -qE "share clusters|not marked|dirty" && log "  fsck sieht den Schaden" || fail "Schaden nicht angerichtet?"
-sleep 12                                   # der Stick sieht die Schreibzugriffe, findet nichts Neues
+fsck.fat -n "$DEV" 2>&1 | grep -qE "share clusters|not marked|dirty" && log "  fsck sees the damage" || fail "damage not created?"
+sleep 12                                   # the stick sees the writes, finds nothing new
 "${CURL[@]}" -X POST "$STICK/aufraeumen" >/dev/null
 sleep 6
 warte_medium da 60 >/dev/null
-BEFUND=$("${CURL[@]}" "$STICK/log" | sed -e 's/<[^>]*>/\n/g' | grep '\[karte\] im Aufraeumfenster' | tail -1)
+BEFUND=$("${CURL[@]}" "$STICK/log" | sed -e 's/<[^>]*>/\n/g' | grep '\[karte\] in the cleanup window' | tail -1)
 log "  Stick: ${BEFUND#* }"
-printf '%s' "$BEFUND" | grep -q "Kreuzverkettung" || fail "Stick hat die Kreuzverkettung nicht gemeldet"
-printf '%s' "$BEFUND" | grep -q "verwaiste"       || fail "Stick hat die Waisen nicht gemeldet"
-printf '%s' "$BEFUND" | grep -q "Schmutzmarke"    || fail "Stick hat die Schmutzmarke nicht gemeldet"
+printf '%s' "$BEFUND" | grep -q "cross-link" || fail "stick did not report the cross-link"
+printf '%s' "$BEFUND" | grep -q "orphaned"   || fail "stick did not report the orphans"
+printf '%s' "$BEFUND" | grep -q "dirty flag" || fail "stick did not report the dirty flag"
 if fsck.fat -n "$DEV" >"$ARBEIT/fsck.txt" 2>&1 && ! grep -qE "share clusters|not marked|dirty|Truncat" "$ARBEIT/fsck.txt"; then
-    log "  fsck danach: sauber"
+    log "  fsck afterwards: clean"
 else
-    fail "fsck findet nach dem Heilen noch Schaeden (siehe $ARBEIT/fsck.txt)"
+    fail "fsck still finds damage after the healing (see $ARBEIT/fsck.txt)"
 fi
 fi
 
-# ---- Bilanz ----
+# ---- Summary ----
 ANGEKOMMEN=$(ls "$INBOX"/*.pdf 2>/dev/null | wc -l)
-ABGELEHNT=$(grep -c ABGELEHNT "$ARBEIT/empfaenger.log" || true)
-DUPLIKATE=$(grep -c "schon empfangen" "$ARBEIT/empfaenger.log" || true)
-log "Bilanz: $GESCHRIEBEN geschrieben, $ANGEKOMMEN angekommen, $DUPLIKATE Duplikate verworfen, $ABGELEHNT abgelehnt, $VERPASST Jobs bei fehlendem Medium"
-[ "$ANGEKOMMEN" -eq "$GESCHRIEBEN" ] || fail "Anzahl stimmt nicht"
-[ "$ABGELEHNT" -eq 0 ] || fail "Empfaenger hat unvollstaendige Uploads abgelehnt"
+ABGELEHNT=$(grep -c REJECTED "$ARBEIT/empfaenger.log" || true)
+DUPLIKATE=$(grep -c "already received" "$ARBEIT/empfaenger.log" || true)
+log "Summary: $GESCHRIEBEN written, $ANGEKOMMEN arrived, $DUPLIKATE duplicates discarded, $ABGELEHNT rejected, $VERPASST jobs with missing medium"
+[ "$ANGEKOMMEN" -eq "$GESCHRIEBEN" ] || fail "count does not match"
+[ "$ABGELEHNT" -eq 0 ] || fail "receiver rejected incomplete uploads"
 
-warte_medium da 120 || fail "Medium am Ende nicht zurueck"
+warte_medium da 120 || fail "medium not back at the end"
 
-if [ "$FEHLER" -eq 0 ]; then log "ERGEBNIS: alles bestanden"; exit 0; fi
-log "ERGEBNIS: $FEHLER Fehler"
+if [ "$FEHLER" -eq 0 ]; then log "RESULT: all passed"; exit 0; fi
+log "RESULT: $FEHLER errors"
 exit 1
