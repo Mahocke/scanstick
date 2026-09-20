@@ -7,7 +7,8 @@
 # ob jede Datei vollstaendig und genau einmal ankommt.
 #
 #   sudo test/stresstest.sh [Stick-Adresse] [Partition]
-#     Stick-Adresse  http://scanstick.local  (Vorgabe)
+#     Stick-Adresse  http://scanstick-1a2b.local  (Vorgabe scanstick.local; besser den eigenen Namen oder die IP,
+#                    mit zwei Sticks im Netz trifft der Name sonst den falschen)
 #     Partition      /dev/sda1               (Vorgabe)
 #
 #   Umgebung: SCAN_WEBPASS=...  Passwort der Weboberflaeche (Benutzer scan)
@@ -27,7 +28,8 @@
 #      Namen des Druckers; zaehlt, wie oft das Medium gerade weg war - genau
 #      diese Jobs haette ein Drucker abgewiesen
 #   W  (nur auf Wunsch) zweimal dieselbe Groesse nacheinander, dazwischen
-#      aufgeraeumt: gleicher Startblock, neuer Inhalt - muss ankommen
+#      aufgeraeumt: gleicher Startblock, neuer Inhalt - muss ankommen; danach
+#      derselbe Inhalt noch einmal - der Empfaenger muss ihn als Wiederholung sehen
 #   E  (nur auf Wunsch) Karte absichtlich beschaedigen - Kette laeuft in eine
 #      andere, verwaiste Cluster, Schmutzmarke - und den Stick heilen lassen;
 #      fsck muss danach sauber sein
@@ -244,6 +246,17 @@ sleep 6
 mach_pdf "$ARBEIT/w2.pdf" 300000                # gleiche Groesse, anderer Inhalt
 schreibe "$ARBEIT/w2.pdf"
 warte_ankunft "$ARBEIT/w2.pdf" 180
+# und denselben Inhalt noch einmal: der Stick sieht eine neue Datei (anderer
+# Startblock), der Empfaenger muss sie an der Kennung als Wiederholung erkennen
+sleep 8
+cp "$ARBEIT/w2.pdf" "$ARBEIT/w3.pdf"
+warte_medium da 60 >/dev/null
+mount -t vfat "$DEV" "$MNT" && cp "$ARBEIT/w3.pdf" "$MNT/w3.pdf" && sync && umount "$MNT"
+log "  geschrieben: w3.pdf (Kopie von w2, zaehlt nicht als neu)"
+t=0; while [ $t -lt 120 ] && ! grep -q "schon empfangen" "$ARBEIT/empfaenger.log"; do sleep 2; t=$((t + 2)); done
+if grep -q "schon empfangen" "$ARBEIT/empfaenger.log"; then log "  Empfaenger hat w3 als Wiederholung erkannt (nach ${t}s)"
+else fail "w3 wurde nicht als Wiederholung erkannt"; fi
+[ "$(ls "$INBOX"/w*.pdf 2>/dev/null | wc -l)" -le 2 ] || fail "w3 wurde trotzdem abgelegt"
 fi
 
 # ---- Szenario E: beschaedigte Karte heilen ----

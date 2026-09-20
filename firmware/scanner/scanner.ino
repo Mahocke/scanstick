@@ -11,7 +11,7 @@
  * Zugangsdaten kommen NICHT in den Code, sondern aus /wifi.cfg auf der SD-Karte:
  *   ssid=...
  *   pass=...
- *   endpoint=http://192.168.1.50:8080/scan
+ *   endpoint=http://192.168.1.50:8080/scan      (Beispiel - die Adresse des eigenen Empfaengers)
  *
  * Board: ESP32S3 Dev Module, USB Mode = USB-OTG (TinyUSB), USB CDC on Boot = Enabled
  */
@@ -360,7 +360,7 @@ static volatile uint32_t g_bytesGeschrieben = 0;   // seit dem letzten Verarbeit
 static uint32_t g_naechsterVersuch = 0;   // 0 = sofort faellig
 static int      g_versuche         = 0;
 
-#define FW_VERSION "v33"
+#define FW_VERSION "v38"
 
 String cfgEndpoint;
 // Bekannte WLAN-Netze - mehrere, damit derselbe Stick an verschiedenen Standorten
@@ -370,6 +370,17 @@ String cfgEndpoint;
 static String    cfgNetzSsid[MAX_NETZE], cfgNetzPass[MAX_NETZE];
 static int       cfgNetze = 0;
 static WiFiMulti g_wifiMulti;
+// Geraetename mit den letzten vier Stellen der Funkadresse: zwei Sticks im selben
+// Netz hiessen sonst beide scanstick.local, und der Pruefstand sprach am 20.09.2026
+// prompt mit dem falschen. Der Name steht im Protokoll und auf der Statusseite.
+static String geraeteName()
+{
+    uint8_t mac[6];
+    WiFi.macAddress(mac);
+    char t[24];
+    snprintf(t, sizeof t, "scanstick-%02x%02x", mac[4], mac[5]);
+    return String(t);
+}
 String cfgWebPass;   // Schutz der Weboberflaeche; leer = offen
 String cfgPraefix = "scan";   // Namensanfang der Dateien, z.B. "buero-774"
 String cfgSchluessel;         // Geraeteschluessel: signiert jeden Upload; leer = ohne
@@ -379,6 +390,28 @@ static bool g_startGeprueft = false;   // nach dem Hochlaufen einmal nachsehen
 
 static WebServer  g_web(80);
 static Preferences g_nvs;
+
+// Ein Riegel fuer ALLE rohen Kartenzugriffe, aus dem USB-Task wie aus der
+// Hauptschleife. Der Kartentreiber schuetzt nur einzelne Kommandos; ein
+// Schreibvorgang besteht aber aus Daten UND dem Warten, bis die Karte fertig
+// ist. Schiebt sich dazwischen ein Lesen der Hauptschleife (Verzeichnis,
+// Endmarke, Upload), kann der Zugriff des Hosts scheitern - fuer den 780 ein
+// Medienfehler (44.12.05), worauf er dem Port den Strom nimmt.
+static SemaphoreHandle_t g_sdRiegel = nullptr;
+static bool sdLesen(uint8_t *b, uint32_t sektor)
+{
+    if (g_sdRiegel) xSemaphoreTake(g_sdRiegel, portMAX_DELAY);
+    bool ok = SD_MMC.readRAW(b, sektor);
+    if (g_sdRiegel) xSemaphoreGive(g_sdRiegel);
+    return ok;
+}
+static bool sdSchreiben(uint8_t *b, uint32_t sektor)
+{
+    if (g_sdRiegel) xSemaphoreTake(g_sdRiegel, portMAX_DELAY);
+    bool ok = SD_MMC.writeRAW(b, sektor);
+    if (g_sdRiegel) xSemaphoreGive(g_sdRiegel);
+    return ok;
+}
 static bool       g_webAn = false;
 static bool       g_updateBegonnen = false;   // Update.begin() ist tatsaechlich gelaufen
 
@@ -403,22 +436,25 @@ static volatile int      g_spurIdx = 0;
 static volatile uint32_t g_usbFehlerLesen = 0, g_usbFehlerSchreiben = 0;
 static volatile uint32_t g_usbFehlerLba = 0, g_usbFehlerZeit = 0;
 static uint32_t          g_usbFehlerGemeldet = 0;
+static volatile bool     g_usbFehlerNeu = false;
+static String            g_usbFehlerAlt;   // Befund aus dem Flash: was vor dem letzten Neustart passierte
 static void logZeile(const String &msg);     // steht weiter unten
 static bool remount();                       // ebenfalls
+static void geloeschtMerken(const Fertig &f); // ebenfalls
 static void logFlushNetz();                  // ebenfalls
 
 static int32_t onWrite(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize)
 {
     // Rueckgabe 0 heisst fuer TinyUSB "beschaeftigt, gleich nochmal" - bei einem
     // echten Kartenfehler haengt der Host damit endlos. Negativ = sauberer Fehler.
-    if (g_sdGesperrt) { g_usbFehlerSchreiben++; g_usbFehlerLba = lba; g_usbFehlerZeit = millis(); g_lastHost = millis(); return -1; }
+    if (g_sdGesperrt) { g_usbFehlerSchreiben++; g_usbFehlerLba = lba; g_usbFehlerZeit = millis(); g_usbFehlerNeu = true; g_lastHost = millis(); return -1; }
     g_usbZugriffe++;
     int32_t ergebnis = -1;
     uint32_t sec = SD_MMC.sectorSize();
     if (sec) {
         ergebnis = bufsize;
         for (uint32_t x = 0; x < bufsize / sec; x++) {
-            if (g_sdGesperrt || !SD_MMC.writeRAW(buffer + sec * x, lba + x)) { ergebnis = -1; break; }
+            if (g_sdGesperrt || !sdSchreiben(buffer + sec * x, lba + x)) { ergebnis = -1; break; }
         }
     }
     if (ergebnis > 0) {
@@ -429,7 +465,7 @@ static int32_t onWrite(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t 
         g_spurLba[i] = lba; g_spurN[i] = bufsize / (sec ? sec : 512); g_spurT[i] = millis();
         g_spurIdx = (i + 1) % SPUR_ANZAHL;
     }
-    if (ergebnis < 0) { g_usbFehlerSchreiben++; g_usbFehlerLba = lba; g_usbFehlerZeit = millis(); }
+    if (ergebnis < 0) { g_usbFehlerSchreiben++; g_usbFehlerLba = lba; g_usbFehlerZeit = millis(); g_usbFehlerNeu = true; }
     g_lastHost = millis();
     g_usbZugriffe--;
     return ergebnis;
@@ -437,17 +473,17 @@ static int32_t onWrite(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t 
 
 static int32_t onRead(uint32_t lba, uint32_t offset, void *buffer, uint32_t bufsize)
 {
-    if (g_sdGesperrt) { g_usbFehlerLesen++; g_usbFehlerLba = lba; g_usbFehlerZeit = millis(); g_lastHost = millis(); return -1; }
+    if (g_sdGesperrt) { g_usbFehlerLesen++; g_usbFehlerLba = lba; g_usbFehlerZeit = millis(); g_usbFehlerNeu = true; g_lastHost = millis(); return -1; }
     g_usbZugriffe++;
     int32_t ergebnis = -1;
     uint32_t sec = SD_MMC.sectorSize();
     if (sec) {
         ergebnis = bufsize;
         for (uint32_t x = 0; x < bufsize / sec; x++) {
-            if (g_sdGesperrt || !SD_MMC.readRAW((uint8_t *)buffer + x * sec, lba + x)) { ergebnis = -1; break; }
+            if (g_sdGesperrt || !sdLesen((uint8_t *)buffer + x * sec, lba + x)) { ergebnis = -1; break; }
         }
     }
-    if (ergebnis < 0) { g_usbFehlerLesen++; g_usbFehlerLba = lba; g_usbFehlerZeit = millis(); }
+    if (ergebnis < 0) { g_usbFehlerLesen++; g_usbFehlerLba = lba; g_usbFehlerZeit = millis(); g_usbFehlerNeu = true; }
     g_lastHost = millis();
     g_usbZugriffe--;
     return ergebnis;
@@ -580,10 +616,10 @@ static void fixMbrTyp()
 {
     uint8_t *s = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
     if (!s) return;
-    if (SD_MMC.readRAW(s, 0) && s[510] == 0x55 && s[511] == 0xAA) {
+    if (sdLesen(s, 0) && s[510] == 0x55 && s[511] == 0xAA) {
         if (s[446 + 4] == 0x07) {
             s[446 + 4] = 0x0C;
-            if (SD_MMC.writeRAW(s, 0)) Serial.println("[mbr] Typ 0x07 -> 0x0C korrigiert");
+            if (sdSchreiben(s, 0)) Serial.println("[mbr] Typ 0x07 -> 0x0C korrigiert");
         }
     }
     free(s);
@@ -652,11 +688,11 @@ static void fatLageLesen()
     if (!s) return;
 
     uint32_t partStart = 0, partSektoren = 0;
-    if (SD_MMC.readRAW(s, 0) && s[510] == 0x55 && s[511] == 0xAA) {
+    if (sdLesen(s, 0) && s[510] == 0x55 && s[511] == 0xAA) {
         partStart    = le32(s + 446 + 8);       // Startsektor der ersten Partition
         partSektoren = le32(s + 446 + 12);
     }
-    if (!SD_MMC.readRAW(s, partStart)) { free(s); return; }
+    if (!sdLesen(s, partStart)) { free(s); return; }
 
     uint16_t bytesProSektor = (uint16_t)s[11] | ((uint16_t)s[12] << 8);
     uint8_t  spc            = s[13];
@@ -692,7 +728,7 @@ static uint32_t clusterSektor(uint32_t c)
 static uint32_t fatNaechster(uint32_t c, uint8_t *puffer)
 {
     uint32_t versatz = c * 4;
-    if (!SD_MMC.readRAW(puffer, g_fat.fatStart + versatz / 512)) return 0x0FFFFFFF;
+    if (!sdLesen(puffer, g_fat.fatStart + versatz / 512)) return 0x0FFFFFFF;
     return le32(puffer + (versatz % 512)) & 0x0FFFFFFF;
 }
 
@@ -713,7 +749,7 @@ static bool rohVerzeichnis(int &anzahl, uint32_t &summe)
     uint32_t cl = g_fat.rootCluster;
     for (int schutz = 0; !fertig && cl >= 2 && cl < 0x0FFFFFF8 && schutz < 128; schutz++) {
         for (uint8_t i = 0; i < g_fat.sektorenProCluster && !fertig; i++) {
-            if (!SD_MMC.readRAW(sek, clusterSektor(cl) + i)) { fertig = true; break; }
+            if (!sdLesen(sek, clusterSektor(cl) + i)) { fertig = true; break; }
             for (int e = 0; e < 512; e += 32) {
                 uint8_t *d = sek + e;
                 if (d[0] == 0x00) { fertig = true; break; }   // Ende des Verzeichnisses
@@ -768,7 +804,7 @@ static bool rohEintragLoeschenIn(uint32_t dirCluster, const String &name, uint32
     for (int schutz = 0; !fertig && !getroffen && cl >= 2 && cl < 0x0FFFFFF8 && schutz < 128; schutz++) {
         for (uint8_t i = 0; i < g_fat.sektorenProCluster && !fertig && !getroffen; i++) {
             uint32_t sektor = clusterSektor(cl) + i;
-            if (!SD_MMC.readRAW(sek, sektor)) { fertig = true; break; }
+            if (!sdLesen(sek, sektor)) { fertig = true; break; }
             for (int e = 0; e < 512 && !getroffen; e += 32) {
                 uint8_t *d = sek + e;
                 if (d[0] == 0x00) { fertig = true; break; }
@@ -794,12 +830,12 @@ static bool rohEintragLoeschenIn(uint32_t dirCluster, const String &name, uint32
                 if (!(d[11] & 0x18) && trifft && le32(d + 28) == groesse) {
                     d[0] = 0xE5;
                     for (int k = 0; k < lfnAnzahl; k++) if (lfnSektor[k] == sektor) sek[lfnOffset[k]] = 0xE5;
-                    getroffen = SD_MMC.writeRAW(sek, sektor);
+                    getroffen = sdSchreiben(sek, sektor);
                     for (int k = 0; k < lfnAnzahl && getroffen; k++) {   // Stuecke in frueheren Sektoren
                         if (lfnSektor[k] == sektor) continue;
-                        if (!SD_MMC.readRAW(sek, lfnSektor[k])) { getroffen = false; break; }
+                        if (!sdLesen(sek, lfnSektor[k])) { getroffen = false; break; }
                         for (int m = 0; m < lfnAnzahl; m++) if (lfnSektor[m] == lfnSektor[k]) sek[lfnOffset[m]] = 0xE5;
-                        if (!SD_MMC.writeRAW(sek, lfnSektor[k])) getroffen = false;
+                        if (!sdSchreiben(sek, lfnSektor[k])) getroffen = false;
                         sektor = lfnSektor[k];   // diese Gruppe ist erledigt
                     }
                     break;
@@ -829,7 +865,7 @@ static uint32_t rohOrdnerCluster(const char *name83)
     uint32_t cl = g_fat.rootCluster;
     for (int schutz = 0; !fertig && !ergebnis && cl >= 2 && cl < 0x0FFFFFF8 && schutz < 128; schutz++) {
         for (uint8_t i = 0; i < g_fat.sektorenProCluster && !fertig && !ergebnis; i++) {
-            if (!SD_MMC.readRAW(sek, clusterSektor(cl) + i)) { fertig = true; break; }
+            if (!sdLesen(sek, clusterSektor(cl) + i)) { fertig = true; break; }
             for (int e = 0; e < 512; e += 32) {
                 uint8_t *d = sek + e;
                 if (d[0] == 0x00) { fertig = true; break; }
@@ -858,7 +894,7 @@ static int rohEintraege(uint32_t dirCluster, uint32_t *starts, uint32_t *groesse
     uint32_t cl = dirCluster ? dirCluster : g_fat.rootCluster;
     for (int schutz = 0; !fertig && n < max && cl >= 2 && cl < 0x0FFFFFF8 && schutz < 128; schutz++) {
         for (uint8_t i = 0; i < g_fat.sektorenProCluster && !fertig && n < max; i++) {
-            if (!SD_MMC.readRAW(sek, clusterSektor(cl) + i)) { fertig = true; break; }
+            if (!sdLesen(sek, clusterSektor(cl) + i)) { fertig = true; break; }
             for (int e = 0; e < 512 && n < max; e += 32) {
                 uint8_t *d = sek + e;
                 if (d[0] == 0x00) { fertig = true; break; }
@@ -942,7 +978,7 @@ static int rohListe(uint32_t dirCluster, RohEintrag *liste, int max, bool nurSca
     uint32_t cl = dirCluster ? dirCluster : g_fat.rootCluster;
     for (int schutz = 0; !fertig && cl >= 2 && cl < 0x0FFFFFF8 && schutz < 128; schutz++) {
         for (uint8_t i = 0; i < g_fat.sektorenProCluster && !fertig; i++) {
-            if (!SD_MMC.readRAW(sek, clusterSektor(cl) + i)) { fertig = true; break; }
+            if (!sdLesen(sek, clusterSektor(cl) + i)) { fertig = true; break; }
             for (int e = 0; e < 512; e += 32) {
                 uint8_t *d = sek + e;
                 if (d[0] == 0x00) { fertig = true; break; }
@@ -1009,7 +1045,7 @@ static bool rohVollstaendig(const RohEintrag &e)
     uint32_t letzter = (e.groesse - 1) / 512;
     for (uint32_t idx = letzter >= 1 ? letzter - 1 : 0; idx <= letzter; idx++) {
         uint32_t sk = rohSektor(e.start, idx, fatBuf);
-        if (!sk || !SD_MMC.readRAW(sek, sk)) { len = 0; break; }
+        if (!sk || !sdLesen(sek, sk)) { len = 0; break; }
         uint32_t im = (idx == letzter) ? ((e.groesse - 1) % 512 + 1) : 512;
         memcpy(puffer + len, sek, im);
         len += im;
@@ -1028,20 +1064,20 @@ static uint32_t rohKennzahl(const RohEintrag &e)
     if (!sek || !fatBuf) { if (sek) free(sek); if (fatBuf) free(fatBuf); return 0; }
     uint32_t summe = e.groesse;
     uint32_t sk = rohSektor(e.start, 0, fatBuf);
-    if (sk && SD_MMC.readRAW(sek, sk)) {
+    if (sk && sdLesen(sek, sk)) {
         uint32_t n = e.groesse < 256 ? e.groesse : 256;
         for (uint32_t i = 0; i < n; i++) summe = summe * 31u + sek[i];
     }
     if (e.groesse > 512) {
         sk = rohSektor(e.start, (e.groesse - 1) / 512, fatBuf);
-        if (sk && SD_MMC.readRAW(sek, sk)) {
+        if (sk && sdLesen(sek, sk)) {
             uint32_t im = (e.groesse - 1) % 512 + 1;
             for (uint32_t i = im > 256 ? im - 256 : 0; i < im; i++) summe = summe * 31u + sek[i];
         }
     }
     if (e.groesse > 2048) {                         // und ein Stueck aus der Mitte (Bilddaten)
         sk = rohSektor(e.start, e.groesse / 1024, fatBuf);
-        if (sk && SD_MMC.readRAW(sek, sk))
+        if (sk && sdLesen(sek, sk))
             for (uint32_t i = 0; i < 256; i++) summe = summe * 31u + sek[i];
     }
     free(sek);
@@ -1066,7 +1102,7 @@ struct RohLeser {
         size_t gelesen = 0;
         while (gelesen + 512 <= n && pos < groesse) {
             if (cluster < 2 || cluster >= 0x0FFFFFF8) return gelesen ? (int)gelesen : -1;
-            if (!SD_MMC.readRAW(sek, clusterSektor(cluster) + idx)) return -1;
+            if (!sdLesen(sek, clusterSektor(cluster) + idx)) return -1;
             size_t k = groesse - pos < 512 ? groesse - pos : 512;
             memcpy(ziel + gelesen, sek, k);
             gelesen += k;
@@ -1141,7 +1177,16 @@ static bool istGeloeschtE(const RohEintrag &e)
 
 static void fertigMerken(const RohEintrag &e, uint32_t kennzahl, const String &sendeName)
 {
-    if (fertigIndex(e.start, e.groesse) >= 0) return;
+    int alt = fertigIndex(e.start, e.groesse);
+    if (alt >= 0 && g_fertig[alt].kennzahl == kennzahl) return;
+    if (alt >= 0) {
+        // Gleicher Startblock, gleiche Groesse, anderer Inhalt: der Eintrag gehoert
+        // jetzt der neuen Datei. Bliebe die alte Kennzahl stehen, gaelte die neue
+        // Datei bei jedem Blick wieder als neu und wuerde endlos hochgeladen.
+        geloeschtMerken(g_fertig[alt]);
+        memmove(g_fertig + alt, g_fertig + alt + 1, (g_fertigAnzahl - alt - 1) * sizeof(Fertig));
+        g_fertigAnzahl--;
+    }
     if (g_fertigAnzahl >= MAX_FERTIG) { memmove(g_fertig, g_fertig + 1, (MAX_FERTIG - 1) * sizeof(Fertig)); g_fertigAnzahl = MAX_FERTIG - 1; }
     Fertig &f = g_fertig[g_fertigAnzahl++];
     f.start = e.start; f.groesse = e.groesse; f.kennzahl = kennzahl;
@@ -1209,11 +1254,11 @@ static inline void bitLoeschen(uint8_t *bits, uint32_t c) { bits[c >> 3] &= ~(1 
 static bool fatSetzen(uint32_t c, uint32_t wert, uint8_t *fatBuf)
 {
     uint32_t versatz = c * 4, sek = versatz / 512, off = versatz % 512;
-    if (!SD_MMC.readRAW(fatBuf, g_fat.fatStart + sek)) return false;
+    if (!sdLesen(fatBuf, g_fat.fatStart + sek)) return false;
     fatBuf[off] = wert & 0xFF; fatBuf[off + 1] = (wert >> 8) & 0xFF; fatBuf[off + 2] = (wert >> 16) & 0xFF;
     fatBuf[off + 3] = (fatBuf[off + 3] & 0xF0) | ((wert >> 24) & 0x0F);
-    bool ok = SD_MMC.writeRAW(fatBuf, g_fat.fatStart + sek);
-    if (ok && g_fat.anzahlFats > 1) ok = SD_MMC.writeRAW(fatBuf, g_fat.fatStart + g_fat.fatSektoren + sek);
+    bool ok = sdSchreiben(fatBuf, g_fat.fatStart + sek);
+    if (ok && g_fat.anzahlFats > 1) ok = sdSchreiben(fatBuf, g_fat.fatStart + g_fat.fatSektoren + sek);
     return ok;
 }
 
@@ -1267,11 +1312,11 @@ static bool pruefeVerzeichnis(uint32_t dirCluster, int tiefe, uint8_t *bits, uin
     for (int schutz = 0; cl >= 2 && cl < 0x0FFFFFF8 && schutz < 1024; schutz++) {
         for (uint8_t i = 0; i < g_fat.sektorenProCluster; i++) {
             uint32_t sektor = clusterSektor(cl) + i;
-            if (!SD_MMC.readRAW(sek, sektor)) return false;
+            if (!sdLesen(sek, sektor)) return false;
             bool geaendert = false;
             for (int e = 0; e < 512; e += 32) {
                 uint8_t *d = sek + e;
-                if (d[0] == 0x00) { if (geaendert) SD_MMC.writeRAW(sek, sektor); return true; }
+                if (d[0] == 0x00) { if (geaendert) sdSchreiben(sek, sektor); return true; }
                 if (d[0] == 0xE5) { lfnN = 0; continue; }
                 if (d[11] == 0x0F) { if (lfnN < 20) { lfnSektor[lfnN] = sektor; lfnOffset[lfnN] = e; lfnN++; } continue; }
                 if ((d[11] & 0x08) || d[0] == '.') { lfnN = 0; continue; }   // Datentraegername, . und ..
@@ -1290,9 +1335,9 @@ static bool pruefeVerzeichnis(uint32_t dirCluster, int tiefe, uint8_t *bits, uin
                             if (lfnSektor[k] == sektor) { sek[lfnOffset[k]] = 0xE5; continue; }
                             bool schon = false;
                             for (int m = 0; m < k; m++) if (lfnSektor[m] == lfnSektor[k]) schon = true;
-                            if (schon || !SD_MMC.readRAW(fatBuf, lfnSektor[k])) continue;
+                            if (schon || !sdLesen(fatBuf, lfnSektor[k])) continue;
                             for (int m = 0; m < lfnN; m++) if (lfnSektor[m] == lfnSektor[k]) fatBuf[lfnOffset[m]] = 0xE5;
-                            SD_MMC.writeRAW(fatBuf, lfnSektor[k]);
+                            sdSchreiben(fatBuf, lfnSektor[k]);
                         }
                         geaendert = true;
                         b.geaendert = true;
@@ -1309,14 +1354,14 @@ static bool pruefeVerzeichnis(uint32_t dirCluster, int tiefe, uint8_t *bits, uin
                         }
                     }
                     if (istOrdner) {
-                        if (geaendert) { SD_MMC.writeRAW(sek, sektor); geaendert = false; }
+                        if (geaendert) { sdSchreiben(sek, sektor); geaendert = false; }
                         if (!pruefeVerzeichnis(start, tiefe + 1, bits, sek, fatBuf, heilen, b)) return false;
-                        if (!SD_MMC.readRAW(sek, sektor)) return false;
+                        if (!sdLesen(sek, sektor)) return false;
                     }
                 }
                 lfnN = 0;
             }
-            if (geaendert) SD_MMC.writeRAW(sek, sektor);
+            if (geaendert) sdSchreiben(sek, sektor);
         }
         cl = fatNaechster(cl, fatBuf);
     }
@@ -1371,10 +1416,10 @@ static void kartePruefen(bool heilen, const char *anlass)
     // 1. Beide Tabellen vergleichen - die erste gilt
     if (g_fat.anzahlFats > 1) {
         for (uint32_t x = 0; x < g_fat.fatSektoren; x++) {
-            if (!SD_MMC.readRAW(sek, g_fat.fatStart + x) || !SD_MMC.readRAW(fatBuf, g_fat.fatStart + g_fat.fatSektoren + x)) break;
+            if (!sdLesen(sek, g_fat.fatStart + x) || !sdLesen(fatBuf, g_fat.fatStart + g_fat.fatSektoren + x)) break;
             if (memcmp(sek, fatBuf, 512)) {
                 b.fatAbweichungen++;
-                if (heilen && SD_MMC.writeRAW(sek, g_fat.fatStart + g_fat.fatSektoren + x)) b.geaendert = true;
+                if (heilen && sdSchreiben(sek, g_fat.fatStart + g_fat.fatSektoren + x)) b.geaendert = true;
             }
         }
     }
@@ -1385,42 +1430,60 @@ static void kartePruefen(bool heilen, const char *anlass)
     if (kaputt) { b.gekuerzt++; if (heilen) b.geaendert = true; }
     if (!pruefeVerzeichnis(g_fat.rootCluster, 0, bits, sek, fatBuf, heilen, b)) b.heillos = true;
 
-    // 3. Verwaiste Cluster: belegt, aber von niemandem erreicht
+    // 3. Verwaiste Cluster: belegt, aber von niemandem erreicht. Nebenbei die
+    //    freien zaehlen - der Freizaehler im FSInfo-Sektor wird gleich mit gerichtet.
+    uint32_t frei = 0, ersterFrei = 0;
     if (!b.heillos) {
         for (uint32_t x = 0; x < g_fat.fatSektoren; x++) {
-            if (!SD_MMC.readRAW(sek, g_fat.fatStart + x)) break;
+            if (!sdLesen(sek, g_fat.fatStart + x)) break;
             bool geaendert = false;
             for (int j = 0; j < 128; j++) {
                 uint32_t c = x * 128 + j;
                 if (c < 2 || c >= g_fat.gesamtCluster + 2) continue;
-                if ((le32(sek + j * 4) & 0x0FFFFFFF) == 0 || bitDa(bits, c)) continue;
-                b.verwaist++;
-                if (heilen) { sek[j * 4] = 0; sek[j * 4 + 1] = 0; sek[j * 4 + 2] = 0; sek[j * 4 + 3] &= 0xF0; geaendert = true; }
+                bool belegt = (le32(sek + j * 4) & 0x0FFFFFFF) != 0;
+                if (belegt && !bitDa(bits, c)) {
+                    b.verwaist++;
+                    if (heilen) { sek[j * 4] = 0; sek[j * 4 + 1] = 0; sek[j * 4 + 2] = 0; sek[j * 4 + 3] &= 0xF0; geaendert = true; belegt = false; }
+                }
+                if (!belegt) { frei++; if (!ersterFrei) ersterFrei = c; }
             }
             if (geaendert) {
-                if (SD_MMC.writeRAW(sek, g_fat.fatStart + x)) b.geaendert = true;
-                if (g_fat.anzahlFats > 1) SD_MMC.writeRAW(sek, g_fat.fatStart + g_fat.fatSektoren + x);
+                if (sdSchreiben(sek, g_fat.fatStart + x)) b.geaendert = true;
+                if (g_fat.anzahlFats > 1) sdSchreiben(sek, g_fat.fatStart + g_fat.fatSektoren + x);
             }
         }
-        // Freizaehler im FSInfo-Sektor stimmt dann nicht mehr: als "unbekannt" markieren
-        if (b.verwaist && heilen && g_fat.fsInfoSektor && SD_MMC.readRAW(sek, g_fat.partStart + g_fat.fsInfoSektor) &&
-            le32(sek) == 0x41615252) {
-            memset(sek + 488, 0xFF, 8);
-            SD_MMC.writeRAW(sek, g_fat.partStart + g_fat.fsInfoSektor);
+        if (heilen && g_fat.fsInfoSektor && sdLesen(sek, g_fat.partStart + g_fat.fsInfoSektor) && le32(sek) == 0x41615252) {
+            if (le32(sek + 488) != frei) {
+                uint32_t v = frei;                  memcpy(sek + 488, &v, 4);
+                v = ersterFrei ? ersterFrei : 2;    memcpy(sek + 492, &v, 4);
+                sdSchreiben(sek, g_fat.partStart + g_fat.fsInfoSektor);
+            }
         }
     }
 
-    // 4. Schmutzmarke: Bit 27 "sauber ausgehaengt", Bit 26 "keine Fehler" im zweiten Eintrag
-    if (!b.heillos && SD_MMC.readRAW(sek, g_fat.fatStart)) {
+    // 4. Schmutzmarke, zweifach: Bit 27 "sauber ausgehaengt" und Bit 26 "keine
+    //    Fehler" im zweiten Tabelleneintrag (Windows), und Bit 0 im Byte 65 des
+    //    Bootsektors (Linux setzt es beim Einhaengen, loescht es beim Aushaengen;
+    //    faellt das Medium vorher weg, bleibt es stehen - fsck: "Dirty bit is set").
+    if (!b.heillos && sdLesen(sek, g_fat.fatStart)) {
         uint32_t v = le32(sek + 4);
         if ((v & 0x0C000000) != 0x0C000000) {
             b.schmutzig = true;
             if (heilen) {
                 v |= 0x0C000000;
                 sek[4] = v & 0xFF; sek[5] = (v >> 8) & 0xFF; sek[6] = (v >> 16) & 0xFF; sek[7] = (v >> 24) & 0xFF;
-                if (SD_MMC.writeRAW(sek, g_fat.fatStart)) b.geaendert = true;
-                if (g_fat.anzahlFats > 1) SD_MMC.writeRAW(sek, g_fat.fatStart + g_fat.fatSektoren);
+                if (sdSchreiben(sek, g_fat.fatStart)) b.geaendert = true;
+                if (g_fat.anzahlFats > 1) sdSchreiben(sek, g_fat.fatStart + g_fat.fatSektoren);
             }
+        }
+    }
+    if (!b.heillos && sdLesen(sek, g_fat.partStart) && (sek[65] & 0x01)) {
+        b.schmutzig = true;
+        if (heilen) {
+            sek[65] &= ~0x01;
+            if (sdSchreiben(sek, g_fat.partStart)) b.geaendert = true;
+            uint16_t sicherung = (uint16_t)sek[50] | ((uint16_t)sek[51] << 8);   // Sicherungskopie des Bootsektors
+            if (sicherung && sicherung < 32) sdSchreiben(sek, g_fat.partStart + sicherung);
         }
     }
 
@@ -1439,7 +1502,7 @@ static bool karteFormatieren(const char *anlass)
     uint8_t *s = (uint8_t *)heap_caps_malloc(512, MALLOC_CAP_DMA);
     if (!s) return false;
     uint32_t partStart = 0, partSektoren = 0;
-    if (SD_MMC.readRAW(s, 0) && s[510] == 0x55 && s[511] == 0xAA) {
+    if (sdLesen(s, 0) && s[510] == 0x55 && s[511] == 0xAA) {
         partStart = le32(s + 446 + 8); partSektoren = le32(s + 446 + 12);
     }
     uint32_t karte = SD_MMC.sectorSize() ? (uint32_t)(SD_MMC.cardSize() / SD_MMC.sectorSize()) : 0;
@@ -1457,13 +1520,13 @@ static bool karteFormatieren(const char *anlass)
     bool ok = true;
     // Tabellen leeren
     memset(s, 0, 512);
-    for (uint32_t x = 0; x < nfat * fatSek && ok; x++) ok = SD_MMC.writeRAW(s, partStart + rsv + x);
+    for (uint32_t x = 0; x < nfat * fatSek && ok; x++) ok = sdSchreiben(s, partStart + rsv + x);
     // Wurzel leeren (ein Cluster)
-    for (uint32_t x = 0; x < spc && ok; x++) ok = SD_MMC.writeRAW(s, partStart + rsv + nfat * fatSek + x);
+    for (uint32_t x = 0; x < spc && ok; x++) ok = sdSchreiben(s, partStart + rsv + nfat * fatSek + x);
     // Ersten Tabellensektor: Medienbyte, sauber-Marken, Wurzel-Ende
     const uint8_t kopf[12] = { 0xF8, 0xFF, 0xFF, 0x0F, 0xFF, 0xFF, 0xFF, 0x0F, 0xFF, 0xFF, 0xFF, 0x0F };
     memset(s, 0, 512); memcpy(s, kopf, 12);
-    for (int f = 0; f < nfat && ok; f++) ok = SD_MMC.writeRAW(s, partStart + rsv + f * fatSek);
+    for (int f = 0; f < nfat && ok; f++) ok = sdSchreiben(s, partStart + rsv + f * fatSek);
     // Bootsektor
     memset(s, 0, 512);
     const uint8_t bs[] = { 0xEB, 0x58, 0x90, 'M','S','W','I','N','4','.','1' };
@@ -1478,7 +1541,7 @@ static bool karteFormatieren(const char *anlass)
     v = esp_random();          memcpy(s + 67, &v, 4);
     memcpy(s + 71, "SCANS      ", 11); memcpy(s + 82, "FAT32   ", 8);
     s[510] = 0x55; s[511] = 0xAA;
-    if (ok) ok = SD_MMC.writeRAW(s, partStart) && SD_MMC.writeRAW(s, partStart + 6);
+    if (ok) ok = sdSchreiben(s, partStart) && sdSchreiben(s, partStart + 6);
     // FSInfo
     memset(s, 0, 512);
     v = 0x41615252; memcpy(s, &v, 4);
@@ -1486,7 +1549,7 @@ static bool karteFormatieren(const char *anlass)
     v = cluster - 1; memcpy(s + 488, &v, 4);
     v = 3;           memcpy(s + 492, &v, 4);
     s[510] = 0x55; s[511] = 0xAA;
-    if (ok) ok = SD_MMC.writeRAW(s, partStart + 1) && SD_MMC.writeRAW(s, partStart + 7);
+    if (ok) ok = sdSchreiben(s, partStart + 1) && sdSchreiben(s, partStart + 7);
     free(s);
     g_fat.gueltig = false;
     g_fertigAnzahl = 0; g_geloeschtAnzahl = 0; fertigSpeichern();
@@ -1609,7 +1672,7 @@ static void cfgAusNvs()
     cfgSchluessel = g_nvs.getString("schluessel", "");
     g_idleMs    = g_nvs.getUInt("idle", IDLE_VORGABE);
     g_aufraeumMin = g_nvs.getUInt("aufraeum", AUFRAEUM_VORGABE);
-    g_loeschen  = g_nvs.getBool("loeschen", true);
+    g_loeschen  = true;   // "nach /gesendet verschieben" gibt es nicht mehr (Kreuzverkettungen, 20.09.2026)
     g_invertiert = g_nvs.getBool("invers", true);
     g_ledHell   = (uint8_t)g_nvs.getUChar("ledhell", 5);
     for (int i = 0; i < Z_ANZAHL; i++) {
@@ -1669,7 +1732,7 @@ static void wlanStarten()
 {
     if (!cfgNetze) { logZeile("[wifi] kein Netz bekannt"); return; }
     WiFi.mode(WIFI_STA);
-    WiFi.setHostname("scanstick");
+    WiFi.setHostname(geraeteName().c_str());
     g_wifiMulti.APlistClean();
     for (int i = 0; i < cfgNetze; i++) g_wifiMulti.addAP(cfgNetzSsid[i].c_str(), cfgNetzPass[i].c_str());
 
@@ -1853,6 +1916,12 @@ static int ladeHochQuelle(const String &name, const String &id, uint32_t len,
     uint8_t puffer[1024];
     uint32_t geschickt = 0, t0 = millis();
     while (geschickt < len) {
+        // Der Drucker schreibt den naechsten Scan: dann jetzt nicht von der Karte
+        // lesen. Vor v26 war das Medium waehrend des Uploads weg, seit v26 lesen
+        // wir daneben - und genau in dieser Ueberlappung brach der 780 zweimal
+        // mit 44.12.05 ab. Also abbrechen und nachholen, sobald er fertig ist;
+        // ein doppelt angekommener Upload ist beim Empfaenger ein Duplikat.
+        if ((int32_t)(g_lastWrite - t0) > 0) { logZeile("[up] Drucker schreibt - Upload abgebrochen, wird nachgeholt"); break; }
         int gelesen = lese(puffer, sizeof puffer);
         if (gelesen <= 0) { logZeile("[up] Karte liefert keine Daten mehr"); break; }
         int raus = c.write(puffer, gelesen);
@@ -2039,7 +2108,7 @@ static void webStatus()
             (g_fertigAnzahl ? " <small>(werden in der naechsten Ruhephase geraeumt)</small>" : ""));
     h += zl("Aufraeumen", String("nach ") + g_aufraeumMin + " min ohne Zugriff des Druckers" +
             (g_letztesAufraeumen ? ", zuletzt vor " + dauer(millis() - g_letztesAufraeumen) : ", noch nie"));
-    h += zl("Nach dem Senden", g_loeschen ? "loeschen" : "nach /gesendet verschieben");
+    h += zl("Nach dem Senden", "von der Karte loeschen <small>(die Kopie liegt beim Empfaenger)</small>");
     h += zl("Weboberflaeche", cfgWebPass.length() ? "<span class=\"ok\">passwortgeschuetzt</span>"
                                                   : "<span class=\"bad\">offen, jeder im WLAN kann die Scans lesen</span>");
     h += zl("Upload-Signatur", cfgSchluessel.length() ? "<span class=\"ok\">Geraeteschluessel gesetzt</span>"
@@ -2059,6 +2128,7 @@ static void webStatus()
         String fehler = String((uint32_t)g_usbFehlerLesen) + " lesen, " + String((uint32_t)g_usbFehlerSchreiben) + " schreiben";
         if (g_usbFehlerZeit) fehler += " <small>(zuletzt vor " + dauer(millis() - g_usbFehlerZeit) + ", Sektor " + String((uint32_t)g_usbFehlerLba) + ")</small>";
         h += zl("Abgewiesene Host-Zugriffe", (g_usbFehlerLesen || g_usbFehlerSchreiben) ? "<span class=warn>" + fehler + "</span>" : "keine");
+        if (g_usbFehlerAlt.length()) h += zl("Vor dem letzten Neustart", "<span class=bad>" + g_usbFehlerAlt + "</span>");
         if (g_befundZeit) {
             String t = befundText(g_befund);
             bool schlecht = g_befund.heillos || g_befund.zuGross || (t != "in Ordnung" && !g_befund.geaendert);
@@ -2066,6 +2136,7 @@ static void webStatus()
                     " <small>(vor " + dauer(millis() - g_befundZeit) + ")</small>");
         }
     }
+    h += zl("Geraetename", geraeteName() + ".local");
     h += zl("Laufzeit", dauer(millis()));
     h += zl("Letzter Startgrund", g_startGrund);
     h += zl("Freier Speicher", menschlich(ESP.getFreeHeap()));
@@ -2288,7 +2359,6 @@ static void webEinstellungen()
             uint32_t sek = g_web.arg("idle").toInt();
             if (sek >= 5 && sek <= 600) g_idleMs = sek * 1000;
         }
-        if (g_web.hasArg("nachher")) g_loeschen = (g_web.arg("nachher") == "loeschen");
         if (g_web.hasArg("speichern")) {
             bool neu = g_web.hasArg("invers");
             if (neu != g_invertiert) { g_invertiert = neu; g_gfx->invertDisplay(g_invertiert); g_screen = -1; }
@@ -2346,11 +2416,6 @@ static void webEinstellungen()
     h += "<tr><td>Ruhefrist in Sekunden<br><small>so lange Stille, bis ein Scan als fertig gilt "
          "(der 780 braucht 45)</small></td><td><input name=\"idle\" type=\"number\" min=\"5\" max=\"600\" value=\"" +
          String(g_idleMs / 1000) + "\"></td></tr>";
-    h += String("<tr><td>Nach dem Senden</td><td>"
-         "<label><input type=\"radio\" name=\"nachher\" value=\"loeschen\"") + (g_loeschen ? " checked" : "") +
-         "> von der Karte loeschen</label><br>"
-         "<label><input type=\"radio\" name=\"nachher\" value=\"aufheben\"" + (g_loeschen ? "" : " checked") +
-         "> nach /gesendet verschieben</label></td></tr>";
     h += "<tr><td>Passwort der Weboberflaeche<br><small>Benutzername ist <b>scan</b>. "
          "Leer lassen = unveraendert.</small></td><td><input name=\"webpass\" type=\"password\" size=\"18\">"
          "<br><label><small><input type=\"checkbox\" name=\"passweg\" value=\"ja\"> Schutz entfernen</small></label></td></tr>";
@@ -2448,10 +2513,10 @@ static void webStarten()
     const char *kopf[] = { "Origin", "Referer" };
     g_web.collectHeaders(kopf, 2);
     g_web.begin();
-    if (MDNS.begin("scanstick")) MDNS.addService("http", "tcp", 80);
+    if (MDNS.begin(geraeteName().c_str())) MDNS.addService("http", "tcp", 80);
     g_webAn = true;
     logZeile(String("[web] erreichbar unter http://") + WiFi.localIP().toString() +
-             "/ und http://scanstick.local/");
+             "/ und http://" + geraeteName() + ".local/");
 }
 
 // ---- nach Scan-Ende: neue Dateien hochladen ----
@@ -2709,7 +2774,8 @@ static void aufraeumFenster(const String &grund)
     for (int fi = g_fertigAnzahl - 1; fi >= 0; fi--) {
         bool da = false;
         for (int i = 0; i < n && !da; i++)
-            da = liste[i].start == g_fertig[fi].start && liste[i].groesse == g_fertig[fi].groesse;
+            da = liste[i].start == g_fertig[fi].start && liste[i].groesse == g_fertig[fi].groesse &&
+                 (!g_fertig[fi].kennzahl || rohKennzahl(liste[i]) == g_fertig[fi].kennzahl);
         if (da) continue;
         logZeile(String("[aufraeumen] Merkliste: ") + g_fertig[fi].name + " (" + (g_fertig[fi].groesse / 1024) +
                  " kB) liegt nicht mehr auf der Karte - Eintrag ausgetragen");
@@ -2799,6 +2865,7 @@ void setup()
     fertigLaden();
 
     SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0, SD_D1, SD_D2, SD_D3);
+    if (!g_sdRiegel) g_sdRiegel = xSemaphoreCreateMutex();
     bool sdOk = SD_MMC.begin("/sdcard", false, false);
     if (!sdOk) { logZeile("[sd] Mount fehlgeschlagen"); zeigeScreen(Z_SDFEHL); }
     else fixMbrTyp();   // MBR nur bei gemounteter Karte anfassen
@@ -2807,6 +2874,16 @@ void setup()
         cfgNachNvs();
         logZeile("[nvs] aus /wifi.cfg uebernommen");
     }
+    g_nvs.begin("scanstick", false);
+    if (g_nvs.getUInt("usbFehler", 0)) {
+        g_usbFehlerAlt = String(g_nvs.getUInt("usbFehler", 0)) + " abgewiesene(r) Host-Zugriff(e), zuletzt Sektor " +
+                         g_nvs.getUInt("usbFehlerLba", 0) + " um " + g_nvs.getString("usbFehlerWann", "?");
+        String spur = g_nvs.getString("usbFehlerSpur", "");
+        logZeile("[usb] VOR DEM LETZTEN NEUSTART: " + g_usbFehlerAlt);
+        if (spur.length()) logZeile("[usb] Schreibspur davor: " + spur);
+        g_nvs.remove("usbFehler"); g_nvs.remove("usbFehlerLba"); g_nvs.remove("usbFehlerWann"); g_nvs.remove("usbFehlerSpur");
+    }
+    g_nvs.end();
     if (sdOk) {                          // Karte heilen, solange sie noch niemand sieht
         kartePruefen(true, "beim Start");
         if (g_befund.geaendert) sdOk = remount();
@@ -2930,14 +3007,22 @@ void loop()
     if (WiFi.status() == WL_CONNECTED && !g_webAn) { webStarten(); zeitHolen(); }
     if (g_webAn) g_web.handleClient();
 
-    {
-        uint32_t f = g_usbFehlerLesen + g_usbFehlerSchreiben;
-        if (f != g_usbFehlerGemeldet && millis() - g_usbFehlerZeit > 2000) {
-            g_usbFehlerGemeldet = f;
-            logZeile(String("[usb] abgewiesene Host-Zugriffe: ") + (uint32_t)g_usbFehlerLesen + " lesen, " +
-                     (uint32_t)g_usbFehlerSchreiben + " schreiben, zuletzt Sektor " + (uint32_t)g_usbFehlerLba);
-            logFlushNetz();
-        }
+    if (g_usbFehlerNeu) {
+        // Sofort, nicht erst nach Ruhe: der 780 nimmt dem Port nach einem
+        // Medienfehler den Strom, und dann waere alles im RAM verloren. Deshalb
+        // zusaetzlich in den Flash - beim naechsten Start wird es gemeldet.
+        g_usbFehlerNeu = false;
+        char wann[16] = "?";
+        if (g_zeitOk) { time_t t = time(nullptr); struct tm tm; localtime_r(&t, &tm); strftime(wann, sizeof wann, "%H:%M:%S", &tm); }
+        g_nvs.begin("scanstick", false);
+        g_nvs.putUInt("usbFehler", g_nvs.getUInt("usbFehler", 0) + 1);
+        g_nvs.putUInt("usbFehlerLba", g_usbFehlerLba);
+        g_nvs.putString("usbFehlerWann", wann);
+        g_nvs.putString("usbFehlerSpur", spurText(false).substring(0, 400));
+        g_nvs.end();
+        logZeile(String("[usb] abgewiesene Host-Zugriffe: ") + (uint32_t)g_usbFehlerLesen + " lesen, " +
+                 (uint32_t)g_usbFehlerSchreiben + " schreiben, zuletzt Sektor " + (uint32_t)g_usbFehlerLba + " um " + wann);
+        logFlushNetz();
     }
 
     uint32_t nun = millis();
@@ -2960,7 +3045,7 @@ void loop()
         g_rohLetzt = nun;
         int anz = 0;
         uint32_t summe = 0;
-        if (rohVerzeichnis(anz, summe) && anz > 0) {
+        if (rohVerzeichnis(anz, summe)) {
             rohOffenSumme(g_zeigAnzahl, g_zeigSumme);
             g_rohGeprueft = nun;
             if (anz == g_rohAnzahl && summe == g_rohSumme) {
@@ -2972,7 +3057,8 @@ void loop()
                         // Der Drucker hat geschrieben, aber es liegt nichts Neues -
                         // etwa seine Verzeichnisdaten. Vorher lief das alle vier
                         // Sekunden im Kreis, mit einem Protokoll-Upload pro Runde.
-                        logZeile(String("[roh] ") + anz + " Datei(en) stabil, alle schon gesendet - nichts zu tun");
+                        logZeile(anz ? String("[roh] ") + anz + " Datei(en) stabil, alle schon gesendet - nichts zu tun"
+                                     : String("[roh] keine Scan-Datei - der Drucker hat nur Verzeichnisdaten geschrieben, nichts zu tun"));
                         g_dirty = false;
                         g_versuche = 0;
                         g_naechsterVersuch = 0;
