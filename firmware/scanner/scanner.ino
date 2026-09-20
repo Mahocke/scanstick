@@ -27,6 +27,7 @@
 #include <ESPmDNS.h>
 #include <Preferences.h>
 #include <Update.h>
+#include "mbedtls/md.h"
 
 #define SD_D0  14
 #define SD_D1  17
@@ -336,7 +337,7 @@ static volatile uint32_t g_bytesGeschrieben = 0;   // seit dem letzten Verarbeit
 static uint32_t g_naechsterVersuch = 0;   // 0 = sofort faellig
 static int      g_versuche         = 0;
 
-#define FW_VERSION "v22"
+#define FW_VERSION "v23"
 
 String cfgEndpoint;
 // Bekannte WLAN-Netze - mehrere, damit derselbe Stick an verschiedenen Standorten
@@ -348,6 +349,7 @@ static int       cfgNetze = 0;
 static WiFiMulti g_wifiMulti;
 String cfgWebPass;   // Schutz der Weboberflaeche; leer = offen
 String cfgPraefix = "scan";   // Namensanfang der Dateien, z.B. "buero-774"
+String cfgSchluessel;         // Geraeteschluessel: signiert jeden Upload; leer = ohne
 static bool g_zeitOk        = false;   // NTP-Zeit vorhanden?
 static bool g_einmalSchauen = false;   // Knopf "Jetzt schauen": einmal, ohne Wartezyklus
 static bool g_startGeprueft = false;   // nach dem Hochlaufen einmal nachsehen
@@ -473,6 +475,25 @@ static void logZeile(const String &msg)
     }
 }
 
+// Geraeteauthentifizierung: HMAC-SHA256 ueber Name, Kennung und Laenge mit dem
+// Geraeteschluessel, als Kopfzeile X-Scan-Auth. Der Empfaenger weist alles ohne
+// gueltige Signatur ab. Einen Zeitstempel braucht es nicht: eine Wiederholung
+// desselben Uploads ist unschaedlich, der Empfaenger dedupliziert per Kennung.
+// Kein TLS - im LAN reicht das, und ein TLS-Kontext kostet auf dem Stick rund
+// 40 kB Arbeitsspeicher und jeden Upload spuerbar Zeit.
+static String uploadSignatur(const String &name, const String &id, uint32_t laenge)
+{
+    if (cfgSchluessel.isEmpty()) return "";
+    String nachricht = name + "\n" + id + "\n" + String(laenge);
+    uint8_t mac[32];
+    if (mbedtls_md_hmac(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
+                        (const uint8_t *)cfgSchluessel.c_str(), cfgSchluessel.length(),
+                        (const uint8_t *)nachricht.c_str(), nachricht.length(), mac) != 0) return "";
+    String hex;
+    for (int i = 0; i < 32; i++) { char t[3]; snprintf(t, sizeof t, "%02x", mac[i]); hex += t; }
+    return hex;
+}
+
 // Nur das Neue seit dem letzten Mal wegschicken. Beruehrt die SD-Karte nicht.
 // Vorher ging jedes Mal der ganze Puffer raus - pro Scan eine Protokolldatei
 // mit der gesamten Vorgeschichte. Der Puffer selbst bleibt stehen, die
@@ -483,11 +504,14 @@ static void logFlushNetz()
     if (WiFi.status() != WL_CONNECTED) return;
     String teil = g_logPuffer.substring(g_logGesendet);
     HTTPClient http;
+    String dateiname = "scanlog-" + String(millis()) + ".txt";
     String url = cfgEndpoint;
     url += (url.indexOf('?') < 0) ? "?name=" : "&name=";
-    url += "scanlog-" + String(millis()) + ".txt";
+    url += dateiname;
     if (!http.begin(url)) return;
     http.addHeader("Content-Type", "text/plain");
+    String sig = uploadSignatur(dateiname, "", teil.length());
+    if (sig.length()) http.addHeader("X-Scan-Auth", sig);
     int code = http.POST(teil);
     http.end();
     if (code >= 200 && code < 300) g_logGesendet = g_logPuffer.length();
@@ -675,6 +699,7 @@ static bool ladeConfig()
         if (k == "ssid") { if (neu < MAX_NETZE) { neuSsid[neu] = v; neuPass[neu] = ""; neu++; } }
         else if (k == "pass") { if (neu) neuPass[neu - 1] = v; }
         else if (k == "endpoint") cfgEndpoint = v;
+        else if (k == "schluessel") cfgSchluessel = v;
     }
     if (neu) {
         cfgNetze = neu;
@@ -740,6 +765,7 @@ static void cfgAusNvs()
     cfgEndpoint = g_nvs.getString("endpoint", "");
     cfgWebPass  = g_nvs.getString("webpass", "");
     cfgPraefix  = g_nvs.getString("praefix", "scan");
+    cfgSchluessel = g_nvs.getString("schluessel", "");
     g_idleMs    = g_nvs.getUInt("idle", IDLE_VORGABE);
     g_loeschen  = g_nvs.getBool("loeschen", true);
     g_invertiert = g_nvs.getBool("invers", true);
@@ -764,6 +790,7 @@ static void cfgNachNvs()
     g_nvs.putString("endpoint", cfgEndpoint);
     g_nvs.putString("webpass", cfgWebPass);
     g_nvs.putString("praefix", cfgPraefix);
+    g_nvs.putString("schluessel", cfgSchluessel);
     g_nvs.putUInt("idle", g_idleMs);
     g_nvs.putBool("loeschen", g_loeschen);
     g_nvs.putBool("invers", g_invertiert);
@@ -970,10 +997,12 @@ static bool ladeHoch(fs::FS &fs, const String &pfad, const String &name, const S
         }
     }
     if (!verbunden) { f.close(); return false; }
+    String sig = uploadSignatur(name, id, len);
     c.print(String("POST ") + ziel + " HTTP/1.1\r\n" +
             "Host: " + host + ":" + port + "\r\n" +
             "Content-Type: application/octet-stream\r\n" +
             "Content-Length: " + len + "\r\n" +
+            (sig.length() ? "X-Scan-Auth: " + sig + "\r\n" : String("")) +
             "Connection: close\r\n\r\n");
 
     zeigeSendenStart(name, len);
@@ -1126,6 +1155,8 @@ static void webStatus()
     h += zl("Nach dem Senden", g_loeschen ? "loeschen" : "nach /gesendet verschieben");
     h += zl("Weboberflaeche", cfgWebPass.length() ? "<span class=\"ok\">passwortgeschuetzt</span>"
                                                   : "<span class=\"bad\">offen, jeder im WLAN kann die Scans lesen</span>");
+    h += zl("Upload-Signatur", cfgSchluessel.length() ? "<span class=\"ok\">Geraeteschluessel gesetzt</span>"
+                                                       : "<span class=\"warn\">keiner, der Empfaenger nimmt alles an</span>");
     h += zl("Uhrzeit", g_zeitOk ? "<span class=\"ok\">per NTP gestellt</span>"
                                  : "<span class=\"warn\">unbekannt, Namen mit Laufzeit</span>");
     h += zl("Namensschema", cfgPraefix + "-JJJJMMTT-HHMMSS.pdf");
@@ -1344,6 +1375,8 @@ static void webEinstellungen()
         // sonst schaltet ein unbedachtes Speichern den Schutz ab.
         if (g_web.hasArg("webpass") && g_web.arg("webpass").length()) cfgWebPass = g_web.arg("webpass");
         if (g_web.hasArg("passweg") && g_web.arg("passweg") == "ja") cfgWebPass = "";
+        if (g_web.hasArg("schluessel") && g_web.arg("schluessel").length()) cfgSchluessel = g_web.arg("schluessel");
+        if (g_web.hasArg("schluesselweg") && g_web.arg("schluesselweg") == "ja") cfgSchluessel = "";
         for (int i = 0; i < Z_ANZAHL; i++) {
             char k[10];
             snprintf(k, sizeof k, "f%d", i);
@@ -1386,6 +1419,11 @@ static void webEinstellungen()
     h += "<tr><td>Passwort der Weboberflaeche<br><small>Benutzername ist <b>scan</b>. "
          "Leer lassen = unveraendert.</small></td><td><input name=\"webpass\" type=\"password\" size=\"18\">"
          "<br><label><small><input type=\"checkbox\" name=\"passweg\" value=\"ja\"> Schutz entfernen</small></label></td></tr>";
+    h += String("<tr><td>Geraeteschluessel fuer den Upload<br><small>signiert jeden Upload "
+         "(HMAC-SHA256); derselbe Schluessel gehoert in den Empfaenger (<code>SCAN_KEY</code>). "
+         "Leer lassen = unveraendert. Zurzeit: ") + (cfgSchluessel.length() ? "gesetzt" : "keiner") +
+         "</small></td><td><input name=\"schluessel\" type=\"password\" size=\"18\">"
+         "<br><label><small><input type=\"checkbox\" name=\"schluesselweg\" value=\"ja\"> Schluessel entfernen</small></label></td></tr>";
     for (int i = 0; i < Z_ANZAHL; i++) {
         char k[10];
         snprintf(k, sizeof k, "f%d", i);
@@ -1741,6 +1779,26 @@ void loop()
         if (rohVerzeichnis(a, gr) && a > 0) {
             logZeile(String("[start] ") + a + " Datei(en) mit " + (gr / 1024) +
                      " kB lagen noch da - nehme sie mit");
+            g_dirty = true;
+            g_lastWrite = millis() - IDLE_MS - 1;   // sofort faellig
+            g_versuche = 0;
+            g_naechsterVersuch = 0;
+        }
+    }
+
+    // Liegt etwas, das nicht wegging - Empfaenger war nicht erreichbar, WLAN
+    // fehlte? Bisher gab es den naechsten Versuch erst mit dem naechsten Scan.
+    // Jetzt alle zehn Minuten roh nachsehen, ohne den Drucker zu stoeren.
+    #define NACHSCHAU_MS 600000
+    static uint32_t nachschau = 0;
+    if (!g_dirty && g_startGeprueft && WiFi.status() == WL_CONNECTED &&
+        millis() - nachschau > NACHSCHAU_MS) {
+        nachschau = millis();
+        int a = 0;
+        uint32_t gr = 0;
+        if (rohVerzeichnis(a, gr) && a > 0) {
+            logZeile(String("[nachschau] ") + a + " Datei(en) mit " + (gr / 1024) +
+                     " kB liegen noch - neuer Anlauf");
             g_dirty = true;
             g_lastWrite = millis() - IDLE_MS - 1;   // sofort faellig
             g_versuche = 0;

@@ -227,8 +227,18 @@ curl -u scan:PASSWORT -X POST http://scanstick.local/neustart
 
 Upload-Ziel · Namensanfang der Dateien (z. B. Standortkennung) · Ruhefrist ·
 nach dem Senden löschen oder nach `/gesendet` verschieben · Passwort ·
-Helligkeit der Status-LED (0 = aus) · Farbumkehr des Displays ·
-acht Zustandsfarben für Display und LED
+Geräteschlüssel für den Upload · Helligkeit der Status-LED (0 = aus) ·
+Farbumkehr des Displays · acht Zustandsfarben für Display und LED
+
+Der **Geräteschlüssel** signiert jeden Upload (HMAC-SHA256 über Name, Kennung und Länge,
+Kopfzeile `X-Scan-Auth`). Derselbe Schlüssel gehört in den Empfänger (`SCAN_KEY`), der dann
+alles ohne gültige Signatur abweist. Er lässt sich auch in `wifi.cfg` als `schluessel=`
+hinterlegen. Bewusst kein TLS: Im LAN reicht das, ein TLS-Kontext kostet auf dem Stick rund
+40 kB Arbeitsspeicher und jeden Upload spürbar Zeit. Wiederholungen brauchen keinen
+Zeitstempel, der Empfänger erkennt sie an der Kennung.
+
+Liegt eine Datei nach einem Fehlversuch noch auf der Karte (Empfänger nicht erreichbar,
+WLAN weg), sieht der Stick **alle zehn Minuten** roh nach und versucht es erneut.
 
 ## Empfänger
 
@@ -237,8 +247,11 @@ nimmt `POST /scan?name=…` entgegen und legt die Datei ab.
 
 ```bash
 python3 empfaenger/scan-receiver.py    # lauscht auf Port 8080, legt in ~/scan-inbox ab
-SCAN_PORT=9000 SCAN_INBOX=/srv/scans python3 empfaenger/scan-receiver.py
+SCAN_PORT=9000 SCAN_INBOX=/srv/scans SCAN_KEY=geheim python3 empfaenger/scan-receiver.py
 ```
+
+Mit `SCAN_KEY` verlangt er zu jedem Upload die Signatur des Sticks (siehe Einstellungen)
+und antwortet sonst mit 401.
 
 Der Empfänger nimmt eine Datei nur an, wenn sie **vollständig** ist: Die Länge muss der
 Ankündigung entsprechen, eine PDF muss auf `%%EOF` enden. Sonst antwortet er mit 400
@@ -310,7 +323,10 @@ Description=Scan-Stick Empfaenger
 After=network-online.target
 
 [Service]
-ExecStart=/usr/bin/python3 /opt/scanstick/scan-receiver.py
+ExecStart=/usr/bin/python3 -u /opt/scanstick/empfaenger/scan-receiver.py
+Environment=SCAN_PORT=8080
+Environment=SCAN_INBOX=/srv/scans
+Environment=SCAN_KEY=geheim
 Restart=always
 User=pi
 

@@ -1,0 +1,36 @@
+name: Firmware bauen
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/setup-arduino-cli@v2
+
+      - name: ESP32-Core und Bibliothek installieren
+        run: |
+          arduino-cli config init --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@3.3.12
+          arduino-cli lib install "GFX Library for Arduino@1.6.8"
+
+      - name: Firmware kompilieren
+        run: >
+          arduino-cli compile
+          -b "esp32:esp32:esp32s3:USBMode=default,CDCOnBoot=cdc,FlashSize=16M,PartitionScheme=default_8MB,PSRAM=disabled,FlashMode=qio,CPUFreq=240"
+          --export-binaries firmware/scanner
+
+      - name: Empfaenger und Pruefstand pruefen
+        run: |
+          python3 -m py_compile empfaenger/scan-receiver.py
+          bash -n test/stresstest.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scanner-firmware
+          path: firmware/scanner/build/*/scanner.ino.bin

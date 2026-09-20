@@ -6,10 +6,15 @@ im Betrieb tritt hier die eigentliche Ablage an diese Stelle.
 Port und Ablageordner lassen sich ueber die Umgebung setzen:
     SCAN_PORT=8080 SCAN_INBOX=~/scan-inbox python3 scan-receiver.py
 """
-import os, time, http.server, socketserver, urllib.parse
+import os, time, hmac, hashlib, http.server, socketserver, urllib.parse
 
 PORT = int(os.environ.get("SCAN_PORT", "8080"))
 INBOX = os.path.expanduser(os.environ.get("SCAN_INBOX", "~/scan-inbox"))
+# Geraeteschluessel: ist er gesetzt, muss jeder Upload eine gueltige Kopfzeile
+# X-Scan-Auth tragen (HMAC-SHA256 ueber "name\nid\nlaenge", derselbe Schluessel
+# wie in den Einstellungen des Sticks). Ohne Schluessel nimmt der Empfaenger
+# alles an - im Heimnetz vertretbar, fuer den Dauerbetrieb nicht.
+SCHLUESSEL = os.environ.get("SCAN_KEY", "").encode()
 # Der Stick schickt sein Protokoll an denselben Endpunkt (scanlog-*.txt). Das
 # gehoert nicht zwischen die Scans, sondern in einen eigenen Ordner.
 PROTOKOLL = os.path.join(INBOX, "protokoll")
@@ -67,11 +72,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         q = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(q.query)
-        name = self._sicherer_name(params.get("name", [""])[0])
-        scan_id = self._sicherer_name(params.get("id", [""])[0])
+        name_roh = params.get("name", [""])[0]
+        id_roh = params.get("id", [""])[0]
+        name = self._sicherer_name(name_roh)
+        scan_id = self._sicherer_name(id_roh)
         laenge = int(self.headers.get("Content-Length", 0))
         daten = self.rfile.read(laenge) if laenge else b""
         stempel = time.strftime("%H:%M:%S")
+
+        if SCHLUESSEL:
+            nachricht = ("%s\n%s\n%d" % (name_roh, id_roh, laenge)).encode()
+            soll = hmac.new(SCHLUESSEL, nachricht, hashlib.sha256).hexdigest()
+            ist = self.headers.get("X-Scan-Auth", "")
+            if not hmac.compare_digest(soll, ist):
+                print("[%s] ABGELEHNT %s von %s: Signatur %s" % (
+                    stempel, name, self.client_address[0], "fehlt" if not ist else "falsch"))
+                self._antwort(401, "abgelehnt: Signatur fehlt oder falsch")
+                return
 
         fehler = vollstaendig(name, daten, laenge)
         if fehler:
