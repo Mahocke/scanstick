@@ -219,6 +219,23 @@ fünf Sekunden startet der Task-Watchdog das Gerät neu (im Kernel-Log des Hosts
 wenn keiner mehr offen ist. Aus demselben Grund gilt als „Ruhe" erst, wenn der Host weder
 schreibt **noch liest**.
 
+**Ein Neustart am Drucker ist ein Stromschnitt.** Meldet sich der Stick per USB ab, schaltet
+der 780 dem Port kurz die Versorgung weg. Nach einem Firmware-Update über die
+Weboberfläche kam die neue Firmware dadurch nie dazu, sich als gültig zu bestätigen — der
+Bootloader fiel zweimal auf die alte zurück. Der Stick meldet deshalb erst das Medium ab,
+trennt USB, wartet den Stromschnitt ab und startet erst dann neu (`sanftNeustarten`).
+Auf der Statusseite steht danach „Strom eingeschaltet" als Startgrund — das ist normal.
+
+**Der 780 überschreibt eine gleichnamige Datei.** Bleibt `[Untitled].pdf` nach dem Senden
+auf der Karte liegen, hängt er beim nächsten Scan keinen Zeitstempel an, sondern schreibt
+dieselbe Datei neu. Der Stick erkennt eine Datei deshalb nicht am Namen, sondern an
+Startblock, Größe und Kennzahl — die neue Fassung gilt damit als neu und wird gesendet.
+
+**Nicht jeder Schreibzugriff ist ein Scan.** Beim Öffnen des Scan-Dialogs schreibt der
+780 eine Testdatei von einem Block und löscht sie gleich wieder (rund 4 kB: FAT, Wurzel,
+ein Datenblock, wieder Wurzel und FAT). Die Anzeige zählt deshalb nur, was noch nicht
+gesendet ist; die Statusseite zeigt die letzten Schreibzugriffe des Hosts nach Bereich.
+
 **Bei mehreren Zugangspunkten mit derselben Kennung** nimmt `WiFi.begin(ssid, pass)`
 den erstbesten, nicht den stärksten. Der Stick sucht deshalb vorher (`WiFiMulti`) und
 verbindet sich gezielt mit der besten Station. Die Kehrseite: Fällt genau diese Station
