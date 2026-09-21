@@ -66,7 +66,7 @@ and some printer USB ports are pickier than a PC is. Known so far:
 | Printer | Firmware | Result |
 |---|---|---|
 | HP PageWide Color MFP 780 | FutureSmart 5.9.2.3 | works, development device |
-| HP PageWide Color MFP 774 | FutureSmart 5.9.2.3 | not tested yet, same firmware family as the 780 |
+| HP PageWide Color MFP 774 | FutureSmart 5.9.2.3 | works, same firmware family as the 780 |
 | HP PageWide Pro 377dw | 2506A | **refuses it** - the port never enumerates the stick at all |
 
 On the 377dw the stick is not merely rejected after mounting: the port never configures
