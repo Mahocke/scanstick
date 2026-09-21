@@ -103,6 +103,7 @@ display). Connect a phone or computer to it - the setup page opens by itself, as
 WiFi, otherwise open `http://192.168.4.1/`. There, pick a network from the list, enter
 password, receiver address, optionally device key and web password, and save. The stick
 restarts and is then reachable on the home network at `http://scanstick-XXXX.local/`.
+For a network the stick already knows, an empty password field keeps the stored one.
 Further networks can be added or removed later in the Settings.
 
 **The second way: a file on the card.** For this too **no card reader is needed** - the
