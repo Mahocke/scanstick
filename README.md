@@ -8,8 +8,9 @@ when a file has finished writing, gives it a name with a timestamp, uploads it o
 HTTP to an arbitrary receiver and clears it away. A small display shows what is
 happening right now; a web interface shows state, log and the files on the card.
 
-Developed on an **HP PageWide Color MFP 780**, but in principle usable on any device
-that can do "scan to USB drive".
+Developed on an **HP PageWide Color MFP 780**. Other devices that can do "scan to USB
+drive" may work, but not all of them do: some printers ignore the stick completely.
+Please read **Printer compatibility** before you buy hardware for this.
 
 ## Why not just "scan to network folder"?
 
@@ -56,6 +57,50 @@ stick, failed.
 The card should be **partitioned small**, about 4 GB with 32 kB clusters: after every
 cleanup the printer remounts the stick and reads the allocation table while doing so. With
 64 GB that is 60 MB over USB, with 4 GB and large clusters 512 kB.
+
+## Printer compatibility
+
+**Not every printer accepts the stick.** It is an ESP32-S3 pretending to be a USB drive,
+and some printer USB ports are pickier than a PC is. Known so far:
+
+| Printer | Firmware | Result |
+|---|---|---|
+| HP PageWide Color MFP 780 | FutureSmart 5.9.2.3 | works, development device |
+| HP PageWide Color MFP 774 | FutureSmart 5.9.2.3 | not tested yet, same firmware family as the 780 |
+| HP PageWide Pro 377dw | 2506A | **refuses it** - the port never enumerates the stick at all |
+
+On the 377dw the stick is not merely rejected after mounting: the port never configures
+it. No sector accesses arrive, and the USB stack never reports a `STARTED` event, while
+the very same firmware starts within a second on a PC or a Raspberry Pi. It made no
+difference whether the serial console was disabled, the reported capacity was capped at
+8 GB, the current draw was declared as 100 mA, or the descriptor pretended to be an
+ordinary SanDisk Cruzer Blade. "Scan to USB" and mass storage were enabled in the
+printer's own settings.
+
+The most likely cause is speed. The ESP32-S3 has a **full-speed** USB device port
+(12 Mbit/s, USB 1.1); every off-the-shelf stick is high-speed. A walk-up port that only
+expects high-speed devices will simply stay quiet. That is a property of the chip and
+**cannot be fixed in firmware**.
+
+### If your printer ignores the stick
+
+1. **Check the printer's settings first.** "Scan to USB drive" and USB mass storage are
+   switched off by default on many devices, and on some only in the embedded web server,
+   not on the panel.
+2. **Make sure it is a walk-up host port.** Some front USB sockets only accept firmware
+   updates or service tools.
+3. **Try a powered USB 2.0 hub in between.** A hub does the speed translation, so a
+   full-speed device can appear behind it. This is the most promising workaround, but it
+   is so far untested - if you try it, please report back in an issue.
+4. **A normal USB stick working in that port proves little.** It only shows that the port
+   carries walk-up storage at high speed, not that it talks to a full-speed device.
+
+If the port stays silent, the printer is not going to work with this project. The
+fallback is the classic one: let the printer **scan into a network folder** (SMB) and
+have the receiving machine watch that folder. You lose the instant-drive advantage
+described above, but everything downstream of the upload stays the same.
+
+Reports about other printers are very welcome - see **Contributing**.
 
 ## Hardware
 
@@ -444,6 +489,8 @@ sudo systemctl enable --now scan-receiver
 - Check file types other than PDF for completeness as well
 - Further boards, in particular ones without a card slot (there the internal flash would
   have to serve as storage)
+- Test whether a USB 2.0 hub in between makes the stick usable on printers that refuse a
+  full-speed device (see "Printer compatibility")
 
 ## Contributing
 
