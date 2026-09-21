@@ -362,7 +362,7 @@ static volatile uint32_t g_bytesGeschrieben = 0;   // since the last processing
 static uint32_t g_naechsterVersuch = 0;   // 0 = due immediately
 static int      g_versuche         = 0;
 
-#define FW_VERSION "v40"
+#define FW_VERSION "v41"
 
 String cfgEndpoint;
 // Known WiFi networks - several, so the same stick runs at different locations.
@@ -1734,7 +1734,11 @@ static uint32_t g_wlanVerloren = 0;   // since when without a network (0 = conne
 static void wlanStarten()
 {
     if (!cfgNetze) { logZeile("[wifi] no network known"); return; }
-    WiFi.mode(WIFI_STA);
+    // In setup mode the own access point is running (AP+STA). Switching to
+    // plain STA here killed it: the two-minute search for known networks
+    // took the setup Wi-Fi down and nothing turned it on again - the display
+    // said WIFI SETUP, but the phone no longer saw the network (21.09.2026).
+    if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_STA);
     WiFi.setHostname(geraeteName().c_str());
     g_wifiMulti.APlistClean();
     for (int i = 0; i < cfgNetze; i++) g_wifiMulti.addAP(cfgNetzSsid[i].c_str(), cfgNetzPass[i].c_str());
@@ -2541,9 +2545,15 @@ static void webEinrichten()
         if (ssid.length()) {
             int vorhanden = -1;
             for (int i = 0; i < cfgNetze; i++) if (cfgNetzSsid[i] == ssid) vorhanden = i;
-            if (vorhanden >= 0) cfgNetzPass[vorhanden] = pass;
-            else {
-                if (cfgNetze >= MAX_NETZE) cfgNetze = MAX_NETZE - 1;          // oldest one drops out
+            if (vorhanden >= 0) {
+                // Empty password = keep the stored one. Before, choosing a known
+                // network and leaving the field empty saved it WITHOUT a password.
+                if (pass.length()) cfgNetzPass[vorhanden] = pass;
+            } else {
+                if (cfgNetze >= MAX_NETZE) {                                   // oldest one drops out
+                    for (int i = 1; i < MAX_NETZE; i++) { cfgNetzSsid[i - 1] = cfgNetzSsid[i]; cfgNetzPass[i - 1] = cfgNetzPass[i]; }
+                    cfgNetze = MAX_NETZE - 1;
+                }
                 cfgNetzSsid[cfgNetze] = ssid; cfgNetzPass[cfgNetze] = pass; cfgNetze++;
             }
         }
@@ -2573,7 +2583,7 @@ static void webEinrichten()
     h += "<form method=\"post\" action=\"/einrichten\"><table>";
     h += "<tr><td>Networks found</td><td><select name=\"ssid_liste\"><option value=\"\">- please choose -</option>" + liste + "</select></td></tr>";
     h += "<tr><td>or network name by hand</td><td><input name=\"ssid\" size=\"24\"></td></tr>";
-    h += "<tr><td>Wi-Fi password</td><td><input name=\"pass\" type=\"password\" size=\"24\"></td></tr>";
+    h += "<tr><td>Wi-Fi password<br><small>known network: empty = keep the stored one</small></td><td><input name=\"pass\" type=\"password\" size=\"24\"></td></tr>";
     h += "<tr><td>Upload target<br><small>address of the receiver</small></td><td><input name=\"endpoint\" size=\"34\" value=\"" +
          (cfgEndpoint.length() ? cfgEndpoint : String("http://192.168.1.50:8080/scan")) + "\"></td></tr>";
     h += String("<tr><td>Device key<br><small>optional, same as SCAN_KEY on the receiver</small></td><td><input name=\"schluessel\" type=\"password\" size=\"24\"") +
