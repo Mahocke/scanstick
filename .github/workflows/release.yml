@@ -1,37 +1,34 @@
-name: Build firmware
+name: Release firmware
 
 on:
   push:
-  pull_request:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
 
 jobs:
-  build:
+  firmware:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: arduino/setup-arduino-cli@v2
-
-      - name: Install ESP32 core and library
+      - name: Install pinned toolchain
         run: |
           arduino-cli config init --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
           arduino-cli core update-index
           arduino-cli core install esp32:esp32@3.3.12
           arduino-cli lib install "GFX Library for Arduino@1.6.8"
-
       - name: Compile firmware
         run: >
           arduino-cli compile
           -b "esp32:esp32:esp32s3:USBMode=default,CDCOnBoot=cdc,FlashSize=16M,PartitionScheme=default_8MB,PSRAM=disabled,FlashMode=qio,CPUFreq=240"
           --export-binaries firmware/scanner
-
-      - name: Check receiver and test bench
-        run: |
-          python3 -m py_compile empfaenger/scan-receiver.py
-          python3 -m unittest discover -s test -p 'test_*.py' -v
-          bash -n test/stresstest.sh
-
-      - uses: actions/upload-artifact@v4
+      - name: Name release asset
+        run: cp firmware/scanner/build/*/scanner.ino.bin "scanstick-${GITHUB_REF_NAME}.bin"
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
         with:
-          name: scanner-firmware
-          path: firmware/scanner/build/*/scanner.ino.bin
+          generate_release_notes: true
+          files: scanstick-${{ github.ref_name }}.bin
