@@ -362,7 +362,7 @@ static volatile uint32_t g_bytesGeschrieben = 0;   // since the last processing
 static uint32_t g_naechsterVersuch = 0;   // 0 = due immediately
 static int      g_versuche         = 0;
 
-#define FW_VERSION "v41"
+#define FW_VERSION "v42"
 
 String cfgEndpoint;
 // Known WiFi networks - several, so the same stick runs at different locations.
@@ -1720,6 +1720,11 @@ static String  g_apKennung;      // BSSID of the chosen access point
 static int     g_apKanal  = 0;
 static long    g_apRssi   = 0;
 static uint32_t g_wlanVerloren = 0;   // since when without a network (0 = connected)
+// Why did the last connection attempt fail? Set by the WiFi event task, read and
+// logged from the main loop (no String work in the event task). 0 = nothing yet.
+// Codes: 2 auth expired, 15 4-way handshake timeout (wrong password), 201 no AP
+// found, 202 auth failed, 203 association failed, 204 handshake timeout.
+static volatile int g_wifiTrennGrund = 0;
 #define WLAN_NEUSUCHE 120000          // this long without a network, then search again
 
 // Several access points can carry the same SSID (single APs, no mesh), and the
@@ -1752,7 +1757,19 @@ static void wlanStarten()
                  g_apKanal + " with " + g_apRssi + " dBm, IP " + WiFi.localIP().toString());
     } else {
         g_apKennung = "";
-        logZeile("[wifi] no known network reachable");
+        logZeile(String("[wifi] no known network reachable, status ") + (int)WiFi.status() +
+                 ", last disconnect reason " + g_wifiTrennGrund);
+        // Diagnosis (21.09.2026: a stick with correct credentials would not join
+        // the home network it had used the day before): what does the scan see?
+        int n = WiFi.scanNetworks(false, false, false, 300);
+        for (int i = 0; i < n && i < 12; i++) {
+            bool bekannt = false;
+            for (int k = 0; k < cfgNetze; k++) if (cfgNetzSsid[k] == WiFi.SSID(i)) bekannt = true;
+            logZeile(String("[wifi] seen: \"") + WiFi.SSID(i) + "\" " + WiFi.BSSIDstr(i) + " ch" + WiFi.channel(i) +
+                     " " + WiFi.RSSI(i) + " dBm auth " + (int)WiFi.encryptionType(i) + (bekannt ? " KNOWN" : ""));
+        }
+        if (n <= 0) logZeile(String("[wifi] scan returned ") + n);
+        WiFi.scanDelete();
     }
 }
 
@@ -3075,6 +3092,9 @@ void setup()
 
     // WiFi only now: the scan blocks for a few seconds, and the printer
     // should see the stick as a drive right away, not only after the WiFi.
+    WiFi.onEvent([](WiFiEvent_t, WiFiEventInfo_t info) {
+        g_wifiTrennGrund = info.wifi_sta_disconnected.reason;
+    }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
     wlanStarten();
     if (WiFi.status() != WL_CONNECTED) {
         einrichtungStarten(cfgNetze ? "no known network in range" : "no network configured");
